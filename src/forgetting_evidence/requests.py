@@ -4,6 +4,11 @@ The store records deletion requests without retaining any identifying
 payload in logs, return values beyond the fixed receipt fields, or
 exception messages. SQLite integrity conflicts are translated into the
 module's own idempotency semantics and never surface to callers.
+
+Every accepted request carries a persistent, append-only status timeline
+in ``status_events``. Events are written in the same transaction as the
+request row or status change they describe, so the final timeline entry
+always matches the request's current status.
 """
 
 from __future__ import annotations
@@ -60,6 +65,20 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_requests_tenant_idempotency
     ON requests(tenant_id, idempotency_key);
 """
 
+_EVENT_TABLE = """
+CREATE TABLE IF NOT EXISTS status_events (
+    tenant_id   TEXT NOT NULL,
+    request_id  TEXT NOT NULL,
+    seq         INTEGER NOT NULL,
+    status      TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, request_id, seq)
+);
+"""
+
+# The composite primary key already indexes (tenant_id, request_id, seq),
+# which serves both the ordered timeline read and the latest-event lookup.
+
 _BUSY_TIMEOUT_MS = 30_000
 # A UUIDv4 primary-key collision is astronomically unlikely; the bound
 # only keeps that conflict distinct from idempotency conflicts.
@@ -105,6 +124,18 @@ def _utc_now_rfc3339() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _occurred_at_not_before(latest: str) -> str:
+    """Return a UTC timestamp that is never earlier than ``latest``.
+
+    ISO-8601 timestamps produced by :func:`_utc_now_rfc3339` sort
+    lexicographically, so the comparison stays purely textual. If the
+    clock produces a value earlier than the previous event's, reuse the
+    previous timestamp so the timeline can never go backwards.
+    """
+    now = _utc_now_rfc3339()
+    return now if now >= latest else latest
+
+
 class RequestStore:
     """Persist and retrieve accepted deletion requests."""
 
@@ -123,6 +154,7 @@ class RequestStore:
         try:
             conn.execute(_SCHEMA)
             conn.execute(_UNIQUE_TENANT_KEY)
+            conn.execute(_EVENT_TABLE)
         finally:
             self._release(conn)
 
@@ -203,6 +235,19 @@ class RequestStore:
                     except _PrimaryKeyConflict:
                         # Collision was on request_id; retry with a new UUID.
                         continue
+                try:
+                    # The first timeline entry shares the acceptance
+                    # transaction: a request can never exist without its
+                    # accepted event, nor an event without its request.
+                    conn.execute(
+                        "INSERT INTO status_events ("
+                        "tenant_id, request_id, seq, status, occurred_at"
+                        ") VALUES (?, ?, 0, 'accepted', ?)",
+                        (tenant_id, request_id, created_at),
+                    )
+                except sqlite3.Error:
+                    conn.execute("ROLLBACK")
+                    raise RuntimeError("failed to persist accepted request") from None
                 conn.execute("COMMIT")
                 return {
                     "request_id": request_id,
@@ -343,6 +388,37 @@ class RequestStore:
                         # graph observed at read time.
                         conn.execute("ROLLBACK")
                         raise InvalidStatusTransition("illegal status transition")
+                    # The event is appended in the same transaction as the
+                    # status update, keyed by the next per-request sequence
+                    # number. BEGIN IMMEDIATE serializes writers, so two
+                    # transitions can never claim the same seq or read a
+                    # stale predecessor.
+                    latest = conn.execute(
+                        "SELECT seq, occurred_at FROM status_events "
+                        "WHERE tenant_id = ? AND request_id = ? "
+                        "ORDER BY seq DESC LIMIT 1",
+                        (tenant_id, request_id),
+                    ).fetchone()
+                    if latest is None:
+                        # Defensive only: every accepted request owns its
+                        # seq-0 event, so reaching here means the timeline
+                        # invariant was broken out of band.
+                        conn.execute("ROLLBACK")
+                        raise RuntimeError("failed to persist status transition")
+                    next_seq, latest_occurred_at = latest
+                    occurred_at = _occurred_at_not_before(latest_occurred_at)
+                    conn.execute(
+                        "INSERT INTO status_events ("
+                        "tenant_id, request_id, seq, status, occurred_at"
+                        ") VALUES (?, ?, ?, ?, ?)",
+                        (
+                            tenant_id,
+                            request_id,
+                            next_seq + 1,
+                            target_status,
+                            occurred_at,
+                        ),
+                    )
                     conn.execute("COMMIT")
                 except InvalidStatusTransition:
                     raise
@@ -368,3 +444,48 @@ class RequestStore:
             "status": target_status,
             "created_at": created_at,
         }
+
+    def audit(
+        self,
+        tenant_id: str,
+        request_id: str,
+    ) -> list[dict[str, str]]:
+        """Return the request's status timeline in occurrence order.
+
+        Each entry contains only ``status`` and ``occurred_at`` (a UTC
+        RFC3339 string). The final entry's status always equals the result
+        of :meth:`get`. Unknown ids and cross-tenant lookups raise
+        :class:`RequestNotFound` with identical behaviour, so the call
+        cannot reveal another tenant's records.
+        """
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        request_id = _require_nonempty_str(request_id, "request_id")
+        if self._mem_conn is not None:
+            with self._write_lock:
+                return self._audit(tenant_id, request_id)
+        return self._audit(tenant_id, request_id)
+
+    def _audit(self, tenant_id: str, request_id: str) -> list[dict[str, str]]:
+        conn = self._connect()
+        try:
+            # Resolve ownership first: filtering the event query by tenant
+            # alone would still distinguish "missing" from "foreign record"
+            # via an empty timeline, so gate on the request row exactly
+            # like get().
+            owner = conn.execute(
+                "SELECT 1 FROM requests WHERE tenant_id = ? AND request_id = ?",
+                (tenant_id, request_id),
+            ).fetchone()
+            if owner is None:
+                raise RequestNotFound("request not found")
+            rows = conn.execute(
+                "SELECT status, occurred_at FROM status_events "
+                "WHERE tenant_id = ? AND request_id = ? ORDER BY seq",
+                (tenant_id, request_id),
+            ).fetchall()
+        finally:
+            self._release(conn)
+        return [
+            {"status": status, "occurred_at": occurred_at}
+            for status, occurred_at in rows
+        ]
