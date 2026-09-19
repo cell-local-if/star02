@@ -60,6 +60,19 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_requests_tenant_idempotency
     ON requests(tenant_id, idempotency_key);
 """
 
+# Append-only audit timeline. One row per recorded status event; seq is
+# strictly increasing per request so occurrence order survives rebuilds.
+_EVENTS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS request_events (
+    request_id  TEXT NOT NULL,
+    tenant_id   TEXT NOT NULL,
+    seq         INTEGER NOT NULL,
+    status      TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    PRIMARY KEY (request_id, seq)
+);
+"""
+
 _BUSY_TIMEOUT_MS = 30_000
 # A UUIDv4 primary-key collision is astronomically unlikely; the bound
 # only keeps that conflict distinct from idempotency conflicts.
@@ -101,8 +114,46 @@ def _normalize_scopes(scopes: object) -> list[str]:
     return sorted(items)
 
 
-def _utc_now_rfc3339() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _format_rfc3339(moment: datetime) -> str:
+    return moment.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _parse_rfc3339(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _append_event(
+    conn: sqlite3.Connection,
+    tenant_id: str,
+    request_id: str,
+    status: str,
+    now: datetime,
+) -> None:
+    """Append one timeline event inside the caller's transaction.
+
+    The timestamp never moves backwards relative to the previous event,
+    so the persisted timeline is always non-decreasing in time.
+    """
+    row = conn.execute(
+        "SELECT seq, occurred_at FROM request_events "
+        "WHERE request_id = ? ORDER BY seq DESC LIMIT 1",
+        (request_id,),
+    ).fetchone()
+    if row is None:
+        seq, occurred = 0, now
+    else:
+        seq = row[0] + 1
+        previous = _parse_rfc3339(row[1])
+        occurred = now if now > previous else previous
+    conn.execute(
+        "INSERT INTO request_events (request_id, tenant_id, seq, status, occurred_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (request_id, tenant_id, seq, status, _format_rfc3339(occurred)),
+    )
 
 
 class RequestStore:
@@ -123,8 +174,34 @@ class RequestStore:
         try:
             conn.execute(_SCHEMA)
             conn.execute(_UNIQUE_TENANT_KEY)
+            conn.execute(_EVENTS_SCHEMA)
+            self._backfill_events(conn)
         finally:
             self._release(conn)
+
+    def _backfill_events(self, conn: sqlite3.Connection) -> None:
+        # Rows written before the audit timeline existed receive a minimal
+        # history so the timeline still ends at the current status.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            missing = conn.execute(
+                "SELECT request_id, tenant_id, status, created_at FROM requests r "
+                "WHERE NOT EXISTS ("
+                "SELECT 1 FROM request_events e WHERE e.request_id = r.request_id"
+                ")"
+            ).fetchall()
+            for request_id, tenant_id, status, created_at in missing:
+                occurred = _parse_rfc3339(created_at)
+                _append_event(conn, tenant_id, request_id, _STATUS_ACCEPTED, occurred)
+                if status != _STATUS_ACCEPTED:
+                    _append_event(conn, tenant_id, request_id, status, occurred)
+            conn.execute("COMMIT")
+        except sqlite3.Error:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
 
     def _open_connection(self) -> sqlite3.Connection:
         conn = sqlite3.connect(
@@ -177,7 +254,8 @@ class RequestStore:
         try:
             for _ in range(_MAX_INSERT_ATTEMPTS):
                 request_id = str(uuid.uuid4())
-                created_at = _utc_now_rfc3339()
+                now = _utc_now()
+                created_at = _format_rfc3339(now)
                 conn.execute("BEGIN IMMEDIATE")
                 try:
                     conn.execute(
@@ -194,6 +272,10 @@ class RequestStore:
                             created_at,
                         ),
                     )
+                    # The acceptance event is committed atomically with the
+                    # record; idempotent replays take the conflict path and
+                    # never append events.
+                    _append_event(conn, tenant_id, request_id, _STATUS_ACCEPTED, now)
                 except sqlite3.IntegrityError:
                     conn.execute("ROLLBACK")
                     try:
@@ -280,6 +362,42 @@ class RequestStore:
             "created_at": row[2],
         }
 
+    def audit(self, tenant_id: str, request_id: str) -> list[dict[str, str]]:
+        """Return the persisted status-change timeline for a request.
+
+        Events are listed in occurrence order; each entry carries only
+        ``status`` and its UTC RFC 3339 ``occurred_at`` timestamp. The
+        last event always matches the status reported by :meth:`get`.
+        Unknown or cross-tenant ids raise :class:`RequestNotFound`.
+        """
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        request_id = _require_nonempty_str(request_id, "request_id")
+        # Serialize against writes for the shared in-memory connection,
+        # mirroring get().
+        if self._mem_conn is not None:
+            with self._write_lock:
+                return self._audit(tenant_id, request_id)
+        return self._audit(tenant_id, request_id)
+
+    def _audit(self, tenant_id: str, request_id: str) -> list[dict[str, str]]:
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT status, occurred_at FROM request_events "
+                "WHERE tenant_id = ? AND request_id = ? ORDER BY seq",
+                (tenant_id, request_id),
+            ).fetchall()
+        finally:
+            self._release(conn)
+        if not rows:
+            # Same outcome for unknown ids and cross-tenant lookups; every
+            # persisted request holds at least its acceptance event.
+            raise RequestNotFound("request not found")
+        return [
+            {"status": status, "occurred_at": occurred_at}
+            for status, occurred_at in rows
+        ]
+
     def transition(
         self,
         tenant_id: str,
@@ -343,6 +461,12 @@ class RequestStore:
                         # graph observed at read time.
                         conn.execute("ROLLBACK")
                         raise InvalidStatusTransition("illegal status transition")
+                    # The event is committed atomically with the status
+                    # update, so the timeline always ends at the persisted
+                    # current status.
+                    _append_event(
+                        conn, tenant_id, request_id, target_status, _utc_now()
+                    )
                     conn.execute("COMMIT")
                 except InvalidStatusTransition:
                     raise
