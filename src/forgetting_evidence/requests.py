@@ -9,6 +9,7 @@ module's own idempotency semantics and never surface to callers.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -16,7 +17,14 @@ import uuid
 from collections.abc import Mapping
 from datetime import datetime, timezone
 
-__all__ = ["RequestStore", "IdempotencyConflict", "RequestNotFound"]
+__all__ = [
+    "RequestStore",
+    "IdempotencyConflict",
+    "RequestNotFound",
+    "InvalidStatusTransition",
+]
+
+_log = logging.getLogger(__name__)
 
 
 class IdempotencyConflict(Exception):
@@ -25,6 +33,10 @@ class IdempotencyConflict(Exception):
 
 class RequestNotFound(Exception):
     """Raised when no request visible to the tenant matches the id."""
+
+
+class InvalidStatusTransition(Exception):
+    """Raised when a requested status change is unknown or not permitted."""
 
 
 class _PrimaryKeyConflict(Exception):
@@ -52,6 +64,19 @@ _BUSY_TIMEOUT_MS = 30_000
 # A UUIDv4 primary-key collision is astronomically unlikely; the bound
 # only keeps that conflict distinct from idempotency conflicts.
 _MAX_INSERT_ATTEMPTS = 3
+
+# Allowed request lifecycle. completed and failed are terminal; moving a
+# request to the status it already holds is an idempotent no-op.
+_STATUS_ACCEPTED = "accepted"
+_STATUS_PROCESSING = "processing"
+_STATUS_COMPLETED = "completed"
+_STATUS_FAILED = "failed"
+_ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
+    _STATUS_ACCEPTED: frozenset({_STATUS_PROCESSING, _STATUS_FAILED}),
+    _STATUS_PROCESSING: frozenset({_STATUS_COMPLETED, _STATUS_FAILED}),
+    _STATUS_COMPLETED: frozenset(),
+    _STATUS_FAILED: frozenset(),
+}
 
 
 def _require_nonempty_str(value: object, field: str) -> str:
@@ -253,4 +278,93 @@ class RequestStore:
             "request_id": row[0],
             "status": row[1],
             "created_at": row[2],
+        }
+
+    def transition(
+        self,
+        tenant_id: str,
+        request_id: str,
+        target_status: str,
+    ) -> dict[str, str]:
+        """Move a request to ``target_status`` according to the lifecycle.
+
+        Moving a request to the status it already holds is idempotent and
+        returns the current receipt. Unknown statuses and illegal moves
+        raise :class:`InvalidStatusTransition` without writing; unknown or
+        cross-tenant ids raise :class:`RequestNotFound`.
+        """
+        # Validate before touching the database, mirroring submit(): no
+        # rejected call may perform a write.
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        request_id = _require_nonempty_str(request_id, "request_id")
+        target_status = _require_nonempty_str(target_status, "target_status")
+        if target_status not in _ALLOWED_TRANSITIONS:
+            raise InvalidStatusTransition("unknown target status")
+
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                except sqlite3.Error:
+                    # Never surface the database engine's own error text.
+                    raise RuntimeError("failed to persist status transition") from None
+                try:
+                    row = conn.execute(
+                        "SELECT status, created_at FROM requests "
+                        "WHERE tenant_id = ? AND request_id = ?",
+                        (tenant_id, request_id),
+                    ).fetchone()
+                    if row is None:
+                        # Same outcome for unknown ids and cross-tenant lookups.
+                        conn.execute("ROLLBACK")
+                        raise RequestNotFound("request not found")
+                    current_status, created_at = row
+                    if current_status == target_status:
+                        # Idempotent replay: nothing to persist.
+                        conn.execute("ROLLBACK")
+                        return {
+                            "request_id": request_id,
+                            "status": current_status,
+                            "created_at": created_at,
+                        }
+                    allowed = _ALLOWED_TRANSITIONS.get(current_status, frozenset())
+                    if target_status not in allowed:
+                        conn.execute("ROLLBACK")
+                        raise InvalidStatusTransition("illegal status transition")
+                    cursor = conn.execute(
+                        "UPDATE requests SET status = ? "
+                        "WHERE tenant_id = ? AND request_id = ? AND status = ?",
+                        (target_status, tenant_id, request_id, current_status),
+                    )
+                    if cursor.rowcount != 1:
+                        # The row vanished or changed under us; refuse rather
+                        # than persisting a state that breaks the transition
+                        # graph observed at read time.
+                        conn.execute("ROLLBACK")
+                        raise InvalidStatusTransition("illegal status transition")
+                    conn.execute("COMMIT")
+                except InvalidStatusTransition:
+                    raise
+                except RequestNotFound:
+                    raise
+                except sqlite3.Error:
+                    # Best-effort cleanup; the rollback failure must not mask
+                    # the original problem or leak engine text.
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise RuntimeError("failed to persist status transition") from None
+            finally:
+                self._release(conn)
+        _log.info(
+            "status transition persisted request_id=%s status=%s",
+            request_id,
+            target_status,
+        )
+        return {
+            "request_id": request_id,
+            "status": target_status,
+            "created_at": created_at,
         }
