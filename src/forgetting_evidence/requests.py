@@ -16,7 +16,12 @@ import uuid
 from collections.abc import Mapping
 from datetime import datetime, timezone
 
-__all__ = ["RequestStore", "IdempotencyConflict", "RequestNotFound"]
+__all__ = [
+    "RequestStore",
+    "IdempotencyConflict",
+    "RequestNotFound",
+    "InvalidStatusTransition",
+]
 
 
 class IdempotencyConflict(Exception):
@@ -25,6 +30,10 @@ class IdempotencyConflict(Exception):
 
 class RequestNotFound(Exception):
     """Raised when no request visible to the tenant matches the id."""
+
+
+class InvalidStatusTransition(Exception):
+    """Raised when a status transition is not allowed by the state machine."""
 
 
 class _PrimaryKeyConflict(Exception):
@@ -52,6 +61,14 @@ _BUSY_TIMEOUT_MS = 30_000
 # A UUIDv4 primary-key collision is astronomically unlikely; the bound
 # only keeps that conflict distinct from idempotency conflicts.
 _MAX_INSERT_ATTEMPTS = 3
+
+# Lifecycle of a deletion request. Terminal states map to no successors.
+_ALLOWED_TRANSITIONS = {
+    "accepted": frozenset({"processing", "failed"}),
+    "processing": frozenset({"completed", "failed"}),
+    "completed": frozenset(),
+    "failed": frozenset(),
+}
 
 
 def _require_nonempty_str(value: object, field: str) -> str:
@@ -253,4 +270,79 @@ class RequestStore:
             "request_id": row[0],
             "status": row[1],
             "created_at": row[2],
+        }
+
+    def transition(
+        self,
+        tenant_id: str,
+        request_id: str,
+        target_status: str,
+    ) -> dict[str, str]:
+        """Move a request to ``target_status`` along the lifecycle graph.
+
+        Reaching the current status again is an idempotent success. Any
+        other disallowed move raises InvalidStatusTransition without
+        writing to the database.
+        """
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        request_id = _require_nonempty_str(request_id, "request_id")
+        target_status = _require_nonempty_str(target_status, "target_status")
+        if target_status not in _ALLOWED_TRANSITIONS:
+            raise InvalidStatusTransition("unknown target status")
+
+        # The write lock plus BEGIN IMMEDIATE serialize the read-modify-write
+        # against every other transition, in this process and others sharing
+        # the database file, so concurrent movers can never both succeed
+        # from the same source state.
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    row = conn.execute(
+                        "SELECT status, created_at FROM requests "
+                        "WHERE tenant_id = ? AND request_id = ?",
+                        (tenant_id, request_id),
+                    ).fetchone()
+                    if row is None:
+                        conn.execute("ROLLBACK")
+                        raise RequestNotFound("request not found")
+                    current_status, created_at = row
+                    if current_status == target_status:
+                        conn.execute("COMMIT")
+                    elif target_status in _ALLOWED_TRANSITIONS[current_status]:
+                        conn.execute(
+                            "UPDATE requests SET status = ? "
+                            "WHERE tenant_id = ? AND request_id = ? AND status = ?",
+                            (target_status, tenant_id, request_id, current_status),
+                        )
+                        conn.execute("COMMIT")
+                    else:
+                        conn.execute("ROLLBACK")
+                        raise InvalidStatusTransition(
+                            "status transition is not allowed"
+                        )
+                except sqlite3.Error:
+                    # Never surface raw database errors to callers.
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise RuntimeError(
+                        "status transition could not be persisted"
+                    ) from None
+                except Exception:
+                    # Defensive: never leave a transaction open on a shared
+                    # connection.
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
+            finally:
+                self._release(conn)
+        return {
+            "request_id": request_id,
+            "status": target_status,
+            "created_at": created_at,
         }
