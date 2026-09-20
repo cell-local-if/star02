@@ -1,13 +1,18 @@
 import hashlib
+import hmac
 import os
 import re
+import shutil
 import sqlite3
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 
 from forgetting_evidence.requests import (
+    IntegrityAnchor,
+    IntegrityConfigurationError,
     InvalidStatusTransition,
+    LegacyEvidenceUnsupported,
     RequestNotFound,
     RequestStore,
 )
@@ -414,13 +419,16 @@ class EvidenceTests(unittest.TestCase):
         rebuilt = self._store()
         self.assertTrue(rebuilt.verify_evidence("tenant-a", receipt["request_id"]))
 
-    def test_genesis_hash_is_sha256_of_documented_preimage(self):        # Independent recomputation guards the length-prefixed encoding.
-        store = self._store()
+    def test_genesis_hash_is_keyed_hmac_of_documented_preimage(self):
+        # Independent recomputation guards the length-prefixed HMAC
+        # encoding and the external key binding.
+        key = bytes(range(32))
+        store = RequestStore(self.db_path, integrity_key=key)
         receipt = store.submit("tenant-a", "subject-1", ["email"], "key-1")
         events = store.audit("tenant-a", receipt["request_id"])
         import struct
 
-        digest = hashlib.sha256()
+        purpose = "forgetting-evidence/status-event/v1"
         values = (
             "tenant-a",
             receipt["request_id"],
@@ -429,7 +437,8 @@ class EvidenceTests(unittest.TestCase):
             events[0]["occurred_at"],
             hashlib.sha256(b"").hexdigest(),
         )
-        for value in values:
+        digest = hmac.new(key, b"", hashlib.sha256)
+        for value in (purpose, *values):
             raw = value.encode()
             digest.update(struct.pack(">Q", len(raw)))
             digest.update(raw)
@@ -445,7 +454,7 @@ def snapshot(path):
 
 
 class LegacySchemaMigrationTests(unittest.TestCase):
-    """Databases created before chain hashes must upgrade transparently."""
+    """Databases created before keyed evidence are never silently trusted."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -487,23 +496,60 @@ class LegacySchemaMigrationTests(unittest.TestCase):
                 ],
             )
 
-    def test_legacy_database_is_upgraded_and_verifies(self):
+    def _legacy_bytes(self):
+        with sqlite3.connect(self.db_path) as conn:
+            return {
+                "request": conn.execute(
+                    "SELECT request_id, tenant_id, idempotency_key, "
+                    "subject_id, scopes_json, status, created_at "
+                    "FROM requests WHERE request_id = 'rid-1'"
+                ).fetchone(),
+                "events": conn.execute(
+                    "SELECT tenant_id, request_id, seq, status, occurred_at "
+                    "FROM status_events ORDER BY seq"
+                ).fetchall(),
+            }
+
+    def test_legacy_database_verifies_false_without_backfill(self):
+        self._create_legacy_database()
+        before = self._legacy_bytes()
+        store = RequestStore(self.db_path)
+        # Readable, but explicitly unprotected...
+        self.assertEqual(store.get("tenant-a", "rid-1")["status"], "processing")
+        self.assertEqual(
+            [e["status"] for e in store.audit("tenant-a", "rid-1")],
+            ["accepted", "processing"],
+        )
+        # ...and never reported as trustworthy evidence.
+        with self.assertRaises(LegacyEvidenceUnsupported):
+            store.evidence("tenant-a", "rid-1")
+        self.assertFalse(store.verify_evidence("tenant-a", "rid-1"))
+        # Rebuild does not change the verdict either.
+        rebuilt = RequestStore(self.db_path)
+        self.assertFalse(rebuilt.verify_evidence("tenant-a", "rid-1"))
+        with self.assertRaises(LegacyEvidenceUnsupported):
+            rebuilt.evidence("tenant-a", "rid-1")
+        # The upgrade is additive: original request/event rows were
+        # neither overwritten nor backfilled.
+        after = self._legacy_bytes()
+        self.assertEqual(before, after)
+
+    def test_legacy_request_cannot_be_extended(self):
         self._create_legacy_database()
         store = RequestStore(self.db_path)
-        ev = store.evidence("tenant-a", "rid-1")
-        self.assertEqual(ev["status"], "processing")
-        self.assertEqual(ev["event_count"], 2)
-        self.assertTrue(HEX64.match(ev["chain_hash"]))
-        self.assertTrue(store.verify_evidence("tenant-a", "rid-1"))
-        # The upgraded chain remains valid after a rebuild and accepts
-        # further transitions that extend the same chain.
-        rebuilt = RequestStore(self.db_path)
-        self.assertTrue(rebuilt.verify_evidence("tenant-a", "rid-1"))
-        rebuilt.transition("tenant-a", "rid-1", "completed")
-        self.assertTrue(rebuilt.verify_evidence("tenant-a", "rid-1"))
-        self.assertEqual(
-            rebuilt.evidence("tenant-a", "rid-1")["event_count"], 3
-        )
+        with self.assertRaises(LegacyEvidenceUnsupported):
+            store.transition("tenant-a", "rid-1", "completed")
+        # Even a same-status replay must not attach a fresh anchor to a
+        # legacy record.
+        with self.assertRaises(LegacyEvidenceUnsupported):
+            store.transition("tenant-a", "rid-1", "processing")
+        self.assertFalse(store.verify_evidence("tenant-a", "rid-1"))
+        with sqlite3.connect(self.db_path) as conn:
+            self.assertIsNone(
+                conn.execute(
+                    "SELECT anchor_value FROM requests WHERE request_id = 'rid-1'"
+                ).fetchone()[0]
+            )
 
     def test_legacy_tampered_timeline_fails_after_upgrade(self):
         self._create_legacy_database()
@@ -515,6 +561,253 @@ class LegacySchemaMigrationTests(unittest.TestCase):
             )
         store = RequestStore(self.db_path)
         self.assertFalse(store.verify_evidence("tenant-a", "rid-1"))
+
+    def test_new_requests_in_upgraded_database_are_protected(self):
+        self._create_legacy_database()
+        store = RequestStore(self.db_path)
+        receipt = store.submit("tenant-a", "subject-9", ["email"], "key-new")
+        self.assertTrue(store.verify_evidence("tenant-a", receipt["request_id"]))
+        store.transition("tenant-a", receipt["request_id"], "processing")
+        self.assertTrue(store.verify_evidence("tenant-a", receipt["request_id"]))
+        # The legacy row is still untouched and untrusted.
+        self.assertFalse(store.verify_evidence("tenant-a", "rid-1"))
+        rebuilt = RequestStore(self.db_path)
+        self.assertTrue(
+            rebuilt.verify_evidence("tenant-a", receipt["request_id"])
+        )
+        self.assertFalse(rebuilt.verify_evidence("tenant-a", "rid-1"))
+
+
+class ExternalTrustAnchorTests(unittest.TestCase):
+    """The integrity basis must not live in SQLite."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self._tmp.name, "nested", "evidence.db")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _fresh_lifecycle(self, **kwargs):
+        store = RequestStore(self.db_path, **kwargs)
+        receipt = store.submit("tenant-a", "subject-1", ["email"], "key-1")
+        store.transition("tenant-a", receipt["request_id"], "processing")
+        store.transition("tenant-a", receipt["request_id"], "completed")
+        return store, receipt
+
+    def test_default_sidecar_files_exist_outside_database(self):
+        store, receipt = self._fresh_lifecycle()
+        base = self.db_path
+        self.assertTrue(os.path.exists(base + ".integrity.key"))
+        self.assertTrue(os.path.exists(base + ".integrity.heads"))
+        mode = os.stat(base + ".integrity.key").st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+        # The raw key material never appears inside the database or in
+        # any evidence surface.
+        with open(base + ".integrity.key", "rb") as handle:
+            secret = handle.read()
+        with sqlite3.connect(self.db_path) as conn:
+            pages = b"".join(
+                str(row).encode()
+                for row in conn.execute(
+                    "SELECT name, sql FROM sqlite_master"
+                ).fetchall()
+            )
+            for table in ("requests", "status_events", "evidence_meta"):
+                pages += b"||".join(
+                    b"|".join(
+                        b"" if v is None else str(v).encode()
+                        for v in row
+                    )
+                    for row in conn.execute(f"SELECT * FROM {table}").fetchall()
+                )
+        self.assertNotIn(secret, pages)
+        rendered = repr(
+            (
+                store.evidence("tenant-a", receipt["request_id"]),
+                store.audit("tenant-a", receipt["request_id"]),
+            )
+        ).encode()
+        self.assertNotIn(secret, rendered)
+
+    def test_rebuild_without_external_files_cannot_verify(self):
+        _, receipt = self._fresh_lifecycle()
+        # Attacker obtains only the SQLite file (no key, no head ledger).
+        stolen = os.path.join(self._tmp.name, "stolen.db")
+        shutil.copyfile(self.db_path, stolen)
+        with self.assertRaises(IntegrityConfigurationError):
+            RequestStore(stolen)
+
+    def test_full_database_recompute_with_key_cannot_move_external_head(self):
+        store, receipt = self._fresh_lifecycle()
+        # Copy the whole deployment, including the key: the external
+        # ledger holds the previously attested head, so forging a
+        # different timeline and recomputing events/heads/anchors still
+        # has to disagree with that recorded state.
+        alt_dir = os.path.join(self._tmp.name, "alt")
+        os.makedirs(alt_dir)
+        alt_db = os.path.join(alt_dir, "evidence.db")
+        for suffix in (".integrity.key", ".integrity.heads"):
+            shutil.copyfile(self.db_path + suffix, alt_db + suffix)
+        # Build a forged database from scratch using the stolen key.
+        with open(self.db_path + ".integrity.key", "rb") as handle:
+            key = handle.read()
+        forged = RequestStore(alt_db, integrity_key=key)
+        fr = forged.submit("tenant-a", "subject-1", ["email"], "key-1")
+        forged.transition("tenant-a", fr["request_id"], "failed")
+        # Overwrite the *original* database rows with the forged request's
+        # id while reusing its recomputed chain/anchor fields wholesale.
+        with sqlite3.connect(alt_db) as conn:
+            frow = conn.execute(
+                "SELECT chain_hash, anchor_value, status FROM requests "
+                "WHERE request_id = ?",
+                (fr["request_id"],),
+            ).fetchone()
+            fevents = conn.execute(
+                "SELECT seq, status, occurred_at, chain_hash "
+                "FROM status_events WHERE request_id = ? ORDER BY seq",
+                (fr["request_id"],),
+            ).fetchall()
+        with sqlite3.connect(alt_db) as conn:
+            conn.execute(
+                "UPDATE requests SET request_id = ?, chain_hash = ?, "
+                "anchor_value = ?, status = ? WHERE request_id = ?",
+                (receipt["request_id"], frow[0], frow[1], frow[2], fr["request_id"]),
+            )
+            conn.execute(
+                "DELETE FROM status_events WHERE request_id = ?",
+                (receipt["request_id"],),
+            )
+            for seq, status, occurred_at, chain in fevents:
+                conn.execute(
+                    "INSERT INTO status_events "
+                    "(tenant_id, request_id, seq, status, occurred_at, chain_hash) "
+                    "VALUES ('tenant-a', ?, ?, ?, ?, ?)",
+                    (receipt["request_id"], seq, status, occurred_at, chain),
+                )
+            # Attacker recomputes every in-database anchor field too.
+            conn.execute(
+                "UPDATE evidence_meta SET domain = ?, value = ? "
+                "WHERE domain = ?",
+                (
+                    "head\x1ftenant-a\x1f" + receipt["request_id"],
+                    frow[1],
+                    "head\x1ftenant-a\x1f" + fr["request_id"],
+                ),
+            )
+        # The external ledger still records the genuine head; the
+        # substituted anchor cannot match it.
+        stolen_store = RequestStore(alt_db, integrity_key=key)
+        self.assertFalse(
+            stolen_store.verify_evidence("tenant-a", receipt["request_id"])
+        )
+
+    def test_wrong_key_fails_to_open_protected_database(self):
+        self._fresh_lifecycle()
+        with self.assertRaises(IntegrityConfigurationError):
+            RequestStore(self.db_path, integrity_key=b"x" * 32)
+
+    def test_explicit_key_rebuild_verifies(self):
+        key = bytes((i * 7 + 3) % 256 for i in range(32))
+        store, receipt = self._fresh_lifecycle(integrity_key=key)
+        rebuilt = RequestStore(self.db_path, integrity_key=key)
+        self.assertTrue(
+            rebuilt.verify_evidence("tenant-a", receipt["request_id"])
+        )
+        # The auto-generated sidecar key is not created when a key is
+        # supplied explicitly.
+        self.assertFalse(os.path.exists(self.db_path + ".integrity.key"))
+
+    def test_external_ledger_tamper_breaks_live_verification(self):
+        store, receipt = self._fresh_lifecycle()
+        ledger = self.db_path + ".integrity.heads"
+        with open(ledger, "rb") as handle:
+            state = bytearray(handle.read())
+        state[-5] ^= 0x01
+        with open(ledger, "wb") as handle:
+            handle.write(bytes(state))
+        # An already-open store strictly reads current persisted state
+        # and never repairs it: the corrupt ledger fails closed.
+        self.assertFalse(
+            store.verify_evidence("tenant-a", receipt["request_id"])
+        )
+        # Reopening reconciles the tag-only ledger from key-verified DB
+        # anchors, restoring the genuine state. Healing copies only tags
+        # that re-verify under the secret key, so it can never admit a
+        # forged head.
+        rebuilt = RequestStore(self.db_path)
+        self.assertTrue(
+            rebuilt.verify_evidence("tenant-a", receipt["request_id"])
+        )
+
+    def test_deleted_ledger_fails_until_writer_reconciles(self):
+        _, receipt = self._fresh_lifecycle()
+        os.unlink(self.db_path + ".integrity.heads")
+        rebuilt = RequestStore(self.db_path)
+        # Reopening reconciles the tag-only ledger from key-verified DB
+        # anchors, restoring the genuine state; a forged DB without the
+        # key still cannot produce valid tags to reconcile from.
+        self.assertTrue(
+            rebuilt.verify_evidence("tenant-a", receipt["request_id"])
+        )
+
+    def test_custom_anchor_implementation_is_honoured(self):
+        class RecordingAnchor(IntegrityAnchor):
+            def __init__(self):
+                self.calls = 0
+
+            def attest(self, purpose, parts):
+                self.calls += 1
+                return hmac.new(
+                    b"z" * 32,
+                    _encode(purpose, parts),
+                    hashlib.sha256,
+                ).hexdigest()
+
+            def verify_attestation(self, purpose, parts, tag):
+                return hmac.compare_digest(self.attest(purpose, parts), tag)
+
+        import struct as _struct
+
+        def _encode(purpose, parts):
+            out = bytearray()
+            for field in (purpose, *parts):
+                raw = field.encode()
+                out += _struct.pack(">Q", len(raw))
+                out += raw
+            return bytes(out)
+
+        anchor = RecordingAnchor()
+        store = RequestStore(self.db_path, integrity_anchor=anchor)
+        receipt = store.submit("tenant-a", "subject-1", ["email"], "key-1")
+        self.assertGreater(anchor.calls, 0)
+        self.assertTrue(store.verify_evidence("tenant-a", receipt["request_id"]))
+
+    def test_key_material_never_in_errors_or_logs(self):
+        wrong = b"a" * 32
+        self._fresh_lifecycle(integrity_key=bytes(range(32)))
+        try:
+            RequestStore(self.db_path, integrity_key=wrong)
+        except IntegrityConfigurationError as exc:
+            message = str(exc)
+        else:
+            self.fail("expected IntegrityConfigurationError")
+        self.assertNotIn(wrong.hex(), message)
+        self.assertNotIn(wrong.decode(), message)
+        import io
+        import logging
+
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        logger = logging.getLogger("forgetting_evidence.requests")
+        logger.addHandler(handler)
+        try:
+            store = RequestStore(self.db_path, integrity_key=bytes(range(32)))
+            receipt = store.submit("tenant-a", "s", ["email"], "k")
+            store.transition("tenant-a", receipt["request_id"], "failed")
+        finally:
+            logger.removeHandler(handler)
+        self.assertNotIn(bytes(range(32)).hex(), stream.getvalue())
 
 
 if __name__ == "__main__":
