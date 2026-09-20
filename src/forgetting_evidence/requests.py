@@ -9,10 +9,21 @@ Every accepted request carries a persistent, append-only status timeline
 in ``status_events``. Events are written in the same transaction as the
 request row or status change they describe, so the final timeline entry
 always matches the request's current status.
+
+Each event additionally seals a persistent hash chain in ``event_chain``
+in that same transaction. A link binds the tenant, request id, event
+sequence, resulting status and occurrence time together with the
+previous link's digest, so the persisted timeline cannot be modified,
+reordered, inserted into or transplanted from another request or tenant
+without :meth:`RequestStore.verify_evidence` noticing. Verification
+recomputes expected digests read-only and never overwrites stored
+evidence; the digests, not the chained preimage, are the only chain data
+that surfaces.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -21,6 +32,7 @@ import threading
 import uuid
 from collections.abc import Mapping
 from datetime import datetime, timezone
+from hmac import compare_digest
 
 __all__ = [
     "RequestStore",
@@ -76,6 +88,20 @@ CREATE TABLE IF NOT EXISTS status_events (
 );
 """
 
+# One sealed link per status event, written in the same transaction as the
+# event it authenticates. Stored digests are the only chain material that
+# ever leaves the database: the chained preimage is never persisted as a
+# column and never appears in return values, exceptions or logs.
+_CHAIN_TABLE = """
+CREATE TABLE IF NOT EXISTS event_chain (
+    tenant_id  TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    seq        INTEGER NOT NULL,
+    chain_hash TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, request_id, seq)
+);
+"""
+
 # The composite primary key already indexes (tenant_id, request_id, seq),
 # which serves both the ordered timeline read and the latest-event lookup.
 
@@ -83,6 +109,10 @@ _BUSY_TIMEOUT_MS = 30_000
 # A UUIDv4 primary-key collision is astronomically unlikely; the bound
 # only keeps that conflict distinct from idempotency conflicts.
 _MAX_INSERT_ATTEMPTS = 3
+
+# Prefix mixed into every chain preimage so a digest computed here cannot
+# be confused with an unrelated SHA-256 of the same fields.
+_CHAIN_DOMAIN = "forgetting-evidence/status-chain/v1"
 
 # Allowed request lifecycle. completed and failed are terminal; moving a
 # request to the status it already holds is an idempotent no-op.
@@ -136,6 +166,40 @@ def _occurred_at_not_before(latest: str) -> str:
     return now if now >= latest else latest
 
 
+def _chain_digest(
+    tenant_id: str,
+    request_id: str,
+    seq: int,
+    status: str,
+    occurred_at: str,
+    prev_hash: str,
+) -> str:
+    """Return the 64-char lowercase hex SHA-256 link for one event.
+
+    The preimage is a single JSON object with fixed key order. JSON
+    string escaping makes the encoding unambiguous without inventing a
+    field separator that a tenant- or request-id could collide with.
+    The digest binds the tenant, request, sequence, status, occurrence
+    time and previous link, so deleting, altering, inserting or swapping
+    any event breaks every subsequent link.
+    """
+    preimage = json.dumps(
+        {
+            "domain": _CHAIN_DOMAIN,
+            "tenant_id": tenant_id,
+            "request_id": request_id,
+            "seq": seq,
+            "status": status,
+            "occurred_at": occurred_at,
+            "prev_hash": prev_hash,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(preimage).hexdigest()
+
+
 class RequestStore:
     """Persist and retrieve accepted deletion requests."""
 
@@ -155,6 +219,7 @@ class RequestStore:
             conn.execute(_SCHEMA)
             conn.execute(_UNIQUE_TENANT_KEY)
             conn.execute(_EVENT_TABLE)
+            conn.execute(_CHAIN_TABLE)
         finally:
             self._release(conn)
 
@@ -244,6 +309,17 @@ class RequestStore:
                         "tenant_id, request_id, seq, status, occurred_at"
                         ") VALUES (?, ?, 0, 'accepted', ?)",
                         (tenant_id, request_id, created_at),
+                    )
+                    # Seal the genesis link in that same transaction. The
+                    # empty predecessor anchors every per-request chain.
+                    genesis_hash = _chain_digest(
+                        tenant_id, request_id, 0, "accepted", created_at, ""
+                    )
+                    conn.execute(
+                        "INSERT INTO event_chain ("
+                        "tenant_id, request_id, seq, chain_hash"
+                        ") VALUES (?, ?, 0, ?)",
+                        (tenant_id, request_id, genesis_hash),
                     )
                 except sqlite3.Error:
                     conn.execute("ROLLBACK")
@@ -419,6 +495,35 @@ class RequestStore:
                             occurred_at,
                         ),
                     )
+                    # Seal the successor link against the previous one in
+                    # the same transaction as the status update. BEGIN
+                    # IMMEDIATE serializes writers, so the predecessor read
+                    # and the link insert can never interleave with another
+                    # transition on the same request.
+                    prev_row = conn.execute(
+                        "SELECT chain_hash FROM event_chain "
+                        "WHERE tenant_id = ? AND request_id = ? AND seq = ?",
+                        (tenant_id, request_id, next_seq),
+                    ).fetchone()
+                    if prev_row is None:
+                        # Defensive only: every event owns a link, so this
+                        # means the chain invariant was broken out of band.
+                        conn.execute("ROLLBACK")
+                        raise RuntimeError("failed to persist status transition")
+                    link_hash = _chain_digest(
+                        tenant_id,
+                        request_id,
+                        next_seq + 1,
+                        target_status,
+                        occurred_at,
+                        prev_row[0],
+                    )
+                    conn.execute(
+                        "INSERT INTO event_chain ("
+                        "tenant_id, request_id, seq, chain_hash"
+                        ") VALUES (?, ?, ?, ?)",
+                        (tenant_id, request_id, next_seq + 1, link_hash),
+                    )
                     conn.execute("COMMIT")
                 except InvalidStatusTransition:
                     raise
@@ -489,3 +594,162 @@ class RequestStore:
             {"status": status, "occurred_at": occurred_at}
             for status, occurred_at in rows
         ]
+
+    def evidence(self, tenant_id: str, request_id: str) -> dict[str, object]:
+        """Return the persisted integrity evidence for one request.
+
+        The result contains only ``request_id``, ``status`` (equal to
+        :meth:`get`), ``event_count`` (equal to the :meth:`audit`
+        timeline length) and ``chain_hash`` (the 64-character lowercase
+        hex SHA-256 tip of the persisted audit chain). Unknown ids and
+        cross-tenant lookups raise :class:`RequestNotFound` identically.
+        """
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        request_id = _require_nonempty_str(request_id, "request_id")
+        if self._mem_conn is not None:
+            with self._write_lock:
+                return self._evidence(tenant_id, request_id)
+        return self._evidence(tenant_id, request_id)
+
+    def _evidence(self, tenant_id: str, request_id: str) -> dict[str, object]:
+        conn = self._connect()
+        try:
+            # Gate on ownership exactly like get()/audit() so a missing
+            # record and a foreign one are indistinguishable.
+            row = conn.execute(
+                "SELECT status FROM requests "
+                "WHERE tenant_id = ? AND request_id = ?",
+                (tenant_id, request_id),
+            ).fetchone()
+            if row is None:
+                raise RequestNotFound("request not found")
+            status = row[0]
+            event_count = conn.execute(
+                "SELECT count(*) FROM status_events "
+                "WHERE tenant_id = ? AND request_id = ?",
+                (tenant_id, request_id),
+            ).fetchone()[0]
+            tip = conn.execute(
+                "SELECT chain_hash FROM event_chain "
+                "WHERE tenant_id = ? AND request_id = ? ORDER BY seq DESC LIMIT 1",
+                (tenant_id, request_id),
+            ).fetchone()
+        finally:
+            self._release(conn)
+        if tip is None:
+            # Every request seals a genesis link in its acceptance
+            # transaction, so a missing tip means the store was damaged
+            # out of band; surface a generic failure rather than a guess.
+            raise RuntimeError("request evidence unavailable")
+        return {
+            "request_id": request_id,
+            "status": status,
+            "event_count": event_count,
+            "chain_hash": tip[0],
+        }
+
+    def verify_evidence(self, tenant_id: str, request_id: str) -> bool:
+        """Verify the persisted audit chain for one request, read-only.
+
+        Recomputes every link from the stored ``status_events`` timeline
+        and compares it against the persisted ``event_chain`` digests
+        without ever recomputing-and-overwriting stored evidence. Returns
+        ``True`` only when the sequences are gap-free from zero, every
+        stored link matches the link derived from tenant, request, seq,
+        status, occurrence time and predecessor, the tip timeline status
+        equals the request's current status, and no chain or timeline
+        row is missing, duplicated or extra. Deleting, altering,
+        inserting or swapping events, or transplanting events or links
+        from another request or tenant, yields ``False``. Unknown ids
+        and cross-tenant lookups raise :class:`RequestNotFound`.
+        """
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        request_id = _require_nonempty_str(request_id, "request_id")
+        if self._mem_conn is not None:
+            with self._write_lock:
+                return self._verify_evidence(tenant_id, request_id)
+        return self._verify_evidence(tenant_id, request_id)
+
+    def _verify_evidence(self, tenant_id: str, request_id: str) -> bool:
+        conn = self._connect()
+        try:
+            owner = conn.execute(
+                "SELECT status FROM requests "
+                "WHERE tenant_id = ? AND request_id = ?",
+                (tenant_id, request_id),
+            ).fetchone()
+            if owner is None:
+                raise RequestNotFound("request not found")
+            current_status = owner[0]
+            events = conn.execute(
+                "SELECT seq, status, occurred_at FROM status_events "
+                "WHERE tenant_id = ? AND request_id = ? ORDER BY seq",
+                (tenant_id, request_id),
+            ).fetchall()
+            links = conn.execute(
+                "SELECT seq, chain_hash FROM event_chain "
+                "WHERE tenant_id = ? AND request_id = ? ORDER BY seq",
+                (tenant_id, request_id),
+            ).fetchall()
+        finally:
+            self._release(conn)
+        return self._chain_intact(
+            tenant_id, request_id, current_status, events, links
+        )
+
+    @staticmethod
+    def _chain_intact(
+        tenant_id: str,
+        request_id: str,
+        current_status: str,
+        events: list[tuple[object, object, object]],
+        links: list[tuple[object, object]],
+    ) -> bool:
+        # Pure recomputation: this path never writes, so damaged evidence
+        # can never be silently "repaired" into a passing result.
+        if not events:
+            return False
+        event_seqs = [event[0] for event in events]
+        if event_seqs != list(range(len(events))):
+            # Gap, duplicate or non-zero start: an event was inserted,
+            # deleted or reordered.
+            return False
+        if [link[0] for link in links] != event_seqs:
+            # A missing, extra or duplicated link breaks the 1:1 binding.
+            return False
+        if events[0][1] != _STATUS_ACCEPTED:
+            return False
+        previous_hash = ""
+        for (seq, status, occurred_at), (_, stored_hash) in zip(events, links):
+            # Only values with the shapes the writers produce can be
+            # authentic; anything else (a corrupted/forged row) simply
+            # fails, and compare_digest must not receive non-ASCII text.
+            if (
+                not isinstance(seq, int)
+                or isinstance(seq, bool)
+                or not isinstance(status, str)
+                or not isinstance(occurred_at, str)
+                or not isinstance(stored_hash, str)
+                or len(stored_hash) != 64
+            ):
+                return False
+            expected_hash = _chain_digest(
+                tenant_id,
+                request_id,
+                seq,
+                status,
+                occurred_at,
+                previous_hash,
+            )
+            try:
+                # compare_digest avoids short-circuiting on the first
+                # unequal character.
+                if not compare_digest(expected_hash, stored_hash):
+                    return False
+            except TypeError:
+                # Non-ASCII stored text: cannot be a lowercase hex digest.
+                return False
+            previous_hash = stored_hash
+        # The sealed timeline must end at the authoritative row status;
+        # otherwise the request row or the final event was altered.
+        return events[-1][1] == current_status
