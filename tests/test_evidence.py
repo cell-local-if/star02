@@ -7,6 +7,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 
 from forgetting_evidence.requests import (
+    EvidenceNotAnchored,
     InvalidStatusTransition,
     RequestNotFound,
     RequestStore,
@@ -444,8 +445,13 @@ def snapshot(path):
         return handle.read()
 
 
-class LegacySchemaMigrationTests(unittest.TestCase):
-    """Databases created before chain hashes must upgrade transparently."""
+class LegacyDatabaseTests(unittest.TestCase):
+    """Databases created before protected anchoring must not be trusted.
+
+    The store never upgrades, backfills or overwrites them: reads of
+    non-sensitive fields keep working, but evidence is reported as
+    explicitly unprotected and every mutating call is refused.
+    """
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -487,34 +493,85 @@ class LegacySchemaMigrationTests(unittest.TestCase):
                 ],
             )
 
-    def test_legacy_database_is_upgraded_and_verifies(self):
+    def test_legacy_verify_is_explicitly_untrusted(self):
         self._create_legacy_database()
         store = RequestStore(self.db_path)
-        ev = store.evidence("tenant-a", "rid-1")
-        self.assertEqual(ev["status"], "processing")
-        self.assertEqual(ev["event_count"], 2)
-        self.assertTrue(HEX64.match(ev["chain_hash"]))
-        self.assertTrue(store.verify_evidence("tenant-a", "rid-1"))
-        # The upgraded chain remains valid after a rebuild and accepts
-        # further transitions that extend the same chain.
+        with self.assertRaises(EvidenceNotAnchored):
+            store.verify_evidence("tenant-a", "rid-1")
+        with self.assertRaises(EvidenceNotAnchored):
+            store.evidence("tenant-a", "rid-1")
+        # And stays untrusted after a rebuild.
         rebuilt = RequestStore(self.db_path)
-        self.assertTrue(rebuilt.verify_evidence("tenant-a", "rid-1"))
-        rebuilt.transition("tenant-a", "rid-1", "completed")
-        self.assertTrue(rebuilt.verify_evidence("tenant-a", "rid-1"))
-        self.assertEqual(
-            rebuilt.evidence("tenant-a", "rid-1")["event_count"], 3
-        )
+        with self.assertRaises(EvidenceNotAnchored):
+            rebuilt.verify_evidence("tenant-a", "rid-1")
 
-    def test_legacy_tampered_timeline_fails_after_upgrade(self):
+    def test_legacy_error_message_leaks_nothing(self):
+        self._create_legacy_database()
+        store = RequestStore(self.db_path)
+        try:
+            store.verify_evidence("tenant-a", "rid-1")
+        except EvidenceNotAnchored as exc:
+            message = str(exc)
+        else:
+            self.fail("expected EvidenceNotAnchored")
+        self.assertNotIn("rid-1", message)
+        self.assertNotIn("tenant-a", message)
+        self.assertNotIn("2026", message)
+
+    def test_legacy_reads_keep_working(self):
+        self._create_legacy_database()
+        store = RequestStore(self.db_path)
+        self.assertEqual(store.get("tenant-a", "rid-1")["status"], "processing")
+        self.assertEqual(
+            [e["status"] for e in store.audit("tenant-a", "rid-1")],
+            ["accepted", "processing"],
+        )
+        with self.assertRaises(RequestNotFound):
+            store.verify_evidence("tenant-a", "missing")
+
+    def test_legacy_writes_are_refused_without_touching_records(self):
+        self._create_legacy_database()
+        store = RequestStore(self.db_path)
+        with self.assertRaises(EvidenceNotAnchored):
+            store.transition("tenant-a", "rid-1", "completed")
+        with self.assertRaises(EvidenceNotAnchored):
+            store.submit("tenant-a", "subject-9", ["email"], "key-9")
+        with sqlite3.connect(self.db_path) as conn:
+            # Original audit records survive byte-for-byte in content.
+            self.assertEqual(
+                conn.execute(
+                    "SELECT status, occurred_at FROM status_events "
+                    "WHERE request_id = 'rid-1' ORDER BY seq"
+                ).fetchall(),
+                [
+                    ("accepted", "2026-01-01T00:00:00Z"),
+                    ("processing", "2026-01-01T00:00:01Z"),
+                ],
+            )
+            self.assertEqual(
+                conn.execute(
+                    "SELECT status FROM requests WHERE request_id = 'rid-1'"
+                ).fetchone(),
+                ("processing",),
+            )
+            self.assertEqual(conn.execute("SELECT count(*) FROM requests").fetchone()[0], 1)
+
+    def test_legacy_open_creates_no_protected_files(self):
+        self._create_legacy_database()
+        RequestStore(self.db_path)
+        self.assertFalse(os.path.exists(self.db_path + ".anchor"))
+        self.assertFalse(os.path.exists(self.db_path + ".anchor.key"))
+
+    def test_legacy_tampered_timeline_is_still_untrusted(self):
         self._create_legacy_database()
         with sqlite3.connect(self.db_path) as conn:
-            # Tamper before the store ever opens the file.
             conn.execute(
                 "UPDATE status_events SET status = 'failed' "
                 "WHERE request_id = 'rid-1' AND seq = 1"
             )
         store = RequestStore(self.db_path)
-        self.assertFalse(store.verify_evidence("tenant-a", "rid-1"))
+        with self.assertRaises(EvidenceNotAnchored):
+            store.verify_evidence("tenant-a", "rid-1")
 
 
 if __name__ == "__main__":

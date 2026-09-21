@@ -4,3 +4,6 @@ __pycache__/
 *.sqlite*
 .coverage
 .pytest_cache/
+# Protected audit-anchor material (master key + anchor journal)
+*.anchor
+*.anchor.key
