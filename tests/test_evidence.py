@@ -487,22 +487,35 @@ class LegacySchemaMigrationTests(unittest.TestCase):
                 ],
             )
 
-    def test_legacy_database_is_upgraded_and_verifies(self):
+    def test_legacy_database_upgrades_but_never_verifies(self):
+        # Pre-anchoring databases are upgraded additively: their audit
+        # records stay readable and the keyless hash chain is restored,
+        # but the missing keyed anchor can never be fabricated, so the
+        # request must NOT be silently trusted.
         self._create_legacy_database()
         store = RequestStore(self.db_path)
         ev = store.evidence("tenant-a", "rid-1")
         self.assertEqual(ev["status"], "processing")
         self.assertEqual(ev["event_count"], 2)
         self.assertTrue(HEX64.match(ev["chain_hash"]))
-        self.assertTrue(store.verify_evidence("tenant-a", "rid-1"))
-        # The upgraded chain remains valid after a rebuild and accepts
-        # further transitions that extend the same chain.
+        self.assertFalse(store.verify_evidence("tenant-a", "rid-1"))
         rebuilt = RequestStore(self.db_path)
-        self.assertTrue(rebuilt.verify_evidence("tenant-a", "rid-1"))
+        self.assertFalse(rebuilt.verify_evidence("tenant-a", "rid-1"))
+        # The state machine remains usable; extending an unanchored chain
+        # still cannot make it verify (its genesis is unanchored).
         rebuilt.transition("tenant-a", "rid-1", "completed")
-        self.assertTrue(rebuilt.verify_evidence("tenant-a", "rid-1"))
         self.assertEqual(
             rebuilt.evidence("tenant-a", "rid-1")["event_count"], 3
+        )
+        self.assertFalse(rebuilt.verify_evidence("tenant-a", "rid-1"))
+        # The original audit records are preserved verbatim.
+        timeline = rebuilt.audit("tenant-a", "rid-1")
+        self.assertEqual(
+            [(e["status"], e["occurred_at"]) for e in timeline[:2]],
+            [
+                ("accepted", "2026-01-01T00:00:00Z"),
+                ("processing", "2026-01-01T00:00:01Z"),
+            ],
         )
 
     def test_legacy_tampered_timeline_fails_after_upgrade(self):
@@ -514,6 +527,16 @@ class LegacySchemaMigrationTests(unittest.TestCase):
                 "WHERE request_id = 'rid-1' AND seq = 1"
             )
         store = RequestStore(self.db_path)
+        self.assertFalse(store.verify_evidence("tenant-a", "rid-1"))
+
+    def test_legacy_and_new_requests_coexist(self):
+        self._create_legacy_database()
+        store = RequestStore(self.db_path)
+        receipt = store.submit("tenant-a", "subject-9", ["email"], "key-new")
+        store.transition("tenant-a", receipt["request_id"], "processing")
+        # New request is fully anchored and verifies; the legacy one
+        # never does, even within the same database.
+        self.assertTrue(store.verify_evidence("tenant-a", receipt["request_id"]))
         self.assertFalse(store.verify_evidence("tenant-a", "rid-1"))
 
 

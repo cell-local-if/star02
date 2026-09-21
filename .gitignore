@@ -4,3 +4,6 @@ __pycache__/
 *.sqlite*
 .coverage
 .pytest_cache/
+# Protected anchor material must never be committed.
+*.key
+*.anchorlog
