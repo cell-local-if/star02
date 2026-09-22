@@ -445,7 +445,7 @@ def snapshot(path):
 
 
 class LegacySchemaMigrationTests(unittest.TestCase):
-    """Databases created before chain hashes must upgrade transparently."""
+    """Databases created before chain hashes upgrade without trust."""
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -487,17 +487,50 @@ class LegacySchemaMigrationTests(unittest.TestCase):
                 ],
             )
 
-    def test_legacy_database_is_upgraded_and_verifies(self):
+    def _legacy_event_rows(self):
+        with sqlite3.connect(self.db_path) as conn:
+            return conn.execute(
+                "SELECT tenant_id, request_id, seq, status, occurred_at "
+                "FROM status_events ORDER BY seq"
+            ).fetchall()
+
+    def test_unanchored_legacy_database_is_not_silently_trusted(self):
         self._create_legacy_database()
+        before = self._legacy_event_rows()
         store = RequestStore(self.db_path)
+        # The additive migration still backfills chain columns, but no
+        # sidecar exists, so the database is incomplete rather than valid.
+        self.assertEqual(store.recover(), "incomplete")
+        self.assertFalse(store.verify_evidence("tenant-a", "rid-1"))
+        # Reads keep their existing behaviour.
+        ev = store.evidence("tenant-a", "rid-1")
+        self.assertEqual(ev["status"], "processing")
+        self.assertEqual(ev["event_count"], 2)
+        # Writes are refused rather than silently anchoring untrusted data.
+        with self.assertRaises(RuntimeError):
+            store.transition("tenant-a", "rid-1", "completed")
+        with self.assertRaises(RuntimeError):
+            store.submit("tenant-a", "subject-2", ["email"], "key-2")
+        # The upgrade never overwrote audit records.
+        self.assertEqual(self._legacy_event_rows(), before)
+
+    def test_legacy_database_adopted_with_key_anchors_and_verifies(self):
+        self._create_legacy_database()
+        before = self._legacy_event_rows()
+        key = b"operator-adoption-key-0123456789ab"
+        store = RequestStore(self.db_path, integrity_key=key)
+        self.assertEqual(store.recover(), "valid")
         ev = store.evidence("tenant-a", "rid-1")
         self.assertEqual(ev["status"], "processing")
         self.assertEqual(ev["event_count"], 2)
         self.assertTrue(HEX64.match(ev["chain_hash"]))
         self.assertTrue(store.verify_evidence("tenant-a", "rid-1"))
-        # The upgraded chain remains valid after a rebuild and accepts
-        # further transitions that extend the same chain.
+        # Audit rows are byte-for-byte preserved by adoption.
+        self.assertEqual(self._legacy_event_rows(), before)
+        # A rebuilt instance (key lives only in the sidecar) keeps
+        # verifying and accepts further transitions on the same chain.
         rebuilt = RequestStore(self.db_path)
+        self.assertEqual(rebuilt.recover(), "valid")
         self.assertTrue(rebuilt.verify_evidence("tenant-a", "rid-1"))
         rebuilt.transition("tenant-a", "rid-1", "completed")
         self.assertTrue(rebuilt.verify_evidence("tenant-a", "rid-1"))
@@ -505,7 +538,7 @@ class LegacySchemaMigrationTests(unittest.TestCase):
             rebuilt.evidence("tenant-a", "rid-1")["event_count"], 3
         )
 
-    def test_legacy_tampered_timeline_fails_after_upgrade(self):
+    def test_legacy_tampered_timeline_fails_after_adoption(self):
         self._create_legacy_database()
         with sqlite3.connect(self.db_path) as conn:
             # Tamper before the store ever opens the file.
@@ -513,7 +546,10 @@ class LegacySchemaMigrationTests(unittest.TestCase):
                 "UPDATE status_events SET status = 'failed' "
                 "WHERE request_id = 'rid-1' AND seq = 1"
             )
-        store = RequestStore(self.db_path)
+        store = RequestStore(self.db_path, integrity_key=b"x" * 32)
+        # Adoption anchors the (tampered) state as-is; the per-request
+        # chain still detects the semantic inconsistency.
+        self.assertEqual(store.recover(), "valid")
         self.assertFalse(store.verify_evidence("tenant-a", "rid-1"))
 
 
