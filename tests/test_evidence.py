@@ -15,17 +15,28 @@ from forgetting_evidence.requests import (
 
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 
+# Caller-held secret: in production this lives outside both SQLite and
+# the sidecar (secret manager / KMS / ops vault). Tests keep a fixed
+# value purely so rebuilds can authenticate.
+INTEGRITY_KEY = b"unit-test-integrity-key-0123456789abcdef"
+
 
 class EvidenceTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.db_path = os.path.join(self._tmp.name, "nested", "evidence.db")
+        self.anchor_path = os.path.join(self._tmp.name, "nested", "evidence.anchor")
+        self.key = INTEGRITY_KEY
 
     def tearDown(self):
         self._tmp.cleanup()
 
-    def _store(self):
-        return RequestStore(self.db_path)
+    def _store(self, key=None):
+        return RequestStore(
+            self.db_path,
+            anchor_path=self.anchor_path,
+            integrity_key=self.key if key is None else key,
+        )
 
     def _fresh_lifecycle(self, statuses=("processing", "completed"), key="key-1"):
         store = self._store()
@@ -110,7 +121,9 @@ class EvidenceTests(unittest.TestCase):
         self.assertTrue(rebuilt.verify_evidence("tenant-a", receipt["request_id"]))
 
     def test_in_memory_chain(self):
-        store = RequestStore(":memory:")
+        store = RequestStore(
+            ":memory:", anchor_path=self.anchor_path, integrity_key=self.key
+        )
         receipt = store.submit("tenant-a", "subject-1", ["email"], "key-1")
         store.transition("tenant-a", receipt["request_id"], "processing")
         self.assertTrue(store.verify_evidence("tenant-a", receipt["request_id"]))
@@ -445,14 +458,27 @@ def snapshot(path):
 
 
 class LegacySchemaMigrationTests(unittest.TestCase):
-    """Databases created before chain hashes must upgrade transparently."""
+    """Databases created before trusted anchoring must not verify.
+
+    The public chain is backfilled additively so timelines stay
+    coherent, but no trusted anchor is fabricated: verify_evidence is
+    False and recover() reports "incomplete" until an anchored write
+    extends the record.
+    """
 
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.db_path = os.path.join(self._tmp.name, "evidence.db")
+        self.anchor_path = os.path.join(self._tmp.name, "evidence.anchor")
+        self.key = INTEGRITY_KEY
 
     def tearDown(self):
         self._tmp.cleanup()
+
+    def _store(self):
+        return RequestStore(
+            self.db_path, anchor_path=self.anchor_path, integrity_key=self.key
+        )
 
     def _create_legacy_database(self):
         with sqlite3.connect(self.db_path) as conn:
@@ -487,23 +513,28 @@ class LegacySchemaMigrationTests(unittest.TestCase):
                 ],
             )
 
-    def test_legacy_database_is_upgraded_and_verifies(self):
+    def test_legacy_database_fails_trusted_verification_until_extended(self):
         self._create_legacy_database()
-        store = RequestStore(self.db_path)
+        store = self._store()
+        # Public evidence is still readable and coherent...
         ev = store.evidence("tenant-a", "rid-1")
         self.assertEqual(ev["status"], "processing")
         self.assertEqual(ev["event_count"], 2)
         self.assertTrue(HEX64.match(ev["chain_hash"]))
-        self.assertTrue(store.verify_evidence("tenant-a", "rid-1"))
-        # The upgraded chain remains valid after a rebuild and accepts
-        # further transitions that extend the same chain.
-        rebuilt = RequestStore(self.db_path)
-        self.assertTrue(rebuilt.verify_evidence("tenant-a", "rid-1"))
+        # ...but without a keyed external anchor it is not trusted.
+        self.assertFalse(store.verify_evidence("tenant-a", "rid-1"))
+        self.assertEqual(store.recover(), "incomplete")
+        rebuilt = self._store()
+        self.assertFalse(rebuilt.verify_evidence("tenant-a", "rid-1"))
+        # A properly anchored write extends the same chain; the new head
+        # is keyed, and the backfilled public prefix now verifies under
+        # it because the links chain into the anchored head.
         rebuilt.transition("tenant-a", "rid-1", "completed")
         self.assertTrue(rebuilt.verify_evidence("tenant-a", "rid-1"))
-        self.assertEqual(
-            rebuilt.evidence("tenant-a", "rid-1")["event_count"], 3
-        )
+        self.assertEqual(rebuilt.evidence("tenant-a", "rid-1")["event_count"], 3)
+        self.assertEqual(rebuilt.recover(), "valid")
+        again = self._store()
+        self.assertTrue(again.verify_evidence("tenant-a", "rid-1"))
 
     def test_legacy_tampered_timeline_fails_after_upgrade(self):
         self._create_legacy_database()
@@ -513,8 +544,9 @@ class LegacySchemaMigrationTests(unittest.TestCase):
                 "UPDATE status_events SET status = 'failed' "
                 "WHERE request_id = 'rid-1' AND seq = 1"
             )
-        store = RequestStore(self.db_path)
+        store = self._store()
         self.assertFalse(store.verify_evidence("tenant-a", "rid-1"))
+        self.assertEqual(store.recover(), "invalid")
 
 
 if __name__ == "__main__":
