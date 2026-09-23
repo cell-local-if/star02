@@ -16,6 +16,16 @@ occurrence time and the previous event's hash. The hash of the final
 event is also stored on the request row, so deleting, modifying,
 inserting or reordering persisted events breaks verification. The hash
 preimage is never exposed in return values, exceptions or logs.
+
+Concurrent worker processes draw work through persistent execution
+leases (:meth:`RequestStore.claim_next`). A lease is anchored to the
+request row by an unpredictable token and an absolute UTC expiry, both
+of which are persisted, so leases survive process and store-instance
+restarts. At most one unexpired lease may exist for any request: a
+request is only claimable while ``accepted`` or while a previous lease
+has expired. Completing a leased request (:meth:`RequestStore.finish_claim`)
+atomically moves it to a terminal state; expired, unknown or foreign
+tokens can never drive a status change.
 """
 
 from __future__ import annotations
@@ -25,18 +35,20 @@ import hmac
 import json
 import logging
 import os
+import secrets
 import sqlite3
 import struct
 import threading
 import uuid
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 __all__ = [
     "RequestStore",
     "IdempotencyConflict",
     "RequestNotFound",
     "InvalidStatusTransition",
+    "ClaimConflict",
 ]
 
 _log = logging.getLogger(__name__)
@@ -52,6 +64,17 @@ class RequestNotFound(Exception):
 
 class InvalidStatusTransition(Exception):
     """Raised when a requested status change is unknown or not permitted."""
+
+
+class ClaimConflict(Exception):
+    """Raised when a claim token cannot drive a completion.
+
+    This covers every invalid-but-present token: malformed values, leases
+    that have expired, tokens for requests already in another state, and
+    replays of a token that was already used. Requests that do not exist
+    or belong to another tenant raise :class:`RequestNotFound` instead, so
+    the two failure modes never collapse into one another.
+    """
 
 
 class _PrimaryKeyConflict(Exception):
@@ -74,6 +97,30 @@ CREATE TABLE IF NOT EXISTS requests (
 _UNIQUE_TENANT_KEY = """
 CREATE UNIQUE INDEX IF NOT EXISTS idx_requests_tenant_idempotency
     ON requests(tenant_id, idempotency_key);
+"""
+
+# Execution leases are append-only records in their own table rather
+# than columns on the request: every grant persists as a row, so an
+# expired-and-superseded token remains resolvable (and distinguishable
+# from a token that never existed) after another worker takes over.
+# The token is the primary key: unpredictable and never reused.
+_LEASE_TABLE = """
+CREATE TABLE IF NOT EXISTS request_leases (
+    claim_token TEXT PRIMARY KEY,
+    tenant_id   TEXT NOT NULL,
+    request_id  TEXT NOT NULL,
+    worker_id   TEXT NOT NULL,
+    claimed_at  TEXT NOT NULL,
+    expires_at  TEXT NOT NULL
+);
+"""
+
+# Serves the "latest lease for a request" lookup used while claiming;
+# rowid order is grant order because claim grants are serialized by
+# BEGIN IMMEDIATE.
+_LEASE_REQUEST_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_request_leases_request
+    ON request_leases(tenant_id, request_id);
 """
 
 _EVENT_TABLE = """
@@ -107,6 +154,13 @@ _BUSY_TIMEOUT_MS = 30_000
 # only keeps that conflict distinct from idempotency conflicts.
 _MAX_INSERT_ATTEMPTS = 3
 
+# Lease lifetime bounds (inclusive). A non-boolean integer is required:
+# booleans are a subclass of int and must not be accepted as durations.
+_MIN_LEASE_SECONDS = 1
+_MAX_LEASE_SECONDS = 3600
+# Bytes of entropy in an unpredictable claim token (256 bits).
+_CLAIM_TOKEN_BYTES = 32
+
 # Allowed request lifecycle. completed and failed are terminal; moving a
 # request to the status it already holds is an idempotent no-op.
 _STATUS_ACCEPTED = "accepted"
@@ -125,6 +179,23 @@ def _require_nonempty_str(value: object, field: str) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{field} must be a non-empty string")
     return value
+
+
+def _require_lease_seconds(value: object) -> int:
+    # Booleans are ints in Python; an explicit exclusion keeps ``True``
+    # from being accepted as a one-second lease.
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError("lease_seconds must be an integer between 1 and 3600")
+    if value < _MIN_LEASE_SECONDS or value > _MAX_LEASE_SECONDS:
+        raise ValueError("lease_seconds must be an integer between 1 and 3600")
+    return value
+
+
+def _new_claim_token() -> str:
+    # 256 bits from the OS CSPRNG, URL-safe text. The token is the sole
+    # capability a worker holds, so it must be unpredictable and is never
+    # logged.
+    return secrets.token_urlsafe(_CLAIM_TOKEN_BYTES)
 
 
 def _normalize_scopes(scopes: object) -> list[str]:
@@ -217,6 +288,10 @@ class RequestStore:
             conn.execute(_SCHEMA)
             conn.execute(_UNIQUE_TENANT_KEY)
             conn.execute(_EVENT_TABLE)
+            # Purely additive for databases created before leases: a new
+            # table plus an index, never touching existing request rows.
+            conn.execute(_LEASE_TABLE)
+            conn.execute(_LEASE_REQUEST_INDEX)
             self._migrate_schema(conn)
         finally:
             self._release(conn)
@@ -599,6 +674,334 @@ class RequestStore:
             "status": target_status,
             "created_at": created_at,
         }
+
+    def claim_next(
+        self,
+        tenant_id: str,
+        worker_id: str,
+        lease_seconds: int,
+    ) -> dict[str, str] | None:
+        """Atomically grant a worker the next request to execute.
+
+        The candidate is the tenant's earliest request, ordered by
+        acceptance time and then request id, that is either still
+        ``accepted`` or is ``processing`` under a lease that has already
+        expired. Returns ``None`` when nothing is claimable. A grant
+        produces an unpredictable ``claim_token`` and an absolute
+        ``lease_expires_at`` (UTC RFC 3339); the lease is persisted, so
+        it stays valid across process and store-instance restarts and
+        the same request can never carry two unexpired leases at once.
+
+        The first grant on an ``accepted`` request moves it to
+        ``processing`` and appends the matching audit-chain event in the
+        same transaction; reclaiming an expired ``processing`` request
+        only issues a fresh lease and never adds another status event.
+        Identifiers must be non-empty strings and ``lease_seconds`` a
+        non-boolean integer in ``1..3600`` or :class:`ValueError` is
+        raised before any write.
+        """
+        # Validate before touching the database, mirroring submit().
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        worker_id = _require_nonempty_str(worker_id, "worker_id")
+        lease_seconds = _require_lease_seconds(lease_seconds)
+
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                except sqlite3.Error:
+                    raise RuntimeError(
+                        "failed to persist execution lease"
+                    ) from None
+                try:
+                    now_dt = datetime.now(timezone.utc)
+                    now = now_dt.isoformat().replace("+00:00", "Z")
+                    # The correlated subquery resolves the latest grant's
+                    # expiry; BEGIN IMMEDIATE serializes the select and the
+                    # grant so two workers can never take the same row.
+                    candidate = conn.execute(
+                        "SELECT request_id, status FROM requests r "
+                        "WHERE r.tenant_id = ? AND ( "
+                        "    r.status = ? "
+                        "    OR (r.status = ? AND ( "
+                        "        SELECT l.expires_at FROM request_leases l "
+                        "        WHERE l.tenant_id = r.tenant_id "
+                        "          AND l.request_id = r.request_id "
+                        "        ORDER BY l.rowid DESC LIMIT 1 "
+                        "    ) < ?) "
+                        ") ORDER BY r.created_at ASC, r.request_id ASC LIMIT 1",
+                        (
+                            tenant_id,
+                            _STATUS_ACCEPTED,
+                            _STATUS_PROCESSING,
+                            now,
+                        ),
+                    ).fetchone()
+                    if candidate is None:
+                        conn.execute("ROLLBACK")
+                        return None
+                    request_id, current_status = candidate
+                    claim_token = _new_claim_token()
+                    lease_expires_at = (
+                        (now_dt + timedelta(seconds=lease_seconds))
+                        .isoformat()
+                        .replace("+00:00", "Z")
+                    )
+                    if current_status == _STATUS_ACCEPTED:
+                        # First grant: migrate accepted -> processing and
+                        # extend the audit chain in the same transaction.
+                        # An expired re-claim finds status == processing and
+                        # deliberately skips this block, appending no event.
+                        next_seq, occurred_at, link_hash = self._next_chain_link(
+                            conn,
+                            tenant_id,
+                            request_id,
+                            _STATUS_PROCESSING,
+                        )
+                        cursor = conn.execute(
+                            "UPDATE requests SET status = ?, chain_hash = ? "
+                            "WHERE tenant_id = ? AND request_id = ? AND status = ?",
+                            (
+                                _STATUS_PROCESSING,
+                                link_hash,
+                                tenant_id,
+                                request_id,
+                                _STATUS_ACCEPTED,
+                            ),
+                        )
+                        if cursor.rowcount != 1:
+                            # Unreachable while holding the write lock;
+                            # never persist a half-applied migration.
+                            raise RuntimeError(
+                                "failed to persist execution lease"
+                            )
+                        conn.execute(
+                            "INSERT INTO status_events ("
+                            "tenant_id, request_id, seq, status, "
+                            "occurred_at, chain_hash"
+                            ") VALUES (?, ?, ?, ?, ?, ?)",
+                            (
+                                tenant_id,
+                                request_id,
+                                next_seq,
+                                _STATUS_PROCESSING,
+                                occurred_at,
+                                link_hash,
+                            ),
+                        )
+                    # Persist the lease itself. The token is the capability
+                    # for finish_claim; only its presence on this row proves
+                    # a grant happened. The token is never logged.
+                    conn.execute(
+                        "INSERT INTO request_leases ("
+                        "claim_token, tenant_id, request_id, worker_id, "
+                        "claimed_at, expires_at"
+                        ") VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            claim_token,
+                            tenant_id,
+                            request_id,
+                            worker_id,
+                            now,
+                            lease_expires_at,
+                        ),
+                    )
+                    conn.execute("COMMIT")
+                except (sqlite3.Error, RuntimeError):
+                    # Covers engine errors and the defensive broken-chain
+                    # path alike: roll back and keep engine text hidden.
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise RuntimeError(
+                        "failed to persist execution lease"
+                    ) from None
+            finally:
+                self._release(conn)
+        # Log only the non-sensitive request id; never token or worker.
+        _log.info("execution lease granted request_id=%s", request_id)
+        return {
+            "request_id": request_id,
+            "claim_token": claim_token,
+            "lease_expires_at": lease_expires_at,
+        }
+
+    def finish_claim(
+        self,
+        tenant_id: str,
+        claim_token: str,
+        target_status: str,
+    ) -> dict[str, str]:
+        """Atomically complete a request previously granted by a lease.
+
+        ``target_status`` must be ``completed`` or ``failed``. Only the
+        request's latest, currently unexpired token may drive the move,
+        which appends the terminal audit-chain event and returns the
+        usual status receipt. Unknown tokens and tokens owned by another
+        tenant raise :class:`RequestNotFound`; every other unusable
+        token (expired, superseded by a newer lease, or already
+        consumed) raises :class:`ClaimConflict`. No rejection writes to
+        the database.
+        """
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        claim_token = _require_nonempty_str(claim_token, "claim_token")
+        # Membership rejects non-strings, booleans and unknown or empty
+        # targets with one pre-write validation.
+        if target_status not in (
+            _STATUS_COMPLETED,
+            _STATUS_FAILED,
+        ):
+            raise ValueError("target_status must be 'completed' or 'failed'")
+
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                except sqlite3.Error:
+                    raise RuntimeError(
+                        "failed to complete claimed request"
+                    ) from None
+                try:
+                    now = _utc_now_rfc3339()
+                    lease = conn.execute(
+                        "SELECT tenant_id, request_id, expires_at "
+                        "FROM request_leases WHERE claim_token = ?",
+                        (claim_token,),
+                    ).fetchone()
+                    if lease is None:
+                        # A token that was never granted is indistinguishable
+                        # from an unknown request.
+                        conn.execute("ROLLBACK")
+                        raise RequestNotFound("request not found")
+                    lease_tenant, request_id, expires_at = lease
+                    if lease_tenant != tenant_id:
+                        # Same generic outcome as an unknown token so the
+                        # existence of another tenant's lease is not revealed.
+                        conn.execute("ROLLBACK")
+                        raise RequestNotFound("request not found")
+                    row = conn.execute(
+                        "SELECT status, created_at FROM requests "
+                        "WHERE tenant_id = ? AND request_id = ?",
+                        (tenant_id, request_id),
+                    ).fetchone()
+                    if row is None:
+                        conn.execute("ROLLBACK")
+                        raise RequestNotFound("request not found")
+                    current_status, created_at = row
+                    latest = conn.execute(
+                        "SELECT claim_token FROM request_leases "
+                        "WHERE tenant_id = ? AND request_id = ? "
+                        "ORDER BY rowid DESC LIMIT 1",
+                        (tenant_id, request_id),
+                    ).fetchone()
+                    # Valid only while processing, this token is still the
+                    # current grant, and that grant has not expired. ISO
+                    # timestamps sort lexicographically, so the expiry test
+                    # stays purely textual.
+                    if (
+                        current_status != _STATUS_PROCESSING
+                        or latest is None
+                        or latest[0] != claim_token
+                        or expires_at <= now
+                    ):
+                        conn.execute("ROLLBACK")
+                        raise ClaimConflict("claim is no longer valid")
+                    next_seq, occurred_at, link_hash = self._next_chain_link(
+                        conn, tenant_id, request_id, target_status
+                    )
+                    # The guarded status clause makes the terminal move
+                    # atomic with the lease check above.
+                    cursor = conn.execute(
+                        "UPDATE requests SET status = ?, chain_hash = ? "
+                        "WHERE tenant_id = ? AND request_id = ? AND status = ?",
+                        (
+                            target_status,
+                            link_hash,
+                            tenant_id,
+                            request_id,
+                            _STATUS_PROCESSING,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        conn.execute("ROLLBACK")
+                        raise ClaimConflict("claim is no longer valid")
+                    conn.execute(
+                        "INSERT INTO status_events ("
+                        "tenant_id, request_id, seq, status, "
+                        "occurred_at, chain_hash"
+                        ") VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            tenant_id,
+                            request_id,
+                            next_seq,
+                            target_status,
+                            occurred_at,
+                            link_hash,
+                        ),
+                    )
+                    conn.execute("COMMIT")
+                except RequestNotFound:
+                    raise
+                except ClaimConflict:
+                    raise
+                except (sqlite3.Error, RuntimeError):
+                    # Roll back on engine errors or a broken audit chain;
+                    # engine text must never reach the caller.
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise RuntimeError(
+                        "failed to complete claimed request"
+                    ) from None
+            finally:
+                self._release(conn)
+        _log.info(
+            "claimed request finished request_id=%s status=%s",
+            request_id,
+            target_status,
+        )
+        return {
+            "request_id": request_id,
+            "status": target_status,
+            "created_at": created_at,
+        }
+
+    def _next_chain_link(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        request_id: str,
+        target_status: str,
+    ) -> tuple[int, str, str]:
+        """Read the chain head and build the next link within a txn.
+
+        Returns the next sequence number, the event timestamp and the
+        chain hash to persist. Raises :class:`RuntimeError` if the
+        timeline invariant is broken; the caller owns rollback and must
+        not fabricate a replacement link.
+        """
+        latest = conn.execute(
+            "SELECT seq, occurred_at, chain_hash FROM status_events "
+            "WHERE tenant_id = ? AND request_id = ? ORDER BY seq DESC LIMIT 1",
+            (tenant_id, request_id),
+        ).fetchone()
+        if latest is None or not _is_chain_hash(latest[2]):
+            raise RuntimeError("audit chain head missing or malformed")
+        next_seq, latest_occurred_at, predecessor_hash = latest
+        occurred_at = _occurred_at_not_before(latest_occurred_at)
+        link_hash = _chain_hash(
+            tenant_id,
+            request_id,
+            next_seq + 1,
+            target_status,
+            occurred_at,
+            predecessor_hash,
+        )
+        return next_seq + 1, occurred_at, link_hash
 
     def audit(
         self,
