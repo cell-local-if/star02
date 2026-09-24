@@ -148,6 +148,11 @@ class DeferredRequestStore:
         # the execution orchestration it is never routed over HTTP.
         return self._ready().reconcile_execution(tenant_id, request_id)
 
+    def reconcile_batch(self, tenant_id, cursor=None, max_items=None):
+        # Batched, resumable reconciliation is storage-layer only and is
+        # never routed over HTTP.
+        return self._ready().reconcile_batch(tenant_id, cursor, max_items)
+
 
 def _normalize_request_id(value: str) -> str:
     """Validate a request id as a UUID and return its canonical text."""

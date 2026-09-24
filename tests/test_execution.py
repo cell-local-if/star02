@@ -512,16 +512,28 @@ class ClaimConflictAccessTests(_StoreCase):
             store.finish_claim("tenant-b", b["request_id"], claim_a["claim_token"], "completed")
         with self.assertRaises(ClaimConflict):
             store.finish_claim("tenant-a", a["request_id"], claim_b["claim_token"], "completed")
-        # Real credential presented against the wrong (or unknown) request id.
-        with self.assertRaises(ClaimConflict):
+        # A real credential presented against a request the calling
+        # tenant cannot see -- a cross-tenant id or an unknown id -- is
+        # resolved as not-found first, regardless of the credential, so
+        # credential validity can never be used to probe ids.
+        with self.assertRaises(RequestNotFound):
             store.finish_claim(
                 "tenant-a", b["request_id"], claim_a["claim_token"], "completed"
             )
-        with self.assertRaises(ClaimConflict):
+        with self.assertRaises(RequestNotFound):
             store.finish_claim(
                 "tenant-a",
                 "00000000-0000-4000-8000-000000000000",
                 claim_a["claim_token"],
+                "completed",
+            )
+        # The same unknown id with an invalid credential is
+        # indistinguishable: still not-found, never ClaimConflict.
+        with self.assertRaises(RequestNotFound):
+            store.finish_claim(
+                "tenant-a",
+                "00000000-0000-4000-8000-000000000000",
+                "no-such-credential",
                 "completed",
             )
         # Nothing moved.

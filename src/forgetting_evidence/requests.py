@@ -44,6 +44,15 @@ Execution orchestration lives on the same store, storage-layer only:
   accepted, hold a live lease or have already reached a terminal state
   are returned unchanged, and reconcile itself never inserts a request,
   an attempt or a receipt.
+* :meth:`RequestStore.reconcile_batch` applies the same convergence to a
+  bounded, resumable batch for one tenant: it scans the tenant's pending
+  requests in a stable keyset order (skipping ``accepted`` requests with
+  no attempt, receipt or extra event), reconciles up to an optional
+  caller cap per call, and returns the batch id, an opaque continuation
+  cursor (``None`` once finished) and per-item ``request_id``/``status``
+  records. Each item's state, attempt, lease and the cursor advance land
+  in one transaction; retried cursors keep the same batch id and resume
+  from the persisted position. No HTTP route is added.
 
 The lease boundary enforced by :meth:`claim_next` is deliberately
 narrower than "every processing request whose latest timestamp is old":
@@ -80,6 +89,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import sqlite3
 import struct
@@ -201,6 +211,52 @@ CREATE TABLE IF NOT EXISTS claim_tokens (
 );
 """
 
+# Resumable reconciliation batches. One row per (tenant, batch): the
+# opaque cursor that resumes the batch, the keyset position already
+# committed as inspected ("续跑 from the persisted position"), the
+# declared limit and the sealed/finished flags plus the continuation
+# cursor handed to the following batch. A row exists once per batch;
+# retrying the same cursor reuses the same batch_id instead of minting
+# another.
+_BATCH_TABLE = """
+CREATE TABLE IF NOT EXISTS reconcile_batches (
+    tenant_id       TEXT NOT NULL,
+    batch_id        TEXT NOT NULL,
+    cursor_token    TEXT NOT NULL,
+    next_cursor_token TEXT NOT NULL,
+    max_items       INTEGER NOT NULL,
+    inspected       INTEGER NOT NULL,
+    last_created_at TEXT,
+    last_request_id TEXT,
+    sealed          INTEGER NOT NULL,
+    finished        INTEGER NOT NULL,
+    PRIMARY KEY (tenant_id, batch_id)
+);
+"""
+
+# The incoming cursor resolves a retry to its batch, so it must be
+# unique within a tenant.
+_BATCH_CURSOR_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_reconcile_batches_cursor
+    ON reconcile_batches(tenant_id, cursor_token);
+"""
+
+# The requests a batch has already inspected and reported. Persisting
+# the window makes a retried cursor replay the identical batch (same
+# batch id, same items, same statuses and order) and lets a batch
+# interrupted mid-window resume and then return the complete window.
+_BATCH_ITEM_TABLE = """
+CREATE TABLE IF NOT EXISTS reconcile_batch_items (
+    tenant_id  TEXT NOT NULL,
+    batch_id   TEXT NOT NULL,
+    item_seq   INTEGER NOT NULL,
+    request_id TEXT NOT NULL,
+    status     TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, batch_id, item_seq)
+);
+"""
+
 # Column probes used to upgrade database files created before chain
 # hashes existed. The upgrade is purely additive (nullable columns plus a
 # one-time backfill derived from the already-persisted timeline); it never
@@ -252,6 +308,23 @@ _TOKEN_BYTES = 32
 # Fixed, detail-free text for every claim failure.
 _CLAIM_CONFLICT_MESSAGE = "claim conflict"
 
+# Batch reconciliation. A batch inspects at most this many pending
+# requests per call; a smaller or default bound is used when the caller
+# does not pin one.
+_DEFAULT_BATCH_LIMIT = 100
+_MIN_BATCH_LIMIT = 1
+_MAX_BATCH_LIMIT = 1000
+# Version tag carried inside every opaque cursor so an unknown format is
+# rejected as an illegal cursor rather than misread as a position.
+_CURSOR_VERSION = "v1"
+# Cursor tokens are fixed-width, URL-safe opaque strings; the same CSPRNG
+# as claim tokens backs them and the raw value is never persisted.
+_CURSOR_BYTES = 32
+# Distinguish the entry cursor of a batch from the continuation cursor
+# handed back for the following batch.
+_CURSOR_KIND_START = "s"
+_CURSOR_KIND_NEXT = "n"
+
 
 def _require_lease_seconds(value: object) -> int:
     """Validate a lease duration: a non-boolean int in 1..3600."""
@@ -279,6 +352,44 @@ def _new_claim_token() -> str:
 def _claim_conflict() -> ClaimConflict:
     """Build the single, detail-free claim error callers ever see."""
     return ClaimConflict(_CLAIM_CONFLICT_MESSAGE)
+
+
+def _new_cursor(kind: str) -> str:
+    """Return an unpredictable, opaque resumable-batch cursor."""
+    return (
+        f"{_CURSOR_VERSION}.{kind}."
+        f"{secrets.token_urlsafe(_CURSOR_BYTES)}"
+    )
+
+
+# A cursor is an opaque handle: a version tag, a kind tag and a random
+# token. The scan position it stands for lives only in the database, so
+# the string reveals nothing about tenant data. Any shape not matching
+# this grammar -- including a fabricated or unrecognised token -- is an
+# illegal caller cursor, indistinguishable in error type.
+_CURSOR_RE = re.compile(r"^v1[.][sn][.][A-Za-z0-9_-]{22,64}$")
+_CURSOR_INVALID_MESSAGE = "cursor is not valid"
+
+
+def _decode_cursor(value: object) -> str:
+    """Validate an opaque cursor; return its kind tag (``s``/``n``)."""
+    if not isinstance(value, str):
+        raise ValueError(_CURSOR_INVALID_MESSAGE)
+    match = _CURSOR_RE.match(value)
+    if match is None:
+        raise ValueError(_CURSOR_INVALID_MESSAGE)
+    return value[3]
+
+
+def _require_batch_limit(value: object) -> int:
+    """Validate the optional batch cap: a non-boolean int in 1..1000."""
+    if value is None:
+        return _DEFAULT_BATCH_LIMIT
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError("max_items must be an integer between 1 and 1000")
+    if not _MIN_BATCH_LIMIT <= value <= _MAX_BATCH_LIMIT:
+        raise ValueError("max_items must be an integer between 1 and 1000")
+    return value
 
 
 def _require_nonempty_str(value: object, field: str) -> str:
@@ -421,6 +532,9 @@ class RequestStore:
                 conn.execute(_CLAIM_TABLE)
                 conn.execute(_CLAIM_TOKEN_TABLE)
                 conn.execute(_CLAIM_CANDIDATE_INDEX)
+                conn.execute(_BATCH_TABLE)
+                conn.execute(_BATCH_CURSOR_INDEX)
+                conn.execute(_BATCH_ITEM_TABLE)
                 self._migrate_schema(conn)
             except sqlite3.Error:
                 raise _storage_failure() from None
@@ -1109,13 +1223,18 @@ class RequestStore:
 
         ``result`` must be ``completed`` or ``failed``. The token must
         identify the request's current, unexpired, unreleased lease for
-        the same tenant; an unknown, expired, already-released or
-        cross-tenant token -- as well as finishing a request that has no
-        open claim -- raises :class:`ClaimConflict` and changes nothing.
-        The terminal status and its chain event are committed in the same
-        transaction that records the attempt result and releases the
-        token. Returns the status record (``request_id``, ``status``,
-        ``created_at``).
+        the same tenant. Precedence is fixed: when the request id is
+        unknown, malformed or not visible to the tenant (a cross-tenant
+        id) and the presented credential is not the live lease for those
+        exact coordinates, :class:`RequestNotFound` is raised first, no
+        matter how the credential reads, so credential validity can never
+        be used to probe ids. For a request the tenant can see, an
+        unknown, expired, already-released or cross-tenant credential --
+        as well as finishing a request that has no open claim -- raises
+        :class:`ClaimConflict` and changes nothing. The terminal status
+        and its chain event are committed in the same transaction that
+        records the attempt result and releases the token. Returns the
+        status record (``request_id``, ``status``, ``created_at``).
         """
         tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
         request_id = _require_identifier(request_id)
@@ -1169,27 +1288,42 @@ class RequestStore:
         claim_token: str,
         result: str,
     ) -> dict[str, str]:
-        # Resolve the presented token without scoping by tenant first: a
-        # token issued to another tenant (or for another request) must look
-        # exactly like an unknown or released one and raise ClaimConflict,
-        # never reveal that the coordinates name a record elsewhere.
+        # Resolve both the presented token and the target's visibility.
+        # Precedence is fixed: a request id that is unknown or not visible
+        # to this tenant (a missing or cross-tenant id) paired with a
+        # absence of a live lease for these exact coordinates raises
+        # RequestNotFound first, regardless of how the credential reads,
+        # so credential validity can never be used to probe ids. Only a
+        # target the tenant can see with a credential that fails to match
+        # its current lease answers ClaimConflict.
         presented = hashlib.sha256(claim_token.encode("utf-8")).hexdigest()
         owner = conn.execute(
             "SELECT tenant_id, request_id, attempt_number FROM claim_tokens "
             "WHERE token_hash = ? LIMIT 1",
             (presented,),
         ).fetchone()
-        if owner is None or (owner[0], owner[1]) != (tenant_id, request_id):
-            # Unknown, already released (a successor or finish deleted it),
-            # or presented against a different tenant/request.
-            raise _claim_conflict()
-        attempt_number = owner[2]
+        token_matches = owner is not None and (
+            owner[0],
+            owner[1],
+        ) == (tenant_id, request_id)
 
         row = conn.execute(
             "SELECT status, created_at FROM requests "
             "WHERE tenant_id = ? AND request_id = ?",
             (tenant_id, request_id),
         ).fetchone()
+        if not token_matches:
+            if row is None:
+                # Unknown id and cross-tenant lookup share one outcome,
+                # even when a real (but foreign or misrouted) credential
+                # was presented.
+                raise RequestNotFound("request not found")
+            # The target is visible but the credential is unknown,
+            # already released (a successor or finish deleted it),
+            # expired, or presented against a different live lease.
+            raise _claim_conflict()
+        attempt_number = owner[2]
+
         if row is None:
             # Defensive: a live token always names an existing request.
             raise RequestNotFound("request not found")
@@ -1658,6 +1792,522 @@ class RequestStore:
             "status": target_status,
             "created_at": created_at,
         }
+
+    # -- batch reconciliation ------------------------------------------
+
+    def reconcile_batch(
+        self,
+        tenant_id: str,
+        cursor: str | None = None,
+        max_items: int | None = None,
+    ) -> dict[str, object]:
+        """Reconcile a bounded, resumable batch of pending requests.
+
+        Storage-layer only; no HTTP route is added. A call scans the
+        tenant's requests in a stable keyset order (acceptance time, then
+        request id), skips ``accepted`` requests outright, and reconciles
+        up to *max_items* of the remaining records, continuing after an
+        optional opaque *cursor* returned by a previous batch.
+
+        Returns exactly ``batch_id``, ``next_cursor`` (a string while more
+        requests may remain, ``None`` once the scan is finished),
+        ``finished`` and ``items``; each item carries only ``request_id``
+        and the reconciled ``status``, in stable scan order. Times and
+        cursors are strings, counts are integers (a boolean for
+        ``finished``) and absent values stay ``None``; no float, negative
+        zero or non-finite number is ever produced.
+
+        Per scanned request the rules match :meth:`reconcile_execution`:
+        an ``accepted`` request is skipped without an attempt, receipt or
+        extra status event; a ``processing`` request holding a live lease
+        stays processing (no early terminal, no new attempt); expired,
+        result-less or unexplainable leases are compensated to ``failed``;
+        terminals are idempotent no-ops. Each item's status, attempt and
+        lease changes settle in the same transaction as the batch cursor
+        advance and the persisted window row. A batch interrupted
+        mid-window resumes from the persisted position and then returns
+        the whole window; retried and restarted calls are idempotent, the
+        same cursor always binding to the same ``batch_id``. Every
+        database failure is the fixed-text :class:`OSError`; an invalid
+        tenant, cursor (including an unknown cursor format or token) or
+        limit raises :class:`ValueError` without writing.
+        """
+        # Validate all caller input before touching the database. An
+        # unknown cursor *shape* is an illegal cursor; a well-formed token
+        # that names no batch is rejected in the registration txn below.
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        if cursor is not None:
+            _decode_cursor(cursor)
+        max_items = _require_batch_limit(max_items)
+
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                # The batch is registered (or a retried one resolved) and
+                # committed before items are processed: a crash leaves a
+                # cursor the caller can resume from, and a repeated cursor
+                # always binds to the same batch.
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    state = self._resolve_or_register_batch(
+                        conn, tenant_id, cursor, max_items
+                    )
+                    conn.execute("COMMIT")
+                except ValueError:
+                    self._rollback_quietly(conn)
+                    raise
+                except sqlite3.Error:
+                    self._rollback_quietly(conn)
+                    raise _storage_failure() from None
+
+                # Reconcile one item per transaction until the window is
+                # sealed. A retried, already-sealed batch skips the loop
+                # and replays the persisted window instead.
+                if not state["sealed"]:
+                    while True:
+                        try:
+                            conn.execute("BEGIN IMMEDIATE")
+                        except sqlite3.Error:
+                            raise _storage_failure() from None
+                        try:
+                            item = self._reconcile_next_batch_item(conn, state)
+                            conn.execute("COMMIT")
+                        except RequestNotFound:
+                            # The candidate was selected inside this same
+                            # write transaction; its vanishing is
+                            # corruption, never a caller-visible not-found.
+                            self._rollback_quietly(conn)
+                            raise _storage_failure() from None
+                        except InvalidStatusTransition:
+                            # Mirrors reconcile_execution: the batch has
+                            # no illegal-transition outcome outside a
+                            # broken invariant.
+                            self._rollback_quietly(conn)
+                            raise _storage_failure() from None
+                        except OSError:
+                            self._rollback_quietly(conn)
+                            raise
+                        except sqlite3.Error:
+                            self._rollback_quietly(conn)
+                            raise _storage_failure() from None
+                        if item is None:
+                            break
+
+                # The returned window is always the persisted one, so a
+                # mid-window resume and a sealed retry are identical to
+                # the batch's first successful response.
+                finished, next_cursor, items = self._load_sealed_batch(
+                    conn, tenant_id, state["batch_id"]
+                )
+            finally:
+                self._release(conn)
+
+        for item in items:
+            _log.info(
+                "batch item reconciled request_id=%s status=%s",
+                item["request_id"],
+                item["status"],
+            )
+        return {
+            "batch_id": state["batch_id"],
+            "next_cursor": None if finished else next_cursor,
+            "finished": finished,
+            "items": items,
+        }
+
+    @staticmethod
+    def _rollback_quietly(conn: sqlite3.Connection) -> None:
+        """Best-effort rollback that never masks the original failure."""
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+
+    def _resolve_or_register_batch(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        cursor: str | None,
+        max_items: int,
+    ) -> dict[str, object]:
+        """Resolve a retried batch or register a new one, in the open txn."""
+        if cursor is None:
+            return self._insert_batch(
+                conn,
+                tenant_id=tenant_id,
+                batch_id=str(uuid.uuid4()),
+                cursor_token=_new_cursor(_CURSOR_KIND_START),
+                max_items=max_items,
+                last_created_at=None,
+                last_request_id=None,
+            )
+
+        existing = conn.execute(
+            "SELECT batch_id, max_items, inspected, last_created_at, "
+            "last_request_id, sealed, finished, next_cursor_token "
+            "FROM reconcile_batches WHERE tenant_id = ? AND cursor_token = ?",
+            (tenant_id, cursor),
+        ).fetchone()
+        if existing is not None:
+            # Retry of an in-flight or already-sealed batch: same id.
+            return self._batch_state_from_row(existing, tenant_id)
+
+        # Otherwise the token is only legitimate as the continuation
+        # cursor of a sealed predecessor. A fabricated token -- or a
+        # continuation whose predecessor never sealed -- is an illegal
+        # caller cursor and writes nothing.
+        predecessor = conn.execute(
+            "SELECT last_created_at, last_request_id, sealed "
+            "FROM reconcile_batches "
+            "WHERE tenant_id = ? AND next_cursor_token = ?",
+            (tenant_id, cursor),
+        ).fetchone()
+        if predecessor is None or predecessor[2] != 1:
+            raise ValueError(_CURSOR_INVALID_MESSAGE)
+        last_created_at, last_request_id, _sealed = predecessor
+        if (last_created_at is None) != (last_request_id is None):
+            raise _storage_failure()
+        return self._insert_batch(
+            conn,
+            tenant_id=tenant_id,
+            batch_id=str(uuid.uuid4()),
+            cursor_token=cursor,
+            max_items=max_items,
+            last_created_at=last_created_at,
+            last_request_id=last_request_id,
+        )
+
+    def _insert_batch(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        tenant_id: str,
+        batch_id: str,
+        cursor_token: str,
+        max_items: int,
+        last_created_at: str | None,
+        last_request_id: str | None,
+    ) -> dict[str, object]:
+        """Insert a fresh batch row, regenerating random ids on collision."""
+        for _ in range(_MAX_INSERT_ATTEMPTS):
+            next_cursor_token = _new_cursor(_CURSOR_KIND_NEXT)
+            try:
+                conn.execute(
+                    "INSERT INTO reconcile_batches ("
+                    "tenant_id, batch_id, cursor_token, next_cursor_token, "
+                    "max_items, inspected, last_created_at, last_request_id, "
+                    "sealed, finished"
+                    ") VALUES (?, ?, ?, ?, ?, 0, ?, ?, 0, 0)",
+                    (
+                        tenant_id,
+                        batch_id,
+                        cursor_token,
+                        next_cursor_token,
+                        max_items,
+                        last_created_at,
+                        last_request_id,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                # A concurrent process sharing the file may have
+                # registered this continuation cursor first; that is a
+                # retry, not a collision -- resume its batch. Any other
+                # unique conflict can only be the random batch id or
+                # continuation token: regenerate and retry.
+                row = conn.execute(
+                    "SELECT batch_id, max_items, inspected, last_created_at, "
+                    "last_request_id, sealed, finished, next_cursor_token "
+                    "FROM reconcile_batches "
+                    "WHERE tenant_id = ? AND cursor_token = ?",
+                    (tenant_id, cursor_token),
+                ).fetchone()
+                if row is not None:
+                    return self._batch_state_from_row(row, tenant_id)
+                batch_id = str(uuid.uuid4())
+                continue
+            return {
+                "tenant_id": tenant_id,
+                "batch_id": batch_id,
+                "max_items": max_items,
+                "sealed": False,
+            }
+        raise _storage_failure()
+
+    @staticmethod
+    def _batch_state_from_row(row: tuple, tenant_id: str) -> dict[str, object]:
+        """Strictly validate a persisted batch header into mutable state."""
+        (
+            batch_id,
+            max_items,
+            inspected,
+            last_created_at,
+            last_request_id,
+            sealed,
+            finished,
+            _next_cursor_token,
+        ) = row
+        if (
+            not isinstance(batch_id, str)
+            or not batch_id
+            or not isinstance(max_items, int)
+            or isinstance(max_items, bool)
+            or not _MIN_BATCH_LIMIT <= max_items <= _MAX_BATCH_LIMIT
+            or not isinstance(inspected, int)
+            or isinstance(inspected, bool)
+            or not 0 <= inspected <= max_items
+            or sealed not in (0, 1)
+            or finished not in (0, 1)
+            or (last_created_at is None) != (last_request_id is None)
+        ):
+            raise _storage_failure()
+        if last_created_at is not None and (
+            not isinstance(last_created_at, str)
+            or not last_created_at
+            or not isinstance(last_request_id, str)
+            or not last_request_id
+        ):
+            raise _storage_failure()
+        if finished == 1 and sealed != 1:
+            raise _storage_failure()
+        return {
+            "tenant_id": tenant_id,
+            "batch_id": batch_id,
+            "max_items": max_items,
+            "sealed": sealed == 1,
+        }
+
+    def _reconcile_next_batch_item(
+        self,
+        conn: sqlite3.Connection,
+        state: dict[str, object],
+    ) -> dict[str, object] | None:
+        """Reconcile one batch item and advance the cursor, in one txn.
+
+        Returns the item bookkeeping, or ``None`` once the window is
+        sealed. ``accepted`` requests are skipped in the scan itself.
+        """
+        tenant_id = state["tenant_id"]
+        batch_id = state["batch_id"]
+        max_items = state["max_items"]
+        # Re-read the header inside the transaction: a concurrent process
+        # sharing the file may have advanced the same cursor, and every
+        # decision must be made from persisted state.
+        row = conn.execute(
+            "SELECT inspected, last_created_at, last_request_id, sealed "
+            "FROM reconcile_batches WHERE tenant_id = ? AND batch_id = ?",
+            (tenant_id, batch_id),
+        ).fetchone()
+        if row is None:
+            raise _storage_failure()
+        inspected, last_created_at, last_request_id, sealed = row
+        if (
+            not isinstance(inspected, int)
+            or isinstance(inspected, bool)
+            or not 0 <= inspected <= max_items
+            or sealed not in (0, 1)
+            or (last_created_at is None) != (last_request_id is None)
+        ):
+            raise _storage_failure()
+        if last_created_at is not None and (
+            not isinstance(last_created_at, str)
+            or not last_created_at
+            or not isinstance(last_request_id, str)
+            or not last_request_id
+        ):
+            raise _storage_failure()
+        if sealed == 1:
+            # The previous item sealed the window (limit reached or scan
+            # exhausted); this call has nothing more to do.
+            state["sealed"] = True
+            return None
+        # The header counter must agree with the persisted window.
+        window_count = conn.execute(
+            "SELECT count(*) FROM reconcile_batch_items "
+            "WHERE tenant_id = ? AND batch_id = ?",
+            (tenant_id, batch_id),
+        ).fetchone()[0]
+        if window_count != inspected:
+            raise _storage_failure()
+
+        candidate = self._select_batch_candidate(
+            conn, tenant_id, last_created_at, last_request_id
+        )
+        if candidate is None:
+            # Nothing left to reconcile: seal and finish the batch.
+            cursor = conn.execute(
+                "UPDATE reconcile_batches SET sealed = 1, finished = 1 "
+                "WHERE tenant_id = ? AND batch_id = ? AND sealed = 0",
+                (tenant_id, batch_id),
+            )
+            if cursor.rowcount != 1:
+                raise _storage_failure()
+            state["sealed"] = True
+            return None
+
+        request_id, _status, created_at = candidate
+        # Reuse the single-request reconciliation exactly: terminals are
+        # read-only, live leases stay processing, and dead or
+        # unexplainable processing rows converge inside this txn.
+        # Accepted requests never reach here.
+        record = self._reconcile_locked(conn, tenant_id, request_id)
+        reconciled_status = record["status"]
+
+        successor = self._select_batch_candidate(
+            conn, tenant_id, created_at, request_id
+        )
+        new_inspected = inspected + 1
+        will_finish = successor is None
+        will_seal = new_inspected >= max_items or will_finish
+        # Persist the window row in the same transaction as the
+        # reconciliation and the cursor advance.
+        conn.execute(
+            "INSERT INTO reconcile_batch_items ("
+            "tenant_id, batch_id, item_seq, request_id, status, created_at"
+            ") VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                tenant_id,
+                batch_id,
+                inspected,
+                request_id,
+                reconciled_status,
+                created_at,
+            ),
+        )
+        cursor = conn.execute(
+            "UPDATE reconcile_batches "
+            "SET inspected = ?, last_created_at = ?, last_request_id = ?, "
+            "sealed = ?, finished = ? "
+            "WHERE tenant_id = ? AND batch_id = ? AND sealed = 0",
+            (
+                new_inspected,
+                created_at,
+                request_id,
+                1 if will_seal else 0,
+                1 if will_finish else 0,
+                tenant_id,
+                batch_id,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise _storage_failure()
+        state["sealed"] = will_seal
+        return {
+            "request_id": request_id,
+            "status": reconciled_status,
+        }
+
+    @staticmethod
+    def _select_batch_candidate(
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        after_created_at: str | None,
+        after_request_id: str | None,
+    ) -> tuple[str, str, str] | None:
+        """Return the next non-accepted request after the keyset.
+
+        ``accepted`` requests are skipped in the scan itself, so the
+        first scan never creates an attempt, receipt or extra event for
+        one. The keyset order (acceptance time, then request id) is
+        stable.
+        """
+        if after_created_at is None:
+            row = conn.execute(
+                "SELECT request_id, status, created_at FROM requests "
+                "WHERE tenant_id = ? AND status != ? "
+                "ORDER BY created_at ASC, request_id ASC LIMIT 1",
+                (tenant_id, _STATUS_ACCEPTED),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT request_id, status, created_at FROM requests "
+                "WHERE tenant_id = ? AND status != ? "
+                "AND (created_at > ? OR (created_at = ? AND request_id > ?)) "
+                "ORDER BY created_at ASC, request_id ASC LIMIT 1",
+                (
+                    tenant_id,
+                    _STATUS_ACCEPTED,
+                    after_created_at,
+                    after_created_at,
+                    after_request_id,
+                ),
+            ).fetchone()
+        if row is None:
+            return None
+        request_id, status, created_at = row
+        if (
+            not isinstance(request_id, str)
+            or not request_id
+            or not isinstance(status, str)
+            or status not in _ALLOWED_TRANSITIONS
+            or status == _STATUS_ACCEPTED
+            or not isinstance(created_at, str)
+            or not created_at
+        ):
+            # An out-of-lifecycle status or broken keyset column is
+            # corruption; never scan or report from a bad read.
+            raise _storage_failure()
+        return request_id, status, created_at
+
+    def _load_sealed_batch(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        batch_id: str,
+    ) -> tuple[bool, str, list[dict[str, str]]]:
+        """Load a sealed batch's outcome and persisted window.
+
+        Returns ``(finished, next_cursor_token, items)``. The items come
+        straight from the persisted window so a retry reproduces the
+        identical statuses and order; an unsealed batch is treated as
+        corruption because the caller is handed a window only once it
+        has fully sealed.
+        """
+        try:
+            header = conn.execute(
+                "SELECT sealed, finished, next_cursor_token, inspected "
+                "FROM reconcile_batches WHERE tenant_id = ? AND batch_id = ?",
+                (tenant_id, batch_id),
+            ).fetchone()
+        except sqlite3.Error:
+            raise _storage_failure() from None
+        if header is None:
+            raise _storage_failure()
+        sealed, finished, next_cursor_token, inspected = header
+        if (
+            sealed != 1
+            or finished not in (0, 1)
+            or not isinstance(next_cursor_token, str)
+            or not next_cursor_token
+            or not isinstance(inspected, int)
+            or isinstance(inspected, bool)
+        ):
+            raise _storage_failure()
+        try:
+            rows = conn.execute(
+                "SELECT item_seq, request_id, status FROM reconcile_batch_items "
+                "WHERE tenant_id = ? AND batch_id = ? ORDER BY item_seq",
+                (tenant_id, batch_id),
+            ).fetchall()
+        except sqlite3.Error:
+            raise _storage_failure() from None
+        items: list[dict[str, str]] = []
+        for expected_seq, item_row in enumerate(rows):
+            item_seq, request_id, status = item_row
+            if (
+                not isinstance(item_seq, int)
+                or isinstance(item_seq, bool)
+                or item_seq != expected_seq
+                or not isinstance(request_id, str)
+                or not request_id
+                or not isinstance(status, str)
+                or status not in _ALLOWED_TRANSITIONS
+                or status == _STATUS_ACCEPTED
+            ):
+                raise _storage_failure()
+            items.append({"request_id": request_id, "status": status})
+        if len(items) != inspected:
+            raise _storage_failure()
+        return finished == 1, next_cursor_token, items
 
     def audit(
         self,
