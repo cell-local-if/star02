@@ -1,6 +1,6 @@
 # Forgetting Evidence Service
 
-这是一个面向后端系统的机器遗忘证据服务，用于记录删除请求、执行状态和可验证回执。当前提供可运行的 Python 包、健康检查入口、删除请求的受理与查询 HTTP API（SQLite 持久化）、请求存储层上的可持久化状态机（状态推进与状态查询），以及存储层上的删除执行编排（领取-租约-完成与执行记录）。状态推进、状态查询与执行编排只在存储层开放，HTTP 仍只提供受理与受理回执查询两个端点，不新增任何执行相关 HTTP 入口。
+这是一个面向后端系统的机器遗忘证据服务，用于记录删除请求、执行状态和可验证回执。当前提供可运行的 Python 包、健康检查入口、删除请求的受理与查询 HTTP API（SQLite 持久化）、请求存储层上的可持久化状态机（状态推进与状态查询），以及存储层上的删除执行编排（领取-租约-完成、执行对账与执行记录）。状态推进、状态查询与执行编排只在存储层开放，HTTP 仍只提供受理与受理回执查询两个端点，不新增任何执行相关 HTTP 入口。
 
 运行健康检查：
 
@@ -32,10 +32,16 @@ PYTHONPATH=src python3 -m forgetting_evidence serve --db ./data/evidence.db --ho
 
 存储层执行编排（`RequestStore`，不经 HTTP 开放）：
 
-- `claim_next(tenant_id, worker_id, lease_seconds)`：原子领取下一个可执行请求。`tenant_id`、`worker_id` 为非空字符串，`lease_seconds` 为 1 至 3600 的非布尔整数秒。候选为 `accepted` 请求及最新租约已过期的 `processing` 请求，按受理时间再按请求编号取最前者；首次领取使请求进入 `processing` 并开始第 1 次尝试，过期重领开始下一次尝试且不改变首次受理时间、编号或当前状态。同一请求同一时刻只有一个 worker 持有有效租约。成功返回恰好三个字段：`request_id`、不可预测的 `claim_token`、UTC RFC3339 的 `lease_expires_at`；无候选返回 `None`。worker 身份只校验不持久化，领取凭证只返回一次、绝不入库（仅存散列）或出现在日志中。
-- `finish_claim(tenant_id, request_id, claim_token, result)`：以终态完成当前租约。`result` 只接受 `completed` 或 `failed`。凭证必须对应该租户该请求当前未过期、未释放的租约；终态状态与审计链事件、尝试结果记录、凭证释放在同一事务提交。返回状态记录（`request_id`、`status`、`created_at`）。
+- `claim_next(tenant_id, worker_id, lease_seconds)`：原子领取下一个可执行请求。`tenant_id`、`worker_id` 为非空字符串，`lease_seconds` 为 1 至 3600 的非布尔整数秒。候选为 `accepted` 请求及**最新一次尝试存在、仍未完成且其可解释租约已过期**的 `processing` 请求，按受理时间再按请求编号取最前者；首次领取使请求进入 `processing` 并开始第 1 次尝试，过期重领开始下一次尝试且不改变首次受理时间、编号或当前状态。没有可解释租约或尝试的 `processing` 请求不得领取，交由 `reconcile_execution` 收敛。同一请求同一时刻只有一个 worker 持有有效租约。成功返回恰好三个字段：`request_id`、不可预测的 `claim_token`、UTC RFC3339 的 `lease_expires_at`；无候选返回 `None`。worker 身份只校验不持久化，领取凭证只返回一次、绝不入库（仅存散列）或出现在日志中。
+- `finish_claim(tenant_id, request_id, claim_token, result)`：以终态完成当前租约。`result` 只接受 `completed` 或 `failed`，越界抛 `ValueError` 且不写库。凭证必须对应该租户该请求当前未过期、未释放的租约；伪造或已释放凭证抛 `ClaimConflict`，不改变状态、尝试或证据。终态状态与审计链事件、尝试结果记录、凭证释放在同一事务提交。返回状态记录（`request_id`、`status`、`created_at`）。
+- `reconcile_execution(tenant_id, request_id)`：按租户和请求编号对账执行状态并收敛，无需领取凭证、也不发放新租约，返回当前状态记录。
+  - `accepted` 且无执行尝试：只返回现状，不创建记录、尝试或回执变化。
+  - `completed`/`failed` 重复对账幂等：保留首次终态结果与同一状态记录；执行记录含多个终态时保留最早完成的结果，其后的重复终态尝试记为 `failed` 且不改变请求状态。
+  - 最新租约仍有效：保留进行中尝试，不提前写终态、不生成新尝试。
+  - 最新租约过期、租约缺失/不可解释或无有效租约：把未完成尝试一次性补偿为 `failed`（完成时间为 UTC RFC3339 且只写一次），释放残留凭证，并在同一事务把请求收敛为 `failed`；若已存在终态尝试则以最早完成结果收敛。重复对账不再改写任何已落定的尝试或状态。
+  - 租户为空或非字符串抛 `ValueError`，不改变状态、尝试或回执；请求编号缺失、空、非字符串、非法、不存在或跨租户统一抛 `RequestNotFound`，不区分记录是否存在；数据库不可读写、执行记录损坏或补偿提交失败抛固定文案 `OSError`，不返回半成结果。
 - `get_execution_log(tenant_id, request_id)`：按租户与请求编号返回执行尝试列表，按尝试序号（从 1 递增）排列。每条恰含 `attempt_number`（正整数）、`claimed_at` 与 `lease_expires_at`（UTC RFC3339 字符串）、`result` 与 `completed_at`（完成后为终态与完成时间，进行中或被过期放弃的尝试为空值）。返回值只含字符串、整数与空值，不含 worker 或领取凭证。
-- 服务重启后租约与尝试记录继续有效；并发领取不会形成两个同时有效的租约，锁冲突不泄露底层数据库错误。
+- 服务重启后租约与尝试记录继续有效；并发领取、完成与对账原子提交状态、尝试与租约，不会形成两个同时有效的租约，锁冲突不泄露底层数据库错误。
 
 执行编排错误语义（在既有错误语义基础上补充）：
 

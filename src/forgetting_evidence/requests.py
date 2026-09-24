@@ -33,6 +33,12 @@ Execution orchestration lives on the same store, storage-layer only:
   live lease: the status change, its audit-chain event, the attempt
   result and the token release land in one transaction. Unknown, expired,
   released or foreign tokens raise :class:`ClaimConflict` unchanged.
+* :meth:`RequestStore.reconcile_execution` reconciles one request's
+  execution state without a credential: an ``accepted`` request with no
+  attempts is returned untouched, a terminal request is idempotent (the
+  first terminal result always wins) and a ``processing`` request whose
+  latest lease is no longer valid has its unfinished attempts
+  compensated to ``failed`` and its status converged, all atomically.
 * :meth:`RequestStore.get_execution_log` returns the attempt history
   (sequence, claim and expiry times, terminal result and completion
   time) with only strings, integers and nulls -- never a worker or token.
@@ -70,6 +76,7 @@ import threading
 import uuid
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
+from fnmatch import fnmatchcase
 
 __all__ = [
     "RequestStore",
@@ -228,6 +235,15 @@ _MIN_LEASE_SECONDS = 1
 _MAX_LEASE_SECONDS = 3600
 # Terminal outcomes finish_claim is allowed to record.
 _TERMINAL_RESULTS = frozenset({_STATUS_COMPLETED, _STATUS_FAILED})
+# Shape of the UTC RFC3339 timestamps this store emits, as a SQLite GLOB
+# pattern. It is used to reject out-of-band rows whose lease expiry is not
+# an interpretable timestamp: such a lease cannot be judged live or
+# expired by the claim path and the request is left for reconciliation.
+_RFC3339_GLOB = (
+    "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]"
+    "T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]"
+    ".[0-9][0-9][0-9][0-9][0-9][0-9]Z"
+)
 # Claim tokens are presented as a fixed-width, URL-safe opaque secret. They
 # are generated with the CSPRNG, returned exactly once at acquisition, and
 # never persisted, logged or echoed back.
@@ -965,11 +981,18 @@ class RequestStore:
         lease_expires_at = _format_rfc3339(
             now_dt + timedelta(seconds=lease_seconds)
         )
-        # Oldest accepted, or oldest processing whose latest lease has
-        # expired. The correlated subquery reads the most recent attempt's
-        # expiry; a request with no attempts has none and only qualifies
-        # while accepted. BEGIN IMMEDIATE plus the write lock make the
-        # read-then-claim atomic, so two workers can never both win.
+        # Oldest accepted, or oldest processing whose *latest* attempt is
+        # an interpretable, still-open lease that has expired. The
+        # correlated predicates require that a latest attempt row exists,
+        # carries no result yet, holds an expiry in the exact RFC3339
+        # shape the store emits and that expiry is in the past; a
+        # processing request with no attempt, with a finished latest
+        # attempt, or with a missing/garbled lease is therefore never
+        # selected here -- such a row has no lease the claim path can
+        # interpret and is left for reconcile_execution() to converge
+        # rather than being re-leased. BEGIN IMMEDIATE plus the write lock
+        # make the read-then-claim atomic, so two workers can never both
+        # win.
         row = conn.execute(
             "SELECT r.request_id, r.status "
             "FROM requests r "
@@ -978,12 +1001,19 @@ class RequestStore:
             "    r.status = ? "
             "    OR ( "
             "      r.status = ? "
-            "      AND ? > COALESCE( "
-            "        (SELECT c.lease_expires_at FROM claim_attempts c "
-            "         WHERE c.tenant_id = r.tenant_id "
-            "           AND c.request_id = r.request_id "
-            "         ORDER BY c.attempt_number DESC LIMIT 1), "
-            "        '') "
+            "      AND EXISTS ( "
+            "        SELECT 1 FROM claim_attempts c "
+            "        WHERE c.tenant_id = r.tenant_id "
+            "          AND c.request_id = r.request_id "
+            "          AND c.attempt_number = ( "
+            "            SELECT MAX(c2.attempt_number) FROM claim_attempts c2 "
+            "            WHERE c2.tenant_id = r.tenant_id "
+            "              AND c2.request_id = r.request_id "
+            "          ) "
+            "          AND c.result IS NULL "
+            "          AND c.lease_expires_at GLOB ? "
+            "          AND ? > c.lease_expires_at "
+            "      ) "
             "    ) "
             "  ) "
             "ORDER BY r.created_at ASC, r.request_id ASC LIMIT 1",
@@ -991,6 +1021,7 @@ class RequestStore:
                 tenant_id,
                 _STATUS_ACCEPTED,
                 _STATUS_PROCESSING,
+                _RFC3339_GLOB,
                 claimed_at,
             ),
         ).fetchone()
@@ -1195,6 +1226,376 @@ class RequestStore:
             "status": result,
             "created_at": created_at,
         }
+
+    def reconcile_execution(
+        self,
+        tenant_id: str,
+        request_id: str,
+    ) -> dict[str, str]:
+        """Reconcile one request's execution state and converge it.
+
+        The call needs no claim token and never grants a lease; it only
+        inspects the persisted status, attempts and the live-lease record,
+        then converges a stuck request:
+
+        * an ``accepted`` request with no execution attempt is returned
+          as-is -- no status, attempt, token or receipt change;
+        * a ``completed``/``failed`` request is idempotent: the first
+          terminal result and the same status record are kept. Repeated
+          terminal attempts are marked ``failed`` but never move the
+          request's status, and the earliest finished terminal attempt is
+          always the retained result;
+        * a ``processing`` request whose latest lease is still live keeps
+          its in-progress attempt -- no terminal is written early and no
+          new attempt is generated;
+        * a ``processing`` request whose latest lease has expired (or that
+          has an open attempt with no interpretable live lease) has every
+          unfinished attempt compensated to ``failed`` once, with a single
+          UTC RFC3339 completion time, any stale token released and the
+          request converged to ``failed`` in the same transaction.
+
+        Returns the request's status record (``request_id``, ``status``,
+        ``created_at``). Invalid, unknown and cross-tenant request ids are
+        indistinguishable and raise :class:`RequestNotFound`; a non-string
+        or empty *tenant_id* raises :class:`ValueError`; corrupt rows or a
+        failed compensation commit raise the fixed-text :class:`OSError`,
+        never a half-converged result.
+        """
+        # Validate before touching the database: a bad tenant is caller
+        # error, while a malformed/unknown/foreign request id is not-found
+        # exactly like the other per-request reads.
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        request_id = _require_identifier(request_id)
+
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                except sqlite3.Error:
+                    raise _storage_failure() from None
+                try:
+                    record = self._reconcile_execution_locked(
+                        conn, tenant_id, request_id
+                    )
+                    conn.execute("COMMIT")
+                except OSError:
+                    # A fixed-text storage failure raised mid-transaction
+                    # (a helper already rolled back or one is about to):
+                    # guarantee the possibly shared connection leaves the
+                    # transaction before propagating, exactly like
+                    # claim_next, so an in-memory store is not poisoned.
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
+                except RequestNotFound:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
+                except InvalidStatusTransition:
+                    # _persist_status_change already rolled back; an
+                    # illegal move during convergence means the persisted
+                    # graph disagrees with itself and is storage damage,
+                    # never a caller-facing transition error.
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise _storage_failure() from None
+                except sqlite3.Error:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise _storage_failure() from None
+            finally:
+                self._release(conn)
+        _log.info("execution reconciled request_id=%s", request_id)
+        return record
+
+    def _reconcile_execution_locked(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        request_id: str,
+    ) -> dict[str, str]:
+        """Converge one request inside an already-open write transaction."""
+        row = conn.execute(
+            "SELECT status, created_at FROM requests "
+            "WHERE tenant_id = ? AND request_id = ?",
+            (tenant_id, request_id),
+        ).fetchone()
+        if row is None:
+            # Identical outcome for unknown ids and cross-tenant lookups.
+            raise RequestNotFound("request not found")
+        current_status, created_at = row
+
+        attempt_rows = conn.execute(
+            "SELECT attempt_number, claimed_at, lease_expires_at, "
+            "result, completed_at FROM claim_attempts "
+            "WHERE tenant_id = ? AND request_id = ? "
+            "ORDER BY attempt_number",
+            (tenant_id, request_id),
+        ).fetchall()
+        attempts = self._validate_reconcile_attempts(attempt_rows)
+
+        def _record(status: str) -> dict[str, str]:
+            return {
+                "request_id": request_id,
+                "status": status,
+                "created_at": created_at,
+            }
+
+        # accepted with no attempt: the request is simply waiting for its
+        # first claim. Return the current state without creating anything.
+        if current_status == _STATUS_ACCEPTED and not attempts:
+            return _record(_STATUS_ACCEPTED)
+
+        if current_status in _TERMINAL_RESULTS:
+            # Idempotent terminal reconciliation. The request's status is
+            # fixed at its first terminal result and never moves; only the
+            # attempt record is normalised -- open attempts are compensated
+            # to failed once, and any finished attempt after the earliest
+            # one is a duplicate terminal recorded as failed. Repeating the
+            # reconciliation finds nothing left to write and returns the
+            # same record.
+            self._normalise_terminal_attempts(
+                conn, tenant_id, request_id, attempts
+            )
+            # A terminal request never keeps a credential after settling.
+            conn.execute(
+                "DELETE FROM claim_tokens "
+                "WHERE tenant_id = ? AND request_id = ?",
+                (tenant_id, request_id),
+            )
+            return _record(current_status)
+
+        if current_status != _STATUS_PROCESSING:
+            # Defensive: only accepted (handled above when attemptless),
+            # processing and the two terminal statuses exist.
+            raise _storage_failure()
+
+        if not attempts:
+            # A processing request with no interpretable lease or attempt
+            # is deliberately not reclaimable; reconciliation converges it
+            # directly -- there is no unfinished attempt to compensate.
+            self._converge_processing(conn, tenant_id, request_id, [], None)
+            return _record(_STATUS_FAILED)
+
+        latest = attempts[-1]
+        latest_expiry = latest[2]
+
+        # The latest attempt is still open and its lease is live (a
+        # well-formed expiry still in the future): preserve the in-progress
+        # attempt. Never write a terminal early, never mint a new attempt,
+        # and leave earlier abandoned attempts untouched.
+        if (
+            latest[3] is None
+            and isinstance(latest_expiry, str)
+            and fnmatchcase(latest_expiry, _RFC3339_GLOB)
+            and _utc_now_rfc3339() <= latest_expiry
+        ):
+            return _record(_STATUS_PROCESSING)
+
+        # Otherwise the latest lease has expired or is missing/unparsable,
+        # or the attempts already disagree with the processing status:
+        # compensate unfinished attempts and converge. A finished attempt
+        # exists only out of band here (finish_claim is itself terminal);
+        # the earliest finished result wins, every unfinished attempt is
+        # compensated to failed and later duplicate terminals are recorded
+        # failed without changing the converged status.
+        finished = [a for a in attempts if a[3] is not None]
+        winner = self._earliest_finished_result(finished)
+        self._converge_processing(conn, tenant_id, request_id, attempts, winner)
+        return _record(winner if winner is not None else _STATUS_FAILED)
+
+    @staticmethod
+    def _validate_reconcile_attempts(rows: list[tuple]) -> list[tuple]:
+        """Shape-check persisted attempts for reconciliation.
+
+        Genuine structural damage -- non-integer or non-dense sequence
+        numbers, a missing/non-text claim time, a non-terminal stored
+        result, or result/completion set inconsistently -- is reported as
+        storage corruption. The lease expiry is accepted as ``None`` or
+        any string: a missing, empty or unparsable lease means "no
+        interpretable lease", which the caller converges rather than
+        treats as corruption (such a lease is never a claim candidate
+        either).
+        """
+        attempts: list[tuple] = []
+        for index, row in enumerate(rows, start=1):
+            (
+                attempt_number,
+                claimed_at,
+                lease_expires_at,
+                result,
+                completed_at,
+            ) = row
+            if (
+                not isinstance(attempt_number, int)
+                or isinstance(attempt_number, bool)
+                or attempt_number != index
+                or not isinstance(claimed_at, str)
+                or not claimed_at
+            ):
+                raise _storage_failure()
+            if lease_expires_at is not None and not isinstance(
+                lease_expires_at, str
+            ):
+                raise _storage_failure()
+            if result is not None and (
+                not isinstance(result, str) or result not in _TERMINAL_RESULTS
+            ):
+                raise _storage_failure()
+            if completed_at is not None and (
+                not isinstance(completed_at, str) or not completed_at
+            ):
+                raise _storage_failure()
+            if (result is None) != (completed_at is None):
+                raise _storage_failure()
+            attempts.append(
+                (
+                    attempt_number,
+                    claimed_at,
+                    lease_expires_at,
+                    result,
+                    completed_at,
+                )
+            )
+        return attempts
+
+    @staticmethod
+    def _earliest_finished_result(finished: list[tuple]) -> str | None:
+        """Return the result of the earliest finished attempt, if any.
+
+        The earliest attempt is the one with the smallest completion time,
+        ties broken by attempt number. Timestamps emitted by this store are
+        RFC3339 with a fixed width, so they order lexicographically; a
+        non-empty out-of-band value still compares deterministically.
+        """
+        if not finished:
+            return None
+        earliest = min(finished, key=lambda a: (a[4], a[0]))
+        return earliest[3]
+
+    @staticmethod
+    def _compensate_open_attempts(
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        request_id: str,
+        attempts: list[tuple],
+        completed_at: str,
+    ) -> None:
+        """Mark every unfinished attempt ``failed`` at one completion time.
+
+        The single UTC RFC3339 timestamp is generated by the caller once
+        and written to each compensated attempt; rows are matched on
+        ``result IS NULL`` so repeated reconciliation can never re-stamp an
+        already-compensated attempt.
+        """
+        for attempt in attempts:
+            if attempt[3] is not None:
+                continue
+            cursor = conn.execute(
+                "UPDATE claim_attempts SET result = 'failed', completed_at = ? "
+                "WHERE tenant_id = ? AND request_id = ? "
+                "AND attempt_number = ? AND result IS NULL",
+                (completed_at, tenant_id, request_id, attempt[0]),
+            )
+            if cursor.rowcount != 1:
+                raise _storage_failure()
+
+    def _normalise_attempts(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        request_id: str,
+        attempts: list[tuple],
+    ) -> None:
+        """Settle the attempt record behind a converging request.
+
+        Every unfinished attempt is compensated to ``failed`` with one
+        shared UTC RFC3339 completion time written once. Of the finished
+        attempts the earliest keeps its result; every later finished
+        attempt is a duplicate terminal that is recorded as ``failed``
+        (its original completion time is left untouched). This never
+        inserts or deletes rows and never re-stamps a settled attempt.
+        """
+        completed_at = _utc_now_rfc3339()
+        self._compensate_open_attempts(
+            conn, tenant_id, request_id, attempts, completed_at
+        )
+        finished = [a for a in attempts if a[3] is not None]
+        if len(finished) <= 1:
+            return
+        earliest_number = min(finished, key=lambda a: (a[4], a[0]))[0]
+        for attempt in finished:
+            if attempt[0] == earliest_number or attempt[3] == _STATUS_FAILED:
+                continue
+            cursor = conn.execute(
+                "UPDATE claim_attempts SET result = 'failed' "
+                "WHERE tenant_id = ? AND request_id = ? "
+                "AND attempt_number = ? AND result = ?",
+                (
+                    tenant_id,
+                    request_id,
+                    attempt[0],
+                    attempt[3],
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise _storage_failure()
+
+    def _normalise_terminal_attempts(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        request_id: str,
+        attempts: list[tuple],
+    ) -> None:
+        """Settle attempts behind an already-terminal request.
+
+        Behaves like :meth:`_normalise_attempts` but never touches the
+        request's status or chain: the first terminal result and the same
+        status record are retained, open attempts are compensated once and
+        later duplicate terminals are recorded as ``failed``.
+        """
+        self._normalise_attempts(conn, tenant_id, request_id, attempts)
+
+    def _converge_processing(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        request_id: str,
+        attempts: list[tuple],
+        winner: str | None,
+    ) -> None:
+        """Compensate/settle attempts, release tokens and converge status.
+
+        All writes share the caller's transaction. The request converges to
+        the earliest finished result when one exists, otherwise to
+        ``failed``; any stale credential is released in the same commit.
+        """
+        self._normalise_attempts(conn, tenant_id, request_id, attempts)
+        conn.execute(
+            "DELETE FROM claim_tokens WHERE tenant_id = ? AND request_id = ?",
+            (tenant_id, request_id),
+        )
+        target = winner if winner is not None else _STATUS_FAILED
+        # _persist_status_change appends the chained convergence event in
+        # this same transaction; processing -> {completed, failed} is always
+        # legal here.
+        self._persist_status_change(
+            conn,
+            tenant_id,
+            request_id,
+            _STATUS_PROCESSING,
+            target,
+        )
 
     def get_execution_log(
         self,

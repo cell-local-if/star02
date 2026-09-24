@@ -15,7 +15,8 @@ The service exposes exactly two business endpoints:
 Status advancement (:meth:`RequestStore.transition`), current-status
 lookup (:meth:`RequestStore.get_status`) and the execution orchestration
 (:meth:`RequestStore.claim_next`, :meth:`RequestStore.finish_claim`,
-:meth:`RequestStore.get_execution_log`) exist only on the storage layer
+:meth:`RequestStore.get_execution_log` and
+:meth:`RequestStore.reconcile_execution`) exist only on the storage layer
 and are deliberately not exposed over HTTP: this service still opens
 only request acceptance and the acceptance-receipt lookup.
 
@@ -141,6 +142,11 @@ class DeferredRequestStore:
 
     def get_execution_log(self, tenant_id, request_id):
         return self._ready().get_execution_log(tenant_id, request_id)
+
+    def reconcile_execution(self, tenant_id, request_id):
+        # Execution reconciliation is storage-layer only; like the rest of
+        # the execution orchestration it is never routed over HTTP.
+        return self._ready().reconcile_execution(tenant_id, request_id)
 
 
 def _normalize_request_id(value: str) -> str:
