@@ -127,6 +127,21 @@ class DeferredRequestStore:
             tenant_id, request_id, target_status
         )
 
+    def claim_next(self, tenant_id, worker, lease_seconds):
+        # Execution orchestration stays storage-layer only; no HTTP route
+        # is added for claiming, finishing or reading execution logs.
+        return self._ready().claim_next(tenant_id, worker, lease_seconds)
+
+    def finish_claim(self, tenant_id, request_id, claim_token, result):
+        # Storage-layer only; not routed over HTTP.
+        return self._ready().finish_claim(
+            tenant_id, request_id, claim_token, result
+        )
+
+    def get_execution_log(self, tenant_id, request_id):
+        # Storage-layer only; not routed over HTTP.
+        return self._ready().get_execution_log(tenant_id, request_id)
+
 
 def _normalize_request_id(value: str) -> str:
     """Validate a request id as a UUID and return its canonical text."""

@@ -1,6 +1,6 @@
 # Forgetting Evidence Service
 
-这是一个面向后端系统的机器遗忘证据服务，用于记录删除请求、执行状态和可验证回执。当前提供可运行的 Python 包、健康检查入口、删除请求的受理与查询 HTTP API（SQLite 持久化），以及请求存储层上的可持久化状态机（状态推进与状态查询）。状态推进与状态查询只在存储层开放，HTTP 仍只提供受理与受理回执查询两个端点，暂不实现删除执行编排能力。
+这是一个面向后端系统的机器遗忘证据服务，用于记录删除请求、执行状态和可验证回执。当前提供可运行的 Python 包、健康检查入口、删除请求的受理与查询 HTTP API（SQLite 持久化）、请求存储层上的可持久化状态机（状态推进与状态查询），以及存储层上的删除执行编排（领取租约、终态回执与执行记录）。状态推进、状态查询与执行编排只在存储层开放，HTTP 仍只提供受理与受理回执查询两个端点。
 
 运行健康检查：
 
@@ -30,12 +30,26 @@ PYTHONPATH=src python3 -m forgetting_evidence serve --db ./data/evidence.db --ho
 - `get_status(tenant_id, request_id)`：按租户和请求编号返回当前状态记录，结构、字段顺序与受理回执一致（`request_id`、`status`、`created_at`），但 `status` 为最新状态、`created_at` 仍为首次受理时间；实例重建后结果一致。
 - 并发推进同一请求时，仅允许迁移图允许的最终结果，底层锁冲突不会作为调用方错误泄露。
 
+存储层执行编排（`RequestStore`，不经 HTTP 开放）补齐从领取到终态的执行链路：
+
+- `claim_next(tenant_id, worker, lease_seconds)`：原子领取本租户最早可领取的请求。可领取集合为 `accepted` 请求与租约已过期的 `processing` 请求，按首次受理时间与请求编号竞争，同一请求租期内只允许一个 worker 持有，无候选返回 `None`。
+  - `tenant_id`、`worker` 为非空字符串；`lease_seconds` 为 1 至 3600 的非布尔整数。参数、租期越界为 `ValueError` 且不写库。
+  - 首次领取将状态由 `accepted` 置为 `processing`（同一事务追加链式 `processing` 事件）；过期重领不改首次受理时间、编号或当前状态，也不重复写状态事件，只开启新的执行尝试。
+  - 成功返回 `request_id`、不可预测的 `claim_token`（CSPRNG 生成，仅回执出现一次）与 UTC RFC3339 的 `lease_expires_at`。
+- `finish_claim(tenant_id, request_id, claim_token, result)`：凭有效且未过期的当前租约凭证完成本次尝试，`result` 仅接受 `completed` 或 `failed`，请求到达终态并记录结果与完成时间。回执含 `request_id`、`status`、`created_at`。
+  - 凭证不存在、已过期、终态后复用（已释放）或跨租户使用：统一抛 `ClaimConflict` 且不改变任何状态；编号非法/不存在抛 `RequestNotFound`，其余参数越界抛 `ValueError`。
+- `get_execution_log(tenant_id, request_id)`：按租户与编号返回全部尝试记录，按尝试序号排列。每条记录只含 `attempt_no`（从 1 递增的整数）、`claimed_at`、`lease_expires_at`（均为 UTC RFC3339 字符串）、`result` 与 `finished_at`；进行中二者为空（`None`），完成后仅在末次尝试记录终态结果与完成时间。返回值只使用字符串、整数与空值，不含浮点、`-0.0` 或非有限数；不含 worker 与凭证。
+- 编号缺失、非法或跨租户读执行记录：抛 `RequestNotFound`；租户参数非法：抛 `ValueError`。
+- 领取/完成的状态变更、状态事件与尝试行在同一 SQLite 事务内提交，无半成记录；并发领取同一请求恰好一个有效租约，并发完成同一尝试恰好一个终态，锁冲突只表现为 `None` 或 `ClaimConflict`，不泄露底层数据库错误。
+- 租约与尝试记录持久化：领取凭证密钥随库存放，服务重启后未过期租约仍可完成；旧库（无租约列与尝试表）透明加列升级。worker 标识与领取凭证只以密钥化 SHA-256 摘要持久化用于完成鉴权，绝不进入回执、执行记录、异常文案或日志。
+
 错误语义（存储层异常类型稳定，回执、返回值与日志只暴露请求编号、状态、时间与稳定错误类型，不含主体、范围、幂等键、其他租户信息、SQL 原文或路径）：
 
 - 受理、推进或查询中，除请求编号外的参数非法、范围为空或重复、目标状态越界：抛 `ValueError` 且不写库。
 - 请求编号非法、请求不存在、跨租户访问或尚未受理：统一抛 `RequestNotFound`，不区分记录是否存在。
 - 已定义状态之间发生非法迁移（含从终态继续推进）：抛 `InvalidStatusTransition`，原状态不变。
 - 同一幂等键提交不同主体或范围集合：抛 `IdempotencyConflict`，首次受理回执不变。
+- 领取凭证不存在、已过期、终态后已释放或跨租户使用：抛 `ClaimConflict`，所有状态与尝试记录不变。
 - 存储路径为空或非字符串：抛 `ValueError`；数据库不可创建、目录不可写、读写失败或内容损坏：统一抛固定文案的 `OSError`，状态写入失败时不返回半成状态。
 
 HTTP 错误响应均为只含 `error` 字段的单行 JSON，使用稳定错误码：
