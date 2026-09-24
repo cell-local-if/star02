@@ -12,8 +12,10 @@ The service exposes exactly two business endpoints:
   at acceptance time and always reports ``accepted``; it never changes
   when the request's status subsequently advances.
 
-Status advancement (:meth:`RequestStore.transition`) and current-status
-lookup (:meth:`RequestStore.get_status`) exist only on the storage layer
+Status advancement (:meth:`RequestStore.transition`), current-status
+lookup (:meth:`RequestStore.get_status`) and the execution orchestration
+(:meth:`RequestStore.claim_next`, :meth:`RequestStore.finish_claim`,
+:meth:`RequestStore.get_execution_log`) exist only on the storage layer
 and are deliberately not exposed over HTTP: this service still opens
 only request acceptance and the acceptance-receipt lookup.
 
@@ -126,6 +128,19 @@ class DeferredRequestStore:
         return self._ready().transition(
             tenant_id, request_id, target_status
         )
+
+    def claim_next(self, tenant_id, worker_id, lease_seconds):
+        # Execution orchestration is storage-layer only; like the status
+        # machine it is never routed over HTTP.
+        return self._ready().claim_next(tenant_id, worker_id, lease_seconds)
+
+    def finish_claim(self, tenant_id, request_id, claim_token, result):
+        return self._ready().finish_claim(
+            tenant_id, request_id, claim_token, result
+        )
+
+    def get_execution_log(self, tenant_id, request_id):
+        return self._ready().get_execution_log(tenant_id, request_id)
 
 
 def _normalize_request_id(value: str) -> str:

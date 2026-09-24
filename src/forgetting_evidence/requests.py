@@ -21,6 +21,22 @@ lifecycle ``accepted -> processing -> {completed, failed}`` and
 ``accepted -> failed``. ``completed`` and ``failed`` are terminal.
 Re-issuing the status a request already holds is an idempotent no-op.
 
+Execution orchestration lives on the same store, storage-layer only:
+
+* :meth:`RequestStore.claim_next` atomically leases the oldest claimable
+  request (accepted, or processing with an expired lease) to a worker,
+  moving a first-time claim to ``processing`` and recording an append-only
+  attempt row. It returns the request id, an unpredictable single-use
+  claim token and the UTC lease expiry; the worker identity is validated
+  but never persisted, and only a hash of the token is stored.
+* :meth:`RequestStore.finish_claim` commits a terminal result for the
+  live lease: the status change, its audit-chain event, the attempt
+  result and the token release land in one transaction. Unknown, expired,
+  released or foreign tokens raise :class:`ClaimConflict` unchanged.
+* :meth:`RequestStore.get_execution_log` returns the attempt history
+  (sequence, claim and expiry times, terminal result and completion
+  time) with only strings, integers and nulls -- never a worker or token.
+
 Every accepted request carries a persistent, append-only status timeline
 in ``status_events``. Events are written in the same transaction as the
 request row or status change they describe, so the final timeline entry
@@ -47,18 +63,20 @@ import hmac
 import json
 import logging
 import os
+import secrets
 import sqlite3
 import struct
 import threading
 import uuid
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 __all__ = [
     "RequestStore",
     "IdempotencyConflict",
     "RequestNotFound",
     "InvalidStatusTransition",
+    "ClaimConflict",
 ]
 
 _log = logging.getLogger(__name__)
@@ -74,6 +92,17 @@ class RequestNotFound(Exception):
 
 class InvalidStatusTransition(Exception):
     """Raised when a requested status change is unknown or not permitted."""
+
+
+class ClaimConflict(Exception):
+    """Raised when a claim cannot be acquired or finished as requested.
+
+    Covers a finish/release presented with a token that is unknown, expired,
+    already released or owned by another tenant, as well as a finish
+    attempted against a request that no longer holds a live claim. The
+    fixed message never identifies which condition applied, so the outcome
+    can never be used to probe for requests, workers or claim tokens.
+    """
 
 
 class _PrimaryKeyConflict(Exception):
@@ -113,6 +142,48 @@ CREATE TABLE IF NOT EXISTS status_events (
 # The composite primary key already indexes (tenant_id, request_id, seq),
 # which serves both the ordered timeline read and the latest-event lookup.
 
+# Append-only execution attempts. One row per lease acquisition: the first
+# claim of an accepted request starts attempt 1, and every reclaim after a
+# lease expires starts the next sequential attempt. Rows are never updated
+# and never deleted, so a worker that lost its lease can never rewrite
+# history. ``claimed_at``/``lease_expires_at`` are set at acquisition;
+# ``result``/``completed_at`` stay NULL until finish_claim records the
+# terminal outcome. No worker identity and no claim token is ever stored.
+_CLAIM_TABLE = """
+CREATE TABLE IF NOT EXISTS claim_attempts (
+    tenant_id       TEXT NOT NULL,
+    request_id      TEXT NOT NULL,
+    attempt_number  INTEGER NOT NULL,
+    claimed_at      TEXT NOT NULL,
+    lease_expires_at TEXT NOT NULL,
+    result          TEXT,
+    completed_at    TEXT,
+    PRIMARY KEY (tenant_id, request_id, attempt_number)
+);
+"""
+
+# Drives the "pick the oldest live candidate" query without a table scan:
+# only requests that may still be claimed (accepted, or processing whose
+# latest lease has expired) are indexed, ordered by acceptance time then id.
+_CLAIM_CANDIDATE_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_claim_candidates
+    ON requests(tenant_id, created_at, request_id);
+"""
+
+# Live claim tokens. At most one row per request: claiming releases every
+# prior token and finishing deletes the winning one. Only a salt-free SHA-256
+# of the token is stored, so the database at rest never contains the secret
+# the worker presents; a leaked file cannot be replayed as a live claim.
+_CLAIM_TOKEN_TABLE = """
+CREATE TABLE IF NOT EXISTS claim_tokens (
+    tenant_id      TEXT NOT NULL,
+    request_id     TEXT NOT NULL,
+    attempt_number INTEGER NOT NULL,
+    token_hash     TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, request_id)
+);
+"""
+
 # Column probes used to upgrade database files created before chain
 # hashes existed. The upgrade is purely additive (nullable columns plus a
 # one-time backfill derived from the already-persisted timeline); it never
@@ -151,6 +222,47 @@ _ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     _STATUS_FAILED: frozenset(),
 }
 
+# Execution leasing. A claim is held for at most 3600 seconds; a lease that
+# has expired makes the request claimable again, starting a fresh attempt.
+_MIN_LEASE_SECONDS = 1
+_MAX_LEASE_SECONDS = 3600
+# Terminal outcomes finish_claim is allowed to record.
+_TERMINAL_RESULTS = frozenset({_STATUS_COMPLETED, _STATUS_FAILED})
+# Claim tokens are presented as a fixed-width, URL-safe opaque secret. They
+# are generated with the CSPRNG, returned exactly once at acquisition, and
+# never persisted, logged or echoed back.
+_TOKEN_BYTES = 32
+# Fixed, detail-free text for every claim failure.
+_CLAIM_CONFLICT_MESSAGE = "claim conflict"
+
+
+def _require_lease_seconds(value: object) -> int:
+    """Validate a lease duration: a non-boolean int in 1..3600."""
+    # bool is a subclass of int; a boolean lease is caller error, not a
+    # 0/1 second lease.
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError("lease_seconds must be an integer between 1 and 3600")
+    if not _MIN_LEASE_SECONDS <= value <= _MAX_LEASE_SECONDS:
+        raise ValueError("lease_seconds must be an integer between 1 and 3600")
+    return value
+
+
+def _require_result(value: object) -> str:
+    """Validate the terminal result handed to finish_claim."""
+    if not isinstance(value, str) or value not in _TERMINAL_RESULTS:
+        raise ValueError("result must be 'completed' or 'failed'")
+    return value
+
+
+def _new_claim_token() -> str:
+    """Return an unpredictable, single-use claim token."""
+    return secrets.token_urlsafe(_TOKEN_BYTES)
+
+
+def _claim_conflict() -> ClaimConflict:
+    """Build the single, detail-free claim error callers ever see."""
+    return ClaimConflict(_CLAIM_CONFLICT_MESSAGE)
+
 
 def _require_nonempty_str(value: object, field: str) -> str:
     if not isinstance(value, str) or not value:
@@ -186,8 +298,22 @@ def _normalize_scopes(scopes: object) -> list[str]:
     return sorted(items)
 
 
+def _format_rfc3339(moment: datetime) -> str:
+    """Format an aware UTC datetime as RFC3339 with a fixed ``Z`` suffix.
+
+    Microseconds are always emitted (six digits) so that two timestamps
+    sort lexicographically in chronological order even when one lands on
+    a whole second. ``isoformat`` drops the fractional part on a zero
+    microsecond value, which would otherwise make ``...:00Z`` sort after
+    ``...:00.000001Z`` textually.
+    """
+    return moment.astimezone(timezone.utc).isoformat(timespec="microseconds").replace(
+        "+00:00", "Z"
+    )
+
+
 def _utc_now_rfc3339() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return _format_rfc3339(datetime.now(timezone.utc))
 
 
 def _occurred_at_not_before(latest: str) -> str:
@@ -275,6 +401,9 @@ class RequestStore:
                 conn.execute(_SCHEMA)
                 conn.execute(_UNIQUE_TENANT_KEY)
                 conn.execute(_EVENT_TABLE)
+                conn.execute(_CLAIM_TABLE)
+                conn.execute(_CLAIM_TOKEN_TABLE)
+                conn.execute(_CLAIM_CANDIDATE_INDEX)
                 self._migrate_schema(conn)
             except sqlite3.Error:
                 raise _storage_failure() from None
@@ -639,70 +768,8 @@ class RequestStore:
                             "status": current_status,
                             "created_at": created_at,
                         }
-                    allowed = _ALLOWED_TRANSITIONS.get(current_status, frozenset())
-                    if target_status not in allowed:
-                        conn.execute("ROLLBACK")
-                        raise InvalidStatusTransition("illegal status transition")
-                    # Read the predecessor link before writing so the new
-                    # link binds the exact persisted predecessor. BEGIN
-                    # IMMEDIATE serializes writers, so two transitions can
-                    # neither claim the same seq nor read a stale predecessor.
-                    latest = conn.execute(
-                        "SELECT seq, occurred_at, chain_hash FROM status_events "
-                        "WHERE tenant_id = ? AND request_id = ? "
-                        "ORDER BY seq DESC LIMIT 1",
-                        (tenant_id, request_id),
-                    ).fetchone()
-                    if latest is None or not _is_chain_hash(latest[2]):
-                        # Defensive only: every accepted request owns its
-                        # seq-0 event with a valid link, so reaching here
-                        # means the timeline invariant was broken out of
-                        # band. Never fabricate a replacement link.
-                        conn.execute("ROLLBACK")
-                        raise _storage_failure()
-                    next_seq, latest_occurred_at, predecessor_hash = latest
-                    occurred_at = _occurred_at_not_before(latest_occurred_at)
-                    next_link_hash = _chain_hash(
-                        tenant_id,
-                        request_id,
-                        next_seq + 1,
-                        target_status,
-                        occurred_at,
-                        predecessor_hash,
-                    )
-                    cursor = conn.execute(
-                        "UPDATE requests SET status = ?, chain_hash = ? "
-                        "WHERE tenant_id = ? AND request_id = ? AND status = ?",
-                        (
-                            target_status,
-                            next_link_hash,
-                            tenant_id,
-                            request_id,
-                            current_status,
-                        ),
-                    )
-                    if cursor.rowcount != 1:
-                        # The row vanished or changed under us; refuse rather
-                        # than persisting a state that breaks the transition
-                        # graph observed at read time.
-                        conn.execute("ROLLBACK")
-                        raise InvalidStatusTransition("illegal status transition")
-                    # The event is appended in the same transaction as the
-                    # status update. The event's chain link binds the
-                    # predecessor hash and is itself anchored on the request
-                    # row by the UPDATE above.
-                    conn.execute(
-                        "INSERT INTO status_events ("
-                        "tenant_id, request_id, seq, status, occurred_at, chain_hash"
-                        ") VALUES (?, ?, ?, ?, ?, ?)",
-                        (
-                            tenant_id,
-                            request_id,
-                            next_seq + 1,
-                            target_status,
-                            occurred_at,
-                            next_link_hash,
-                        ),
+                    self._persist_status_change(
+                        conn, tenant_id, request_id, current_status, target_status
                     )
                     conn.execute("COMMIT")
                 except InvalidStatusTransition:
@@ -729,6 +796,495 @@ class RequestStore:
             "status": target_status,
             "created_at": created_at,
         }
+
+    def _persist_status_change(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        request_id: str,
+        current_status: str,
+        target_status: str,
+    ) -> str:
+        """Append the chain event and advance the status within an open txn.
+
+        Shared by :meth:`transition` and :meth:`finish_claim` so a terminal
+        result lands in the same transaction as the attempt record. The
+        caller owns ``BEGIN``/``COMMIT``; on a domain rejection or a broken
+        invariant this helper rolls back before raising, so a shared
+        in-memory connection is never left inside an aborted transaction.
+        Returns the (monotonic) occurrence time written on the new event so
+        the caller can stamp the attempt completion with the same instant.
+        """
+        allowed = _ALLOWED_TRANSITIONS.get(current_status, frozenset())
+        if target_status not in allowed:
+            conn.execute("ROLLBACK")
+            raise InvalidStatusTransition("illegal status transition")
+        # Read the predecessor link before writing so the new link binds
+        # the exact persisted predecessor. BEGIN IMMEDIATE serializes
+        # writers, so two changes can neither claim the same seq nor read a
+        # stale predecessor.
+        latest = conn.execute(
+            "SELECT seq, occurred_at, chain_hash FROM status_events "
+            "WHERE tenant_id = ? AND request_id = ? ORDER BY seq DESC LIMIT 1",
+            (tenant_id, request_id),
+        ).fetchone()
+        if latest is None or not _is_chain_hash(latest[2]):
+            # Defensive only: every accepted request owns its seq-0 event
+            # with a valid link, so reaching here means the timeline
+            # invariant was broken out of band. Never fabricate a link.
+            conn.execute("ROLLBACK")
+            raise _storage_failure()
+        next_seq, latest_occurred_at, predecessor_hash = latest
+        occurred_at = _occurred_at_not_before(latest_occurred_at)
+        next_link_hash = _chain_hash(
+            tenant_id,
+            request_id,
+            next_seq + 1,
+            target_status,
+            occurred_at,
+            predecessor_hash,
+        )
+        cursor = conn.execute(
+            "UPDATE requests SET status = ?, chain_hash = ? "
+            "WHERE tenant_id = ? AND request_id = ? AND status = ?",
+            (
+                target_status,
+                next_link_hash,
+                tenant_id,
+                request_id,
+                current_status,
+            ),
+        )
+        if cursor.rowcount != 1:
+            # The row vanished or changed under us; refuse rather than
+            # persisting a state that breaks the graph observed at read.
+            conn.execute("ROLLBACK")
+            raise InvalidStatusTransition("illegal status transition")
+        # The event is appended in the same transaction as the status
+        # update and the attempt row; its link is anchored on the request
+        # row by the UPDATE above.
+        conn.execute(
+            "INSERT INTO status_events ("
+            "tenant_id, request_id, seq, status, occurred_at, chain_hash"
+            ") VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                tenant_id,
+                request_id,
+                next_seq + 1,
+                target_status,
+                occurred_at,
+                next_link_hash,
+            ),
+        )
+        return occurred_at
+
+    # -- execution orchestration ---------------------------------------
+
+    def claim_next(
+        self,
+        tenant_id: str,
+        worker_id: str,
+        lease_seconds: int,
+    ) -> dict[str, object] | None:
+        """Atomically claim the next request the tenant may execute.
+
+        Candidates are ``accepted`` requests and ``processing`` requests
+        whose latest lease has expired, ordered by acceptance time then
+        request id; the oldest wins. The first claim moves an accepted
+        request to ``processing`` and starts attempt 1; reclaiming after
+        expiry starts the next attempt without changing the acceptance
+        time, request id or current status. Only one worker ever holds a
+        live lease for a given request.
+
+        Returns ``None`` when no request is currently claimable. On
+        success returns exactly ``request_id``, an unpredictable
+        ``claim_token`` and the UTC RFC3339 ``lease_expires_at``. The
+        worker identity is validated but never stored, logged or returned,
+        and the raw token is returned once and never persisted. Invalid
+        arguments raise :class:`ValueError` without writing; every storage
+        fault is a fixed-text :class:`OSError`.
+        """
+        # Validate everything before touching the database. worker_id is
+        # deliberately not persisted: it is authorised here only.
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        worker_id = _require_nonempty_str(worker_id, "worker_id")
+        lease_seconds = _require_lease_seconds(lease_seconds)
+
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                except sqlite3.Error:
+                    raise _storage_failure() from None
+                claim: dict[str, object] | None = None
+                try:
+                    claim = self._claim_next_locked(conn, tenant_id, lease_seconds)
+                    conn.execute("COMMIT")
+                except OSError:
+                    # A fixed-text storage failure raised after the helper
+                    # rolled back; the second rollback is a harmless no-op
+                    # that guarantees the (possibly shared) connection is
+                    # never left inside an aborted transaction.
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
+                except sqlite3.Error:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise _storage_failure() from None
+            finally:
+                self._release(conn)
+        if claim is None:
+            _log.info("claim found no candidate")
+            return None
+        _log.info(
+            "claim acquired request_id=%s attempt=%s",
+            claim["request_id"],
+            claim["_attempt_number"],
+        )
+        # Strip internal bookkeeping; the caller sees only the contract.
+        return {
+            "request_id": claim["request_id"],
+            "claim_token": claim["claim_token"],
+            "lease_expires_at": claim["lease_expires_at"],
+        }
+
+    def _claim_next_locked(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        lease_seconds: int,
+    ) -> dict[str, object] | None:
+        now_dt = datetime.now(timezone.utc)
+        claimed_at = _format_rfc3339(now_dt)
+        lease_expires_at = _format_rfc3339(
+            now_dt + timedelta(seconds=lease_seconds)
+        )
+        # Oldest accepted, or oldest processing whose latest lease has
+        # expired. The correlated subquery reads the most recent attempt's
+        # expiry; a request with no attempts has none and only qualifies
+        # while accepted. BEGIN IMMEDIATE plus the write lock make the
+        # read-then-claim atomic, so two workers can never both win.
+        row = conn.execute(
+            "SELECT r.request_id, r.status "
+            "FROM requests r "
+            "WHERE r.tenant_id = ? "
+            "  AND ( "
+            "    r.status = ? "
+            "    OR ( "
+            "      r.status = ? "
+            "      AND ? > COALESCE( "
+            "        (SELECT c.lease_expires_at FROM claim_attempts c "
+            "         WHERE c.tenant_id = r.tenant_id "
+            "           AND c.request_id = r.request_id "
+            "         ORDER BY c.attempt_number DESC LIMIT 1), "
+            "        '') "
+            "    ) "
+            "  ) "
+            "ORDER BY r.created_at ASC, r.request_id ASC LIMIT 1",
+            (
+                tenant_id,
+                _STATUS_ACCEPTED,
+                _STATUS_PROCESSING,
+                claimed_at,
+            ),
+        ).fetchone()
+        if row is None:
+            return None
+        request_id, current_status = row
+
+        attempt_row = conn.execute(
+            "SELECT COALESCE(MAX(attempt_number), 0) + 1 "
+            "FROM claim_attempts WHERE tenant_id = ? AND request_id = ?",
+            (tenant_id, request_id),
+        ).fetchone()
+        attempt_number = attempt_row[0]
+        if not isinstance(attempt_number, int) or isinstance(attempt_number, bool):
+            # Corrupt attempt sequence: never fabricate a number.
+            raise _storage_failure()
+
+        conn.execute(
+            "INSERT INTO claim_attempts ("
+            "tenant_id, request_id, attempt_number, claimed_at, "
+            "lease_expires_at, result, completed_at"
+            ") VALUES (?, ?, ?, ?, ?, NULL, NULL)",
+            (
+                tenant_id,
+                request_id,
+                attempt_number,
+                claimed_at,
+                lease_expires_at,
+            ),
+        )
+        # Any token from a previous (now superseded) lease is released the
+        # instant a new lease begins, so an expired worker can never finish
+        # a request a successor now owns.
+        conn.execute(
+            "DELETE FROM claim_tokens WHERE tenant_id = ? AND request_id = ?",
+            (tenant_id, request_id),
+        )
+        token = _new_claim_token()
+        conn.execute(
+            "INSERT INTO claim_tokens ("
+            "tenant_id, request_id, attempt_number, token_hash"
+            ") VALUES (?, ?, ?, ?)",
+            (
+                tenant_id,
+                request_id,
+                attempt_number,
+                hashlib.sha256(token.encode("utf-8")).hexdigest(),
+            ),
+        )
+        if current_status == _STATUS_ACCEPTED:
+            # The first acquisition enters processing exactly once, in the
+            # same transaction as the attempt row. A reclaim after expiry
+            # finds the request already processing and writes no state.
+            self._persist_status_change(
+                conn, tenant_id, request_id, _STATUS_ACCEPTED, _STATUS_PROCESSING
+            )
+        return {
+            "request_id": request_id,
+            "claim_token": token,
+            "lease_expires_at": lease_expires_at,
+            "_attempt_number": attempt_number,
+        }
+
+    def finish_claim(
+        self,
+        tenant_id: str,
+        request_id: str,
+        claim_token: str,
+        result: str,
+    ) -> dict[str, str]:
+        """Finish the live claim with a terminal ``result``.
+
+        ``result`` must be ``completed`` or ``failed``. The token must
+        identify the request's current, unexpired, unreleased lease for
+        the same tenant; an unknown, expired, already-released or
+        cross-tenant token -- as well as finishing a request that has no
+        open claim -- raises :class:`ClaimConflict` and changes nothing.
+        The terminal status and its chain event are committed in the same
+        transaction that records the attempt result and releases the
+        token. Returns the status record (``request_id``, ``status``,
+        ``created_at``).
+        """
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        request_id = _require_identifier(request_id)
+        result = _require_result(result)
+        # A token outside the non-empty-string domain is caller error
+        # (ValueError), exactly like the other execution parameters. A
+        # well-formed string that simply matches no live lease is resolved
+        # below and surfaces as ClaimConflict ("no such credential").
+        claim_token = _require_nonempty_str(claim_token, "claim_token")
+
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                except sqlite3.Error:
+                    raise _storage_failure() from None
+                try:
+                    receipt = self._finish_claim_locked(
+                        conn, tenant_id, request_id, claim_token, result
+                    )
+                    conn.execute("COMMIT")
+                except (InvalidStatusTransition, ClaimConflict, RequestNotFound):
+                    # Domain rejections carry no engine text; ensure the
+                    # shared in-memory connection leaves the transaction.
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
+                except sqlite3.Error:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise _storage_failure() from None
+            finally:
+                self._release(conn)
+        _log.info(
+            "claim finished request_id=%s status=%s",
+            request_id,
+            result,
+        )
+        return receipt
+
+    def _finish_claim_locked(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        request_id: str,
+        claim_token: str,
+        result: str,
+    ) -> dict[str, str]:
+        # Resolve the presented token without scoping by tenant first: a
+        # token issued to another tenant (or for another request) must look
+        # exactly like an unknown or released one and raise ClaimConflict,
+        # never reveal that the coordinates name a record elsewhere.
+        presented = hashlib.sha256(claim_token.encode("utf-8")).hexdigest()
+        owner = conn.execute(
+            "SELECT tenant_id, request_id, attempt_number FROM claim_tokens "
+            "WHERE token_hash = ? LIMIT 1",
+            (presented,),
+        ).fetchone()
+        if owner is None or (owner[0], owner[1]) != (tenant_id, request_id):
+            # Unknown, already released (a successor or finish deleted it),
+            # or presented against a different tenant/request.
+            raise _claim_conflict()
+        attempt_number = owner[2]
+
+        row = conn.execute(
+            "SELECT status, created_at FROM requests "
+            "WHERE tenant_id = ? AND request_id = ?",
+            (tenant_id, request_id),
+        ).fetchone()
+        if row is None:
+            # Defensive: a live token always names an existing request.
+            raise RequestNotFound("request not found")
+        current_status, created_at = row
+
+        # The token names the current lease; its attempt must still be open
+        # and the lease must not have lapsed.
+        latest = conn.execute(
+            "SELECT result, lease_expires_at FROM claim_attempts "
+            "WHERE tenant_id = ? AND request_id = ? AND attempt_number = ?",
+            (tenant_id, request_id, attempt_number),
+        ).fetchone()
+        if latest is None or latest[0] is not None:
+            raise _claim_conflict()
+        if _utc_now_rfc3339() > latest[1]:
+            # The lease has expired; the holder no longer owns the request.
+            raise _claim_conflict()
+
+        if current_status != _STATUS_PROCESSING:
+            # An open attempt must accompany processing; anything else is
+            # an out-of-band inconsistency that must not be overwritten.
+            raise _claim_conflict()
+
+        # Advance to the terminal state with its chain event and reuse the
+        # exact monotonic occurrence time for the attempt completion, all in
+        # this one transaction: the attempt result and request status can
+        # never disagree and neither can be left half-written.
+        completed_at = self._persist_status_change(
+            conn, tenant_id, request_id, _STATUS_PROCESSING, result
+        )
+        cursor = conn.execute(
+            "UPDATE claim_attempts SET result = ?, completed_at = ? "
+            "WHERE tenant_id = ? AND request_id = ? AND attempt_number = ? "
+            "AND result IS NULL",
+            (result, completed_at, tenant_id, request_id, attempt_number),
+        )
+        if cursor.rowcount != 1:
+            raise _claim_conflict()
+        # Release the single-use token before returning success.
+        conn.execute(
+            "DELETE FROM claim_tokens "
+            "WHERE tenant_id = ? AND request_id = ? AND attempt_number = ?",
+            (tenant_id, request_id, attempt_number),
+        )
+        return {
+            "request_id": request_id,
+            "status": result,
+            "created_at": created_at,
+        }
+
+    def get_execution_log(
+        self,
+        tenant_id: str,
+        request_id: str,
+    ) -> list[dict[str, object]]:
+        """Return the request's execution attempts in attempt order.
+
+        Each entry contains exactly ``attempt_number`` (a positive int
+        starting at 1), ``claimed_at`` and ``lease_expires_at`` (UTC
+        RFC3339 strings), and ``result``/``completed_at`` which are the
+        terminal status and completion time once finished, and ``None``
+        while the attempt is still open (or was abandoned on expiry). No
+        worker identity and no claim token is ever included. Invalid,
+        unknown and cross-tenant ids raise :class:`RequestNotFound`; a
+        non-string or empty tenant raises :class:`ValueError`; corrupt
+        rows raise the fixed-text :class:`OSError`.
+        """
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        request_id = _require_identifier(request_id)
+        if self._mem_conn is not None:
+            with self._write_lock:
+                return self._get_execution_log(tenant_id, request_id)
+        return self._get_execution_log(tenant_id, request_id)
+
+    def _get_execution_log(
+        self, tenant_id: str, request_id: str
+    ) -> list[dict[str, object]]:
+        conn = self._connect()
+        try:
+            try:
+                # Resolve ownership first, exactly like audit(): an empty
+                # log must not distinguish "missing" from "foreign record".
+                owner = conn.execute(
+                    "SELECT 1 FROM requests WHERE tenant_id = ? AND request_id = ?",
+                    (tenant_id, request_id),
+                ).fetchone()
+                if owner is None:
+                    raise RequestNotFound("request not found")
+                rows = conn.execute(
+                    "SELECT attempt_number, claimed_at, lease_expires_at, "
+                    "result, completed_at FROM claim_attempts "
+                    "WHERE tenant_id = ? AND request_id = ? "
+                    "ORDER BY attempt_number",
+                    (tenant_id, request_id),
+                ).fetchall()
+            except RequestNotFound:
+                raise
+            except sqlite3.Error:
+                raise _storage_failure() from None
+        finally:
+            self._release(conn)
+
+        attempts: list[dict[str, object]] = []
+        for index, row in enumerate(rows, start=1):
+            attempt_number, claimed_at, lease_expires_at, result, completed_at = row
+            # Strict shape validation: a tampered row is storage
+            # corruption, never a partially-formed record. Only str, int
+            # and None ever reach the caller -- never float or bool.
+            if (
+                not isinstance(attempt_number, int)
+                or isinstance(attempt_number, bool)
+                or attempt_number != index
+                or not isinstance(claimed_at, str)
+                or not claimed_at
+                or not isinstance(lease_expires_at, str)
+                or not lease_expires_at
+            ):
+                raise _storage_failure()
+            if result is not None and (
+                not isinstance(result, str) or result not in _TERMINAL_RESULTS
+            ):
+                raise _storage_failure()
+            if completed_at is not None and (
+                not isinstance(completed_at, str) or not completed_at
+            ):
+                raise _storage_failure()
+            # result and completed_at are set together at finish time.
+            if (result is None) != (completed_at is None):
+                raise _storage_failure()
+            attempts.append(
+                {
+                    "attempt_number": attempt_number,
+                    "claimed_at": claimed_at,
+                    "lease_expires_at": lease_expires_at,
+                    "result": result,
+                    "completed_at": completed_at,
+                }
+            )
+        return attempts
 
     def audit(
         self,
