@@ -1,14 +1,16 @@
+import io
+import logging
 import os
 import sqlite3
 import tempfile
+import threading
 import unittest
 import uuid
-from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 
 from forgetting_evidence.requests import (
     IdempotencyConflict,
-    InvalidStatusTransition,
     RequestNotFound,
     RequestStore,
 )
@@ -41,6 +43,19 @@ class RequestStoreTests(unittest.TestCase):
         self.assertIn("requests", names)
         self.assertIn("idx_requests_tenant_idempotency", names)
 
+    def test_database_contains_only_request_storage(self):
+        # The acceptance core persists accepted requests alone; it must not
+        # introduce status timelines or other unrelated tables.
+        RequestStore(self.db_path)
+        with sqlite3.connect(self.db_path) as conn:
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+        self.assertEqual(tables, {"requests"})
+
     def test_submit_returns_fixed_receipt_fields(self):
         store = RequestStore(self.db_path)
         receipt = store.submit("tenant-a", "subject-1", ["email", "profile"], "key-1")
@@ -57,11 +72,17 @@ class RequestStoreTests(unittest.TestCase):
         fetched = store.get("tenant-a", receipt["request_id"])
         self.assertEqual(fetched, receipt)
 
-    def test_get_missing_and_cross_tenant(self):
+    def test_get_missing_illegal_and_cross_tenant_unified(self):
         store = RequestStore(self.db_path)
         receipt = store.submit("tenant-a", "subject-1", ["email"], "key-1")
+        # Missing request, unknown/illegal id shape and cross-tenant access
+        # all share one entry point and one exception type.
         with self.assertRaises(RequestNotFound):
             store.get("tenant-a", "does-not-exist")
+        with self.assertRaises(RequestNotFound):
+            store.get(
+                "tenant-a", "not-a-uuid-but-queried-through-the-same-entry"
+            )
         with self.assertRaises(RequestNotFound):
             store.get("tenant-b", receipt["request_id"])
 
@@ -76,6 +97,14 @@ class RequestStoreTests(unittest.TestCase):
                 "SELECT count(*) FROM requests WHERE idempotency_key = 'key-1'"
             ).fetchone()[0]
         self.assertEqual(count, 1)
+
+    def test_idempotent_replay_accepts_equivalent_scope_sequence_types(self):
+        store = RequestStore(self.db_path)
+        first = store.submit("tenant-a", "subject-1", ["email", "profile"], "key-1")
+        second = store.submit(
+            "tenant-a", "subject-1", ("profile", "email"), "key-1"
+        )
+        self.assertEqual(second, first)
 
     def test_idempotency_scoped_per_tenant(self):
         store = RequestStore(self.db_path)
@@ -94,6 +123,11 @@ class RequestStoreTests(unittest.TestCase):
         store.submit("tenant-a", "subject-1", ["email"], "key-1")
         with self.assertRaises(IdempotencyConflict):
             store.submit("tenant-a", "subject-1", ["email", "billing"], "key-1")
+        # The first record stays untouched after a conflicting replay.
+        self.assertEqual(
+            store.submit("tenant-a", "subject-1", ["email"], "key-1")["status"],
+            "accepted",
+        )
 
     def test_invalid_identifiers_rejected_without_writes(self):
         store = RequestStore(self.db_path)
@@ -115,6 +149,7 @@ class RequestStoreTests(unittest.TestCase):
             (),
             ["email", "email"],
             ["email", 7],
+            ["email", ""],
             "email",
             b"email",
             {"email": 1},
@@ -128,6 +163,24 @@ class RequestStoreTests(unittest.TestCase):
         with sqlite3.connect(self.db_path) as conn:
             self.assertEqual(conn.execute("SELECT count(*) FROM requests").fetchone()[0], 0)
 
+    def test_rejected_validation_does_not_reserve_idempotency_key(self):
+        store = RequestStore(self.db_path)
+        with self.assertRaises(ValueError):
+            store.submit("tenant-clean", "subject-1", [], "clean-key")
+        receipt = store.submit("tenant-clean", "subject-1", ["email"], "clean-key")
+        self.assertEqual(receipt["status"], "accepted")
+
+    def test_get_rejects_invalid_arguments(self):
+        store = RequestStore(self.db_path)
+        receipt = store.submit("tenant-a", "subject-1", ["email"], "key-1")
+        bad_values = ["", None, 7, b"tenant", ["tenant"]]
+        for bad in bad_values:
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    store.get(bad, receipt["request_id"])
+                with self.assertRaises(ValueError):
+                    store.get("tenant-a", bad)
+
     def test_persistence_survives_store_rebuild(self):
         first_store = RequestStore(self.db_path)
         receipt = first_store.submit("tenant-a", "subject-1", ["email"], "key-1")
@@ -135,6 +188,15 @@ class RequestStoreTests(unittest.TestCase):
         self.assertEqual(rebuilt.get("tenant-a", receipt["request_id"]), receipt)
         replay = rebuilt.submit("tenant-a", "subject-1", ["email"], "key-1")
         self.assertEqual(replay, receipt)
+
+    def test_rebuild_preserves_all_receipt_values(self):
+        first_store = RequestStore(self.db_path)
+        receipt = first_store.submit("tenant-a", "subject-1", ["email"], "key-1")
+        rebuilt = RequestStore(self.db_path)
+        fetched = rebuilt.get("tenant-a", receipt["request_id"])
+        self.assertEqual(fetched["request_id"], receipt["request_id"])
+        self.assertEqual(fetched["status"], receipt["status"])
+        self.assertEqual(fetched["created_at"], receipt["created_at"])
 
     def test_concurrent_same_key_creates_one_record(self):
         store = RequestStore(self.db_path)
@@ -154,25 +216,90 @@ class RequestStoreTests(unittest.TestCase):
             ).fetchone()[0]
         self.assertEqual(count, 1)
 
+    def test_concurrent_same_key_across_separate_instances(self):
+        barrier = threading.Barrier(8)
+        results = []
+        errors = []
+        lock = threading.Lock()
+
+        def submit_once():
+            try:
+                barrier.wait()
+                value = RequestStore(self.db_path).submit(
+                    "tenant-c", "subject-1", ["email"], "same-key"
+                )
+                with lock:
+                    results.append(value)
+            except Exception as exc:  # noqa: BLE001 - surface any leak in assert
+                with lock:
+                    errors.append(exc)
+
+        threads = [threading.Thread(target=submit_once) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 8)
+        self.assertEqual(len({r["request_id"] for r in results}), 1)
+        with sqlite3.connect(self.db_path) as conn:
+            count = conn.execute(
+                "SELECT count(*) FROM requests "
+                "WHERE tenant_id = 'tenant-c' AND idempotency_key = 'same-key'"
+            ).fetchone()[0]
+        self.assertEqual(count, 1)
+
     def test_errors_do_not_leak_payload(self):
         store = RequestStore(self.db_path)
         secret_subject = "subject-SECRET"
         secret_scope = "scope-SECRET"
-        store.submit("tenant-a", secret_subject, [secret_scope, "email"], "key-1")
+        secret_key = "key-SECRET"
+        store.submit("tenant-a", secret_subject, [secret_scope, "email"], secret_key)
         try:
-            store.submit("tenant-a", "other-subject", [secret_scope], "key-1")
+            store.submit("tenant-a", "other-subject", [secret_scope], secret_key)
         except IdempotencyConflict as exc:
             message = str(exc)
         else:
             self.fail("expected IdempotencyConflict")
         self.assertNotIn(secret_subject, message)
         self.assertNotIn(secret_scope, message)
+        self.assertNotIn(secret_key, message)
+        self.assertNotIn(self.db_path, message)
         try:
             store.get("tenant-a", secret_subject)
         except RequestNotFound as exc:
-            self.assertNotIn(secret_scope, str(exc))
+            message = str(exc)
         else:
             self.fail("expected RequestNotFound")
+        self.assertNotIn(secret_subject, message)
+        self.assertNotIn(secret_scope, message)
+
+    def test_logs_contain_only_request_id_status_and_time(self):
+        store = RequestStore(self.db_path)
+        secret_subject = "subject-LOG-SECRET"
+        secret_scope = "scope-LOG-SECRET"
+        secret_key = "key-LOG-SECRET"
+        stream = io.StringIO()
+        handler = logging.StreamHandler(stream)
+        logger = logging.getLogger("forgetting_evidence.requests")
+        logger.addHandler(handler)
+        old_level = logger.level
+        logger.setLevel(logging.INFO)
+        try:
+            receipt = store.submit(
+                "tenant-a", secret_subject, [secret_scope, "email"], secret_key
+            )
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(old_level)
+        logs = stream.getvalue()
+        self.assertIn(receipt["request_id"], logs)
+        self.assertIn("accepted", logs)
+        self.assertNotIn(secret_subject, logs)
+        self.assertNotIn(secret_scope, logs)
+        self.assertNotIn(secret_key, logs)
+        self.assertNotIn("tenant-a", logs)
+        self.assertNotIn(self.db_path, logs)
 
     def test_table_can_be_reused_when_already_initialized(self):
         RequestStore(self.db_path)
@@ -181,250 +308,63 @@ class RequestStoreTests(unittest.TestCase):
         receipt = store.submit("tenant-a", "subject-1", ["email"], "key-1")
         self.assertEqual(set(receipt), {"request_id", "status", "created_at"})
 
+    def test_in_memory_store_keeps_contract(self):
+        store = RequestStore(":memory:")
+        receipt = store.submit("tenant-a", "subject-1", ["email"], "key-1")
+        self.assertEqual(store.get("tenant-a", receipt["request_id"]), receipt)
+        with self.assertRaises(RequestNotFound):
+            store.get("tenant-b", receipt["request_id"])
+        replay = store.submit("tenant-a", "subject-1", ["email"], "key-1")
+        self.assertEqual(replay, receipt)
 
-class TransitionTests(unittest.TestCase):
+
+class ConstructorErrorTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
-        self.db_path = os.path.join(self._tmp.name, "nested", "evidence.db")
 
     def tearDown(self):
         self._tmp.cleanup()
 
-    def _submit(self, store=None, tenant="tenant-a", key="key-1"):
-        store = store if store is not None else RequestStore(self.db_path)
-        return store.submit(tenant, "subject-1", ["email"], key)
-
-    def test_accepted_to_processing_and_completed(self):
-        store = RequestStore(self.db_path)
-        receipt = self._submit(store)
-        moved = store.transition("tenant-a", receipt["request_id"], "processing")
-        self.assertEqual(set(moved), {"request_id", "status", "created_at"})
-        self.assertEqual(moved["request_id"], receipt["request_id"])
-        self.assertEqual(moved["status"], "processing")
-        self.assertEqual(moved["created_at"], receipt["created_at"])
-        done = store.transition("tenant-a", receipt["request_id"], "completed")
-        self.assertEqual(done["status"], "completed")
-        # created_at stays the original acceptance timestamp.
-        self.assertEqual(done["created_at"], receipt["created_at"])
-        self.assertEqual(store.get("tenant-a", receipt["request_id"]), done)
-
-    def test_accepted_to_failed(self):
-        store = RequestStore(self.db_path)
-        receipt = self._submit(store)
-        failed = store.transition("tenant-a", receipt["request_id"], "failed")
-        self.assertEqual(failed["status"], "failed")
-        self.assertEqual(failed["created_at"], receipt["created_at"])
-
-    def test_processing_to_failed(self):
-        store = RequestStore(self.db_path)
-        receipt = self._submit(store)
-        store.transition("tenant-a", receipt["request_id"], "processing")
-        failed = store.transition("tenant-a", receipt["request_id"], "failed")
-        self.assertEqual(failed["status"], "failed")
-
-    def test_terminal_states_reject_further_moves(self):
-        store = RequestStore(self.db_path)
-        receipt = self._submit(store)
-        store.transition("tenant-a", receipt["request_id"], "processing")
-        store.transition("tenant-a", receipt["request_id"], "completed")
-        for target in ("processing", "failed", "accepted"):
-            with self.subTest(target=target):
-                with self.assertRaises(InvalidStatusTransition):
-                    store.transition("tenant-a", receipt["request_id"], target)
-
-        other = self._submit(store, key="key-2")
-        store.transition("tenant-a", other["request_id"], "failed")
-        for target in ("processing", "completed", "accepted"):
-            with self.subTest(target=target):
-                with self.assertRaises(InvalidStatusTransition):
-                    store.transition("tenant-a", other["request_id"], target)
-
-    def test_illegal_edges_rejected(self):
-        store = RequestStore(self.db_path)
-        receipt = self._submit(store)
-        with self.assertRaises(InvalidStatusTransition):
-            store.transition("tenant-a", receipt["request_id"], "completed")
-        # State unchanged after rejected moves.
-        self.assertEqual(
-            store.get("tenant-a", receipt["request_id"])["status"], "accepted"
-        )
-
-    def test_same_target_is_idempotent(self):
-        store = RequestStore(self.db_path)
-        receipt = self._submit(store)
-        again = store.transition("tenant-a", receipt["request_id"], "accepted")
-        self.assertEqual(again, receipt)
-        store.transition("tenant-a", receipt["request_id"], "processing")
-        replay = store.transition("tenant-a", receipt["request_id"], "processing")
-        self.assertEqual(replay["request_id"], receipt["request_id"])
-        self.assertEqual(replay["status"], "processing")
-        self.assertEqual(replay["created_at"], receipt["created_at"])
-        store.transition("tenant-a", receipt["request_id"], "completed")
-        terminal = store.transition("tenant-a", receipt["request_id"], "completed")
-        self.assertEqual(terminal["status"], "completed")
-
-    def test_unknown_target_status(self):
-        store = RequestStore(self.db_path)
-        receipt = self._submit(store)
-        for bad in ("cancelled", "PROCESSING", " done", ""):
-            with self.subTest(bad=bad):
-                with self.assertRaises(InvalidStatusTransition if bad else ValueError):
-                    store.transition("tenant-a", receipt["request_id"], bad)
-        self.assertEqual(
-            store.get("tenant-a", receipt["request_id"])["status"], "accepted"
-        )
-
-    def test_non_string_arguments_rejected(self):
-        store = RequestStore(self.db_path)
-        receipt = self._submit(store)
-        bad_values = ["", None, 7, b"tenant", ["tenant"]]
-        for bad in bad_values:
+    def test_path_must_be_non_empty_string(self):
+        for bad in ("", None, 7, b"/tmp/x.db", ["/tmp/x.db"], object()):
             with self.subTest(bad=bad):
                 with self.assertRaises(ValueError):
-                    store.transition(bad, receipt["request_id"], "processing")
-                with self.assertRaises(ValueError):
-                    store.transition("tenant-a", bad, "processing")
-                with self.assertRaises(ValueError):
-                    store.transition("tenant-a", receipt["request_id"], bad)
-        with sqlite3.connect(self.db_path) as conn:
-            self.assertEqual(conn.execute("SELECT count(*) FROM requests").fetchone()[0], 1)
+                    RequestStore(bad)  # type: ignore[arg-type]
 
-    def test_unknown_and_cross_tenant_raise_not_found(self):
-        store = RequestStore(self.db_path)
-        receipt = self._submit(store)
-        with self.assertRaises(RequestNotFound):
-            store.transition("tenant-a", "does-not-exist", "processing")
-        with self.assertRaises(RequestNotFound):
-            store.transition("tenant-b", receipt["request_id"], "processing")
-        # A cross-tenant attempt must not have moved the record.
-        self.assertEqual(
-            store.get("tenant-a", receipt["request_id"])["status"], "accepted"
-        )
-
-    def test_rejected_transitions_perform_no_write(self):
-        store = RequestStore(self.db_path)
-        receipt = self._submit(store)
-        with self.assertRaises(InvalidStatusTransition):
-            store.transition("tenant-a", receipt["request_id"], "completed")
-        with sqlite3.connect(self.db_path) as conn:
-            status = conn.execute(
-                "SELECT status FROM requests WHERE request_id = ?",
-                (receipt["request_id"],),
-            ).fetchone()[0]
-        self.assertEqual(status, "accepted")
-
-    def test_latest_status_visible_after_rebuild(self):
-        first_store = RequestStore(self.db_path)
-        receipt = self._submit(first_store)
-        first_store.transition("tenant-a", receipt["request_id"], "processing")
-        first_store.transition("tenant-a", receipt["request_id"], "completed")
-        rebuilt = RequestStore(self.db_path)
-        fetched = rebuilt.get("tenant-a", receipt["request_id"])
-        self.assertEqual(fetched["status"], "completed")
-        self.assertEqual(fetched["created_at"], receipt["created_at"])
-        # Terminal state is still enforced on the rebuilt store.
-        with self.assertRaises(InvalidStatusTransition):
-            rebuilt.transition("tenant-a", receipt["request_id"], "failed")
-        # Idempotent replay still succeeds post-rebuild.
-        self.assertEqual(
-            rebuilt.transition("tenant-a", receipt["request_id"], "completed"),
-            fetched,
-        )
-
-    def test_concurrent_transitions_never_violate_graph(self):
-        store = RequestStore(self.db_path)
-        receipt = self._submit(store)
-
-        # Every worker races every legal and illegal edge; the persisted
-        # result must be reachable from accepted without passing through a
-        # terminal state.
-        targets = ("processing", "completed", "failed", "accepted", "completed")
-
-        def move(target):
-            try:
-                return store.transition("tenant-a", receipt["request_id"], target)
-            except InvalidStatusTransition:
-                return None
-
-        with ThreadPoolExecutor(max_workers=16) as pool:
-            outcomes = list(pool.map(move, targets * 8))
-        final = store.get("tenant-a", receipt["request_id"])
-        self.assertIn(final["status"], ("processing", "completed", "failed"))
-        if final["status"] == "completed":
-            # completed can only win if the accepted->processing edge and
-            # the processing->completed edge were both honoured; no
-            # accepted->completed shortcut exists.
-            self.assertIsNotNone(
-                next(o for o in outcomes if o and o["status"] == "completed")
-            )
-        # A terminal result is stable.
-        if final["status"] in ("completed", "failed"):
-            with self.assertRaises(InvalidStatusTransition):
-                store.transition("tenant-a", receipt["request_id"], "processing")
-
-    def test_concurrent_completed_and_failed_only_one_wins(self):
-        store = RequestStore(self.db_path)
-        receipt = self._submit(store)
-        store.transition("tenant-a", receipt["request_id"], "processing")
-        errors = []
-
-        def move(target):
-            try:
-                return store.transition("tenant-a", receipt["request_id"], target)
-            except InvalidStatusTransition as exc:
-                return exc
-
-        with ThreadPoolExecutor(max_workers=16) as pool:
-            results = list(pool.map(move, ("completed", "failed") * 16))
-        final = store.get("tenant-a", receipt["request_id"])
-        self.assertIn(final["status"], ("completed", "failed"))
-        winners = [
-            r for r in results if isinstance(r, dict) and r["status"] == final["status"]
-        ]
-        losers = [
-            r
-            for r in results
-            if isinstance(r, dict) and r["status"] != final["status"]
-        ]
-        # The winning terminal edge may replay idempotently; the losing edge
-        # can never report success.
-        self.assertTrue(winners)
-        self.assertFalse(losers)
-        self.assertEqual(errors, [])
-
-    def test_errors_and_logs_do_not_leak_payload(self):
-        store = RequestStore(self.db_path)
-        secret_subject = "subject-SECRET"
-        secret_scope = "scope-SECRET"
-        receipt = store.submit(
-            "tenant-a", secret_subject, [secret_scope, "email"], "key-1"
-        )
+    def test_unwritable_directory_raises_os_error(self):
+        readonly = os.path.join(self._tmp.name, "readonly")
+        os.makedirs(readonly)
+        os.chmod(readonly, 0o500)
         try:
-            store.transition("tenant-a", receipt["request_id"], "completed")
-        except InvalidStatusTransition as exc:
-            self.assertNotIn(secret_subject, str(exc))
-            self.assertNotIn(secret_scope, str(exc))
-        else:
-            self.fail("expected InvalidStatusTransition")
-
-        import io
-        import logging
-
-        stream = io.StringIO()
-        handler = logging.StreamHandler(stream)
-        logger = logging.getLogger("forgetting_evidence.requests")
-        logger.addHandler(handler)
-        old_level = logger.level
-        logger.setLevel(logging.INFO)
-        try:
-            store.transition("tenant-a", receipt["request_id"], "failed")
+            with self.assertRaises(OSError):
+                RequestStore(os.path.join(readonly, "nested", "evidence.db"))
         finally:
-            logger.removeHandler(handler)
-            logger.setLevel(old_level)
-        logs = stream.getvalue()
-        self.assertNotIn(secret_subject, logs)
-        self.assertNotIn(secret_scope, logs)
-        self.assertIn(receipt["request_id"], logs)
+            os.chmod(readonly, 0o700)
+
+    def test_path_pointing_at_directory_raises_os_error(self):
+        with self.assertRaises(OSError):
+            RequestStore(self._tmp.name)
+
+    def test_corrupt_database_raises_os_error(self):
+        db_path = os.path.join(self._tmp.name, "evidence.db")
+        with open(db_path, "wb") as handle:
+            handle.write(b"this is definitely not a sqlite database")
+        with self.assertRaises(OSError) as context:
+            RequestStore(db_path)
+        self.assertNotIn(db_path, str(context.exception))
+
+    def test_init_errors_do_not_leak_path_or_engine_text(self):
+        db_path = os.path.join(self._tmp.name, "evidence.db")
+        with open(db_path, "wb") as handle:
+            handle.write(b"not a database")
+        try:
+            RequestStore(db_path)
+        except OSError as exc:
+            message = str(exc)
+        else:
+            self.fail("expected OSError")
+        self.assertNotIn(db_path, message)
+        self.assertNotIn("sqlite", message.lower())
 
 
 if __name__ == "__main__":
