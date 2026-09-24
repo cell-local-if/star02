@@ -206,7 +206,12 @@ class TransitionTests(unittest.TestCase):
         self.assertEqual(done["status"], "completed")
         # created_at stays the original acceptance timestamp.
         self.assertEqual(done["created_at"], receipt["created_at"])
-        self.assertEqual(store.get("tenant-a", receipt["request_id"]), done)
+        # The status query tracks the current state...
+        self.assertEqual(
+            store.get_status("tenant-a", receipt["request_id"]), done
+        )
+        # ...while the acceptance query stays frozen at accepted.
+        self.assertEqual(store.get("tenant-a", receipt["request_id"]), receipt)
 
     def test_accepted_to_failed(self):
         store = RequestStore(self.db_path)
@@ -246,7 +251,7 @@ class TransitionTests(unittest.TestCase):
             store.transition("tenant-a", receipt["request_id"], "completed")
         # State unchanged after rejected moves.
         self.assertEqual(
-            store.get("tenant-a", receipt["request_id"])["status"], "accepted"
+            store.get_status("tenant-a", receipt["request_id"])["status"], "accepted"
         )
 
     def test_same_target_is_idempotent(self):
@@ -263,15 +268,16 @@ class TransitionTests(unittest.TestCase):
         terminal = store.transition("tenant-a", receipt["request_id"], "completed")
         self.assertEqual(terminal["status"], "completed")
 
-    def test_unknown_target_status(self):
+    def test_unknown_target_status_is_value_error(self):
         store = RequestStore(self.db_path)
         receipt = self._submit(store)
-        for bad in ("cancelled", "PROCESSING", " done", ""):
+        for bad in ("cancelled", "PROCESSING", " done", "", None, 7):
             with self.subTest(bad=bad):
-                with self.assertRaises(InvalidStatusTransition if bad else ValueError):
+                with self.assertRaises(ValueError):
                     store.transition("tenant-a", receipt["request_id"], bad)
+        # Out-of-range targets perform no write.
         self.assertEqual(
-            store.get("tenant-a", receipt["request_id"])["status"], "accepted"
+            store.get_status("tenant-a", receipt["request_id"])["status"], "accepted"
         )
 
     def test_non_string_arguments_rejected(self):
@@ -280,12 +286,19 @@ class TransitionTests(unittest.TestCase):
         bad_values = ["", None, 7, b"tenant", ["tenant"]]
         for bad in bad_values:
             with self.subTest(bad=bad):
+                # Tenant and target stay caller errors...
                 with self.assertRaises(ValueError):
                     store.transition(bad, receipt["request_id"], "processing")
                 with self.assertRaises(ValueError):
-                    store.transition("tenant-a", bad, "processing")
-                with self.assertRaises(ValueError):
                     store.transition("tenant-a", receipt["request_id"], bad)
+                # ...but a malformed request id is indistinguishable from a
+                # missing one and must raise RequestNotFound, never ValueError.
+                with self.assertRaises(RequestNotFound):
+                    store.transition("tenant-a", bad, "processing")
+                with self.assertRaises(RequestNotFound):
+                    store.get("tenant-a", bad)
+                with self.assertRaises(RequestNotFound):
+                    store.get_status("tenant-a", bad)
         with sqlite3.connect(self.db_path) as conn:
             self.assertEqual(conn.execute("SELECT count(*) FROM requests").fetchone()[0], 1)
 
@@ -298,7 +311,7 @@ class TransitionTests(unittest.TestCase):
             store.transition("tenant-b", receipt["request_id"], "processing")
         # A cross-tenant attempt must not have moved the record.
         self.assertEqual(
-            store.get("tenant-a", receipt["request_id"])["status"], "accepted"
+            store.get_status("tenant-a", receipt["request_id"])["status"], "accepted"
         )
 
     def test_rejected_transitions_perform_no_write(self):
@@ -319,9 +332,11 @@ class TransitionTests(unittest.TestCase):
         first_store.transition("tenant-a", receipt["request_id"], "processing")
         first_store.transition("tenant-a", receipt["request_id"], "completed")
         rebuilt = RequestStore(self.db_path)
-        fetched = rebuilt.get("tenant-a", receipt["request_id"])
+        fetched = rebuilt.get_status("tenant-a", receipt["request_id"])
         self.assertEqual(fetched["status"], "completed")
         self.assertEqual(fetched["created_at"], receipt["created_at"])
+        # The acceptance receipt remains frozen and byte-stable after rebuild.
+        self.assertEqual(rebuilt.get("tenant-a", receipt["request_id"]), receipt)
         # Terminal state is still enforced on the rebuilt store.
         with self.assertRaises(InvalidStatusTransition):
             rebuilt.transition("tenant-a", receipt["request_id"], "failed")
@@ -329,6 +344,11 @@ class TransitionTests(unittest.TestCase):
         self.assertEqual(
             rebuilt.transition("tenant-a", receipt["request_id"], "completed"),
             fetched,
+        )
+        # A status query rebuilt from another instance agrees.
+        another = RequestStore(self.db_path)
+        self.assertEqual(
+            another.get_status("tenant-a", receipt["request_id"]), fetched
         )
 
     def test_concurrent_transitions_never_violate_graph(self):
@@ -348,7 +368,7 @@ class TransitionTests(unittest.TestCase):
 
         with ThreadPoolExecutor(max_workers=16) as pool:
             outcomes = list(pool.map(move, targets * 8))
-        final = store.get("tenant-a", receipt["request_id"])
+        final = store.get_status("tenant-a", receipt["request_id"])
         self.assertIn(final["status"], ("processing", "completed", "failed"))
         if final["status"] == "completed":
             # completed can only win if the accepted->processing edge and
@@ -376,7 +396,7 @@ class TransitionTests(unittest.TestCase):
 
         with ThreadPoolExecutor(max_workers=16) as pool:
             results = list(pool.map(move, ("completed", "failed") * 16))
-        final = store.get("tenant-a", receipt["request_id"])
+        final = store.get_status("tenant-a", receipt["request_id"])
         self.assertIn(final["status"], ("completed", "failed"))
         winners = [
             r for r in results if isinstance(r, dict) and r["status"] == final["status"]

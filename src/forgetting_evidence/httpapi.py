@@ -8,7 +8,14 @@ The service exposes exactly two business endpoints:
   distinct non-empty strings.
 * ``GET /requests/{request_id}`` -- return the accepted request's
   receipt, scoped to the tenant identified by the ``X-Tenant-Id`` header
-  (or a ``tenant_id`` query parameter).
+  (or a ``tenant_id`` query parameter). The receipt is the record frozen
+  at acceptance time and always reports ``accepted``; it never changes
+  when the request's status subsequently advances.
+
+Status advancement (:meth:`RequestStore.transition`) and current-status
+lookup (:meth:`RequestStore.get_status`) exist only on the storage layer
+and are deliberately not exposed over HTTP: this service still opens
+only request acceptance and the acceptance-receipt lookup.
 
 Success responses are a single line of JSON with exactly
 ``request_id``, ``status`` and ``created_at`` (in that order) followed by
@@ -107,6 +114,18 @@ class DeferredRequestStore:
 
     def get(self, tenant_id, request_id):
         return self._ready().get(tenant_id, request_id)
+
+    def get_status(self, tenant_id, request_id):
+        # Storage-layer only; not routed over HTTP, but proxied so this
+        # wrapper stays a faithful RequestStore substitute.
+        return self._ready().get_status(tenant_id, request_id)
+
+    def transition(self, tenant_id, request_id, target_status):
+        # Storage-layer only; not routed over HTTP, but proxied so this
+        # wrapper stays a faithful RequestStore substitute.
+        return self._ready().transition(
+            tenant_id, request_id, target_status
+        )
 
 
 def _normalize_request_id(value: str) -> str:

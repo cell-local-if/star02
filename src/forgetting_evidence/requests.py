@@ -5,6 +5,22 @@ payload in logs, return values beyond the fixed receipt fields, or
 exception messages. SQLite integrity conflicts are translated into the
 module's own idempotency semantics and never surface to callers.
 
+Two read shapes are offered deliberately:
+
+* :meth:`RequestStore.get` is the *acceptance* query and returns the
+  frozen ``accepted`` receipt exactly as it was at submission time, no
+  matter how the request's status subsequently advances. This is the
+  record served by the HTTP lookup and idempotent submission replay.
+* :meth:`RequestStore.get_status` is the *status* query and returns the
+  same fixed record shape (``request_id``, ``status``, ``created_at``)
+  but with the request's current status. The ``created_at`` field always
+  stays the original acceptance time.
+
+Status advances through :meth:`RequestStore.transition` along the fixed
+lifecycle ``accepted -> processing -> {completed, failed}`` and
+``accepted -> failed``. ``completed`` and ``failed`` are terminal.
+Re-issuing the status a request already holds is an idempotent no-op.
+
 Every accepted request carries a persistent, append-only status timeline
 in ``status_events``. Events are written in the same transaction as the
 request row or status change they describe, so the final timeline entry
@@ -16,6 +32,12 @@ occurrence time and the previous event's hash. The hash of the final
 event is also stored on the request row, so deleting, modifying,
 inserting or reordering persisted events breaks verification. The hash
 preimage is never exposed in return values, exceptions or logs.
+
+Caller errors are always :class:`ValueError` (invalid parameters) or the
+module's own domain exceptions; every database failure -- an unwritable
+path, an uncreatable or corrupt file, an I/O or read/write error -- is
+reported as a fixed-text :class:`OSError` that never embeds SQL, engine
+text or a filesystem path.
 """
 
 from __future__ import annotations
@@ -107,6 +129,15 @@ _BUSY_TIMEOUT_MS = 30_000
 # only keeps that conflict distinct from idempotency conflicts.
 _MAX_INSERT_ATTEMPTS = 3
 
+# Fixed, detail-free text for every storage-layer failure. It must never
+# embed a SQL statement, the engine's own error text or a filesystem path.
+_STORAGE_MESSAGE = "request store is unavailable"
+
+
+def _storage_failure() -> OSError:
+    """Build the single storage error callers are ever allowed to see."""
+    return OSError(_STORAGE_MESSAGE)
+
 # Allowed request lifecycle. completed and failed are terminal; moving a
 # request to the status it already holds is an idempotent no-op.
 _STATUS_ACCEPTED = "accepted"
@@ -124,6 +155,18 @@ _ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
 def _require_nonempty_str(value: object, field: str) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{field} must be a non-empty string")
+    return value
+
+
+def _require_identifier(value: object) -> str:
+    """Validate a request id, mapping every malformed value to not-found.
+
+    Unlike the other arguments a bad request id must raise
+    :class:`RequestNotFound` rather than :class:`ValueError`, so the
+    validation layer can never be used as an oracle for which ids exist.
+    """
+    if not isinstance(value, str) or not value:
+        raise RequestNotFound("request not found")
     return value
 
 
@@ -202,22 +245,39 @@ class RequestStore:
     """Persist and retrieve accepted deletion requests."""
 
     def __init__(self, db_path: str | os.PathLike[str]):
-        self._db_path = os.fspath(db_path)
+        # Validate the path before touching the filesystem: an empty or
+        # non-string path is caller error (ValueError), never a storage
+        # fault, and must not create directories.
+        if isinstance(db_path, os.PathLike):
+            db_path = os.fspath(db_path)
+        if not isinstance(db_path, str) or not db_path:
+            raise ValueError("storage path must be a non-empty string")
+        self._db_path = db_path
         # In-process serialization; the unique index additionally guards
         # other processes sharing the same database file.
         self._write_lock = threading.Lock()
-        if self._db_path == ":memory:":
-            self._mem_conn: sqlite3.Connection | None = self._open_connection()
-        else:
-            self._mem_conn = None
-            parent = os.path.dirname(os.path.abspath(self._db_path))
-            os.makedirs(parent, exist_ok=True)
+        try:
+            if self._db_path == ":memory:":
+                self._mem_conn: sqlite3.Connection | None = self._open_connection()
+            else:
+                self._mem_conn = None
+                parent = os.path.dirname(os.path.abspath(self._db_path))
+                os.makedirs(parent, exist_ok=True)
+        except sqlite3.Error:
+            raise _storage_failure() from None
+        except OSError:
+            # makedirs/connect errors embed the offending path; replace
+            # them with the fixed-text storage error.
+            raise _storage_failure() from None
         conn = self._connect()
         try:
-            conn.execute(_SCHEMA)
-            conn.execute(_UNIQUE_TENANT_KEY)
-            conn.execute(_EVENT_TABLE)
-            self._migrate_schema(conn)
+            try:
+                conn.execute(_SCHEMA)
+                conn.execute(_UNIQUE_TENANT_KEY)
+                conn.execute(_EVENT_TABLE)
+                self._migrate_schema(conn)
+            except sqlite3.Error:
+                raise _storage_failure() from None
         finally:
             self._release(conn)
 
@@ -281,16 +341,23 @@ class RequestStore:
                     conn.execute("ROLLBACK")
                 except sqlite3.Error:
                     pass
-                raise RuntimeError("failed to initialize request store") from None
+                raise _storage_failure() from None
 
     def _open_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(
-            self._db_path,
-            timeout=_BUSY_TIMEOUT_MS / 1000,
-            check_same_thread=False,
-        )
+        try:
+            conn = sqlite3.connect(
+                self._db_path,
+                timeout=_BUSY_TIMEOUT_MS / 1000,
+                check_same_thread=False,
+            )
+        except sqlite3.Error:
+            raise _storage_failure() from None
         conn.isolation_level = None  # explicit transaction control
-        conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+        try:
+            conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+        except sqlite3.Error:
+            conn.close()
+            raise _storage_failure() from None
         return conn
 
     def _connect(self) -> sqlite3.Connection:
@@ -343,33 +410,31 @@ class RequestStore:
                     created_at,
                     _GENESIS_PREDECESSOR,
                 )
-                conn.execute("BEGIN IMMEDIATE")
                 try:
-                    conn.execute(
-                        "INSERT INTO requests ("
-                        "request_id, tenant_id, idempotency_key, subject_id, "
-                        "scopes_json, status, created_at, chain_hash"
-                        ") VALUES (?, ?, ?, ?, ?, 'accepted', ?, ?)",
-                        (
-                            request_id,
-                            tenant_id,
-                            idempotency_key,
-                            subject_id,
-                            scopes_json,
-                            created_at,
-                            genesis_hash,
-                        ),
-                    )
-                except sqlite3.IntegrityError:
-                    conn.execute("ROLLBACK")
+                    conn.execute("BEGIN IMMEDIATE")
                     try:
+                        conn.execute(
+                            "INSERT INTO requests ("
+                            "request_id, tenant_id, idempotency_key, subject_id, "
+                            "scopes_json, status, created_at, chain_hash"
+                            ") VALUES (?, ?, ?, ?, ?, 'accepted', ?, ?)",
+                            (
+                                request_id,
+                                tenant_id,
+                                idempotency_key,
+                                subject_id,
+                                scopes_json,
+                                created_at,
+                                genesis_hash,
+                            ),
+                        )
+                    except sqlite3.IntegrityError:
+                        conn.execute("ROLLBACK")
+                        # _PrimaryKeyConflict means retry with a new UUID;
+                        # IdempotencyConflict propagates to the caller.
                         return self._load_idempotent(
                             conn, tenant_id, idempotency_key, subject_id, scope_list
                         )
-                    except _PrimaryKeyConflict:
-                        # Collision was on request_id; retry with a new UUID.
-                        continue
-                try:
                     # The first timeline entry shares the acceptance
                     # transaction: a request can never exist without its
                     # accepted event, nor an event without its request. The
@@ -381,18 +446,30 @@ class RequestStore:
                         ") VALUES (?, ?, 0, 'accepted', ?, ?)",
                         (tenant_id, request_id, created_at, genesis_hash),
                     )
+                    conn.execute("COMMIT")
+                except _PrimaryKeyConflict:
+                    # Collision was on request_id; retry with a fresh UUID.
+                    continue
                 except sqlite3.Error:
-                    conn.execute("ROLLBACK")
-                    raise RuntimeError("failed to persist accepted request") from None
-                conn.execute("COMMIT")
-                return {
-                    "request_id": request_id,
-                    "status": "accepted",
-                    "created_at": created_at,
-                }
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise _storage_failure() from None
+                return self._acceptance_receipt(request_id, created_at)
         finally:
             self._release(conn)
-        raise RuntimeError("unable to allocate a unique request id")
+        raise _storage_failure()
+
+    @staticmethod
+    def _acceptance_receipt(request_id: str, created_at: str) -> dict[str, str]:
+        # The acceptance record is frozen: it always reports "accepted",
+        # regardless of how the request later advances.
+        return {
+            "request_id": request_id,
+            "status": _STATUS_ACCEPTED,
+            "created_at": created_at,
+        }
 
     def _load_idempotent(
         self,
@@ -403,7 +480,7 @@ class RequestStore:
         scope_list: list[str],
     ) -> dict[str, str]:
         row = conn.execute(
-            "SELECT request_id, status, created_at, subject_id, scopes_json "
+            "SELECT request_id, created_at, subject_id, scopes_json "
             "FROM requests WHERE tenant_id = ? AND idempotency_key = ?",
             (tenant_id, idempotency_key),
         ).fetchone()
@@ -411,7 +488,7 @@ class RequestStore:
             # The conflict came from the primary key rather than the
             # idempotency index; signal a fresh-UUID retry.
             raise _PrimaryKeyConflict
-        existing_request_id, status, created_at, existing_subject, existing_scopes_json = row
+        existing_request_id, created_at, existing_subject, existing_scopes_json = row
         try:
             existing_scopes = json.loads(existing_scopes_json)
         except (TypeError, ValueError):
@@ -426,16 +503,25 @@ class RequestStore:
             raise IdempotencyConflict(
                 "idempotency key was already submitted with a different payload"
             )
-        return {
-            "request_id": existing_request_id,
-            "status": status,
-            "created_at": created_at,
-        }
+        # The first acceptance receipt is immutable: always "accepted",
+        # with the first request id and first acceptance time.
+        return self._acceptance_receipt(existing_request_id, created_at)
 
     def get(self, tenant_id: str, request_id: str) -> dict[str, str]:
-        # The in-memory connection is shared across threads; serialize it
-        # against writes. File-backed stores use a fresh connection per
-        # call and rely on SQLite's own concurrency.
+        """Return the *frozen acceptance receipt* for a request.
+
+        The receipt always reports ``accepted`` with the first request id
+        and first acceptance time, even after the request has advanced to
+        processing/completed/failed. This is the record served by the
+        HTTP lookup and idempotent submission replay. Invalid, unknown or
+        cross-tenant ids are indistinguishable and raise
+        :class:`RequestNotFound`; non-string or empty *tenant_id* raises
+        :class:`ValueError`.
+        """
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        # An invalid request id is treated exactly like an unknown one so
+        # validation can never be used to tell which ids exist.
+        request_id = _require_identifier(request_id)
         if self._mem_conn is not None:
             with self._write_lock:
                 return self._get(tenant_id, request_id)
@@ -444,16 +530,54 @@ class RequestStore:
     def _get(self, tenant_id: str, request_id: str) -> dict[str, str]:
         conn = self._connect()
         try:
-            row = conn.execute(
-                "SELECT request_id, status, created_at FROM requests "
-                "WHERE tenant_id = ? AND request_id = ?",
-                (tenant_id, request_id),
-            ).fetchone()
+            try:
+                row = conn.execute(
+                    "SELECT request_id, created_at FROM requests "
+                    "WHERE tenant_id = ? AND request_id = ?",
+                    (tenant_id, request_id),
+                ).fetchone()
+            except sqlite3.Error:
+                raise _storage_failure() from None
         finally:
             self._release(conn)
         if row is None:
             # Identical outcome for unknown ids and cross-tenant lookups:
             # the response must not reveal that another tenant owns a record.
+            raise RequestNotFound("request not found")
+        return self._acceptance_receipt(row[0], row[1])
+
+    def get_status(self, tenant_id: str, request_id: str) -> dict[str, str]:
+        """Return the *current status record* for a request.
+
+        The record has the same fixed shape and field order
+        (``request_id``, ``status``, ``created_at``) as the acceptance
+        receipt, but ``status`` reflects the latest persisted transition
+        while ``created_at`` remains the original acceptance time. The
+        result survives store rebuilds. Invalid, unknown or cross-tenant
+        ids raise :class:`RequestNotFound`; a non-string or empty
+        *tenant_id* raises :class:`ValueError`.
+        """
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        request_id = _require_identifier(request_id)
+        if self._mem_conn is not None:
+            with self._write_lock:
+                return self._get_status(tenant_id, request_id)
+        return self._get_status(tenant_id, request_id)
+
+    def _get_status(self, tenant_id: str, request_id: str) -> dict[str, str]:
+        conn = self._connect()
+        try:
+            try:
+                row = conn.execute(
+                    "SELECT request_id, status, created_at FROM requests "
+                    "WHERE tenant_id = ? AND request_id = ?",
+                    (tenant_id, request_id),
+                ).fetchone()
+            except sqlite3.Error:
+                raise _storage_failure() from None
+        finally:
+            self._release(conn)
+        if row is None:
             raise RequestNotFound("request not found")
         return {
             "request_id": row[0],
@@ -470,17 +594,23 @@ class RequestStore:
         """Move a request to ``target_status`` according to the lifecycle.
 
         Moving a request to the status it already holds is idempotent and
-        returns the current receipt. Unknown statuses and illegal moves
-        raise :class:`InvalidStatusTransition` without writing; unknown or
-        cross-tenant ids raise :class:`RequestNotFound`.
+        returns the current status record without appending an event.
+        An unknown/empty/non-string ``target_status`` is out of range and
+        raises :class:`ValueError`; a move between two defined statuses
+        that the lifecycle forbids (including any move out of a terminal
+        state) raises :class:`InvalidStatusTransition` without writing.
+        Invalid, unknown or cross-tenant request ids raise
+        :class:`RequestNotFound`. No storage fault ever surfaces as
+        anything other than :class:`OSError`.
         """
         # Validate before touching the database, mirroring submit(): no
         # rejected call may perform a write.
         tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
-        request_id = _require_nonempty_str(request_id, "request_id")
+        request_id = _require_identifier(request_id)
         target_status = _require_nonempty_str(target_status, "target_status")
         if target_status not in _ALLOWED_TRANSITIONS:
-            raise InvalidStatusTransition("unknown target status")
+            # Out-of-range target (an undefined status) is caller error.
+            raise ValueError("target_status is out of range")
 
         with self._write_lock:
             conn = self._connect()
@@ -489,7 +619,7 @@ class RequestStore:
                     conn.execute("BEGIN IMMEDIATE")
                 except sqlite3.Error:
                     # Never surface the database engine's own error text.
-                    raise RuntimeError("failed to persist status transition") from None
+                    raise _storage_failure() from None
                 try:
                     row = conn.execute(
                         "SELECT status, created_at FROM requests "
@@ -529,7 +659,7 @@ class RequestStore:
                         # means the timeline invariant was broken out of
                         # band. Never fabricate a replacement link.
                         conn.execute("ROLLBACK")
-                        raise RuntimeError("failed to persist status transition")
+                        raise _storage_failure()
                     next_seq, latest_occurred_at, predecessor_hash = latest
                     occurred_at = _occurred_at_not_before(latest_occurred_at)
                     next_link_hash = _chain_hash(
@@ -586,7 +716,7 @@ class RequestStore:
                         conn.execute("ROLLBACK")
                     except sqlite3.Error:
                         pass
-                    raise RuntimeError("failed to persist status transition") from None
+                    raise _storage_failure() from None
             finally:
                 self._release(conn)
         _log.info(
@@ -609,12 +739,12 @@ class RequestStore:
 
         Each entry contains only ``status`` and ``occurred_at`` (a UTC
         RFC3339 string). The final entry's status always equals the result
-        of :meth:`get`. Unknown ids and cross-tenant lookups raise
+        of :meth:`get_status`. Invalid, unknown and cross-tenant ids raise
         :class:`RequestNotFound` with identical behaviour, so the call
-        cannot reveal another tenant's records.
+        cannot reveal another tenant's records or which ids exist.
         """
         tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
-        request_id = _require_nonempty_str(request_id, "request_id")
+        request_id = _require_identifier(request_id)
         if self._mem_conn is not None:
             with self._write_lock:
                 return self._audit(tenant_id, request_id)
@@ -626,18 +756,23 @@ class RequestStore:
             # Resolve ownership first: filtering the event query by tenant
             # alone would still distinguish "missing" from "foreign record"
             # via an empty timeline, so gate on the request row exactly
-            # like get().
-            owner = conn.execute(
-                "SELECT 1 FROM requests WHERE tenant_id = ? AND request_id = ?",
-                (tenant_id, request_id),
-            ).fetchone()
-            if owner is None:
-                raise RequestNotFound("request not found")
-            rows = conn.execute(
-                "SELECT status, occurred_at FROM status_events "
-                "WHERE tenant_id = ? AND request_id = ? ORDER BY seq",
-                (tenant_id, request_id),
-            ).fetchall()
+            # like get_status().
+            try:
+                owner = conn.execute(
+                    "SELECT 1 FROM requests WHERE tenant_id = ? AND request_id = ?",
+                    (tenant_id, request_id),
+                ).fetchone()
+                if owner is None:
+                    raise RequestNotFound("request not found")
+                rows = conn.execute(
+                    "SELECT status, occurred_at FROM status_events "
+                    "WHERE tenant_id = ? AND request_id = ? ORDER BY seq",
+                    (tenant_id, request_id),
+                ).fetchall()
+            except RequestNotFound:
+                raise
+            except sqlite3.Error:
+                raise _storage_failure() from None
         finally:
             self._release(conn)
         return [
@@ -653,14 +788,14 @@ class RequestStore:
         """Return the persisted integrity evidence for a request.
 
         The result contains exactly ``request_id``, ``status`` (identical
-        to :meth:`get`), ``event_count`` (identical to the length of
-        :meth:`audit`) and ``chain_hash`` (the SHA-256 head of the audit
-        chain as persisted, never recomputed). Unknown ids and cross-
-        tenant lookups raise :class:`RequestNotFound`; non-string or
-        empty arguments raise :class:`ValueError`.
+        to :meth:`get_status`), ``event_count`` (identical to the length
+        of :meth:`audit`) and ``chain_hash`` (the SHA-256 head of the
+        audit chain as persisted, never recomputed). Invalid, unknown and
+        cross-tenant ids raise :class:`RequestNotFound`; a non-string or
+        empty *tenant_id* raises :class:`ValueError`.
         """
         tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
-        request_id = _require_nonempty_str(request_id, "request_id")
+        request_id = _require_identifier(request_id)
         if self._mem_conn is not None:
             with self._write_lock:
                 return self._evidence(tenant_id, request_id)
@@ -692,12 +827,12 @@ class RequestStore:
         tenant all yield ``False``. Returns ``True`` only when every link
         recomputes to its stored hash from the genesis predecessor, the
         sequences are gap-free from zero, and the final link matches the
-        request's anchored head and current status. Unknown ids and
-        cross-tenant lookups raise :class:`RequestNotFound`; non-string
-        or empty arguments raise :class:`ValueError`.
+        request's anchored head and current status. Invalid, unknown and
+        cross-tenant ids raise :class:`RequestNotFound`; a non-string or
+        empty *tenant_id* raises :class:`ValueError`.
         """
         tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
-        request_id = _require_nonempty_str(request_id, "request_id")
+        request_id = _require_identifier(request_id)
         if self._mem_conn is not None:
             with self._write_lock:
                 return self._verify_evidence(tenant_id, request_id)
@@ -731,7 +866,7 @@ class RequestStore:
                 raise
             except sqlite3.Error:
                 # Never surface the database engine's own error text.
-                raise RuntimeError("failed to verify request evidence") from None
+                raise _storage_failure() from None
         finally:
             self._release(conn)
 
@@ -788,7 +923,7 @@ class RequestStore:
                     (tenant_id, request_id),
                 ).fetchone()
             except sqlite3.Error:
-                raise RuntimeError("failed to read request evidence") from None
+                raise _storage_failure() from None
         finally:
             self._release(conn)
         if row is None:

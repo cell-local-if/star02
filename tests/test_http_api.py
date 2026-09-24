@@ -133,6 +133,64 @@ class HttpAcceptanceTests(unittest.TestCase):
         self.assertEqual(status3, 200)
         self.assertEqual(data3, post_data)
 
+    def test_get_remains_frozen_after_storage_layer_transition(self):
+        # Advancing state happens only on the storage layer; the HTTP
+        # lookup must keep serving the byte-identical accepted receipt and
+        # no status endpoint must appear.
+        _, _, post_data = self._submit()
+        receipt = json.loads(post_data)
+        self.store.transition(
+            "tenant-a", receipt["request_id"], "processing"
+        )
+        self.store.transition(
+            "tenant-a", receipt["request_id"], "completed"
+        )
+        # Storage layer sees the terminal state...
+        self.assertEqual(
+            self.store.get_status(
+                "tenant-a", receipt["request_id"]
+            )["status"],
+            "completed",
+        )
+        # ...but the HTTP query is unchanged from acceptance.
+        status, _, data = self._request(
+            "GET",
+            f"/requests/{receipt['request_id']}",
+            headers={"X-Tenant-Id": "tenant-a"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(data, post_data)
+        self.assertEqual(json.loads(data)["status"], "accepted")
+        # Idempotent POST replay is likewise the frozen accepted receipt.
+        replay_status, _, replay_data = self._submit(
+            {
+                "tenant_id": "tenant-a",
+                "subject_id": "subject-1",
+                "idempotency_key": "key-1",
+                "scopes": ["profile", "email"],
+            }
+        )
+        self.assertEqual(replay_status, 200)
+        self.assertEqual(replay_data, post_data)
+        # No status route is exposed: a status sub-resource is 404.
+        status, _, data = self._request(
+            "GET",
+            f"/requests/{receipt['request_id']}/status",
+            headers={"X-Tenant-Id": "tenant-a"},
+        )
+        self.assertEqual(status, 404)
+        self.assertEqual(data, b'{"error":"not_found"}\n')
+        # PATCH/PUT to advance state over HTTP stay 405.
+        for method in ("PATCH", "PUT"):
+            status, _, _ = self._request(
+                method,
+                f"/requests/{receipt['request_id']}",
+                body=json.dumps({"status": "processing"}),
+                headers={"X-Tenant-Id": "tenant-a"},
+            )
+            self.assertEqual(status, 405)
+
+
     def test_receipt_byte_stable_across_server_rebuild(self):
         _, _, first_data = self._submit()
         receipt = json.loads(first_data)
@@ -823,6 +881,22 @@ class DeferredStoreTests(unittest.TestCase):
     def test_healthy_path_initializes_and_persists(self):
         store = httpapi.DeferredRequestStore(self.db_path)
         receipt = store.submit("tenant-a", "subject-1", ["email"], "key-1")
+        self.assertEqual(
+            store.get("tenant-a", receipt["request_id"]), receipt
+        )
+
+    def test_storage_layer_transition_and_status_are_proxied(self):
+        # The HTTP layer never routes these, but the deferred wrapper must
+        # forward them like the underlying store.
+        store = httpapi.DeferredRequestStore(self.db_path)
+        receipt = store.submit("tenant-a", "subject-1", ["email"], "key-1")
+        moved = store.transition("tenant-a", receipt["request_id"], "processing")
+        self.assertEqual(moved["status"], "processing")
+        self.assertEqual(
+            store.get_status("tenant-a", receipt["request_id"])["status"],
+            "processing",
+        )
+        # The acceptance query stays frozen even through the wrapper.
         self.assertEqual(
             store.get("tenant-a", receipt["request_id"]), receipt
         )

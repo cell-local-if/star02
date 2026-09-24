@@ -51,7 +51,11 @@ class AuditTimelineTests(unittest.TestCase):
         self.assertEqual([e["status"] for e in events],
                          ["accepted", "processing", "completed"])
         self.assertEqual(events[-1]["status"],
-                         store.get("tenant-a", receipt["request_id"])["status"])
+                         store.get_status("tenant-a", receipt["request_id"])["status"])
+        # The acceptance query stays frozen at accepted.
+        self.assertEqual(
+            store.get("tenant-a", receipt["request_id"])["status"], "accepted"
+        )
         for event in events:
             self.assertEqual(set(event), {"status", "occurred_at"})
 
@@ -95,7 +99,8 @@ class AuditTimelineTests(unittest.TestCase):
         receipt = self._submit(store)
         with self.assertRaises(InvalidStatusTransition):
             store.transition("tenant-a", receipt["request_id"], "completed")
-        with self.assertRaises(InvalidStatusTransition):
+        # An undefined target is out of range (ValueError), not a graph edge.
+        with self.assertRaises(ValueError):
             store.transition("tenant-a", receipt["request_id"], "cancelled")
         store.transition("tenant-a", receipt["request_id"], "processing")
         with self.assertRaises(InvalidStatusTransition):
@@ -122,12 +127,14 @@ class AuditTimelineTests(unittest.TestCase):
         store = RequestStore(self.db_path)
         receipt = self._submit(store)
         for bad in ("", None, 7, b"x", ["x"]):
+            # Tenant and target stay caller errors...
             with self.assertRaises(ValueError):
                 store.transition(bad, receipt["request_id"], "processing")
             with self.assertRaises(ValueError):
-                store.transition("tenant-a", bad, "processing")
-            with self.assertRaises(ValueError):
                 store.transition("tenant-a", receipt["request_id"], bad)
+            # ...while a malformed request id is treated as not found.
+            with self.assertRaises(RequestNotFound):
+                store.transition("tenant-a", bad, "processing")
         self.assertEqual(
             [e["status"] for e in store.audit("tenant-a", receipt["request_id"])],
             ["accepted"],
@@ -146,9 +153,11 @@ class AuditTimelineTests(unittest.TestCase):
         store = RequestStore(self.db_path)
         for bad in ("", None, 7, b"tenant", ["tenant"]):
             with self.subTest(bad=bad):
+                # A bad tenant is caller error...
                 with self.assertRaises(ValueError):
                     store.audit(bad, "some-id")
-                with self.assertRaises(ValueError):
+                # ...but a bad request id must look exactly like a missing one.
+                with self.assertRaises(RequestNotFound):
                     store.audit("tenant-a", bad)
 
     def test_cross_tenant_access_does_not_leak_timeline(self):
@@ -202,7 +211,7 @@ class AuditTimelineTests(unittest.TestCase):
         self.assertEqual([e["status"] for e in events],
                          ["accepted", "processing", "completed"])
         self.assertEqual(events[-1]["status"],
-                         rebuilt.get("tenant-a", receipt["request_id"])["status"])
+                         rebuilt.get_status("tenant-a", receipt["request_id"])["status"])
         stamps = [e["occurred_at"] for e in events]
         self.assertEqual(stamps, sorted(stamps))
         # The original acceptance timestamp survives unchanged.
@@ -266,7 +275,7 @@ class AuditTimelineTests(unittest.TestCase):
         # The final event always agrees with the authoritative status.
         self.assertEqual(
             events[-1]["status"],
-            store.get("tenant-a", receipt["request_id"])["status"],
+            store.get_status("tenant-a", receipt["request_id"])["status"],
         )
 
     def test_concurrent_terminal_race_produces_single_terminal_event(self):
@@ -288,7 +297,7 @@ class AuditTimelineTests(unittest.TestCase):
         terminal = [s for s in statuses if s in ("completed", "failed")]
         self.assertEqual(len(terminal), 1)
         self.assertEqual(events[-1]["status"],
-                         store.get("tenant-a", receipt["request_id"])["status"])
+                         store.get_status("tenant-a", receipt["request_id"])["status"])
 
     def test_event_rows_share_transaction_with_request_row(self):
         # Direct schema-level check: each request has at least its accepted

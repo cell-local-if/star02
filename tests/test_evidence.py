@@ -42,7 +42,7 @@ class EvidenceTests(unittest.TestCase):
         )
         self.assertEqual(ev["request_id"], receipt["request_id"])
         self.assertEqual(
-            ev["status"], store.get("tenant-a", receipt["request_id"])["status"]
+            ev["status"], store.get_status("tenant-a", receipt["request_id"])["status"]
         )
         self.assertEqual(
             ev["event_count"], len(store.audit("tenant-a", receipt["request_id"]))
@@ -60,19 +60,23 @@ class EvidenceTests(unittest.TestCase):
         self.assertTrue(HEX64.match(ev["chain_hash"]))
         self.assertTrue(store.verify_evidence("tenant-a", receipt["request_id"]))
 
-    def test_evidence_status_tracks_get(self):
+    def test_evidence_status_tracks_get_status(self):
         store = self._store()
         receipt = store.submit("tenant-a", "subject-1", ["email"], "key-1")
         for target in ("processing", "failed"):
             store.transition("tenant-a", receipt["request_id"], target)
             ev = store.evidence("tenant-a", receipt["request_id"])
-            got = store.get("tenant-a", receipt["request_id"])
+            got = store.get_status("tenant-a", receipt["request_id"])
             self.assertEqual(ev["status"], got["status"])
             self.assertEqual(
                 ev["event_count"],
                 len(store.audit("tenant-a", receipt["request_id"])),
             )
             self.assertTrue(store.verify_evidence("tenant-a", receipt["request_id"]))
+        # The acceptance query stays frozen at accepted even at end of life.
+        self.assertEqual(
+            store.get("tenant-a", receipt["request_id"])["status"], "accepted"
+        )
 
     def test_verify_true_on_clean_chain_every_lifecycle(self):
         for index, path in enumerate(
@@ -122,13 +126,15 @@ class EvidenceTests(unittest.TestCase):
         store, receipt = self._fresh_lifecycle()
         for bad in ("", None, 7, b"tenant", ["tenant"], 3.14):
             with self.subTest(bad=bad):
+                # A bad tenant is caller error...
                 with self.assertRaises(ValueError):
                     store.evidence(bad, receipt["request_id"])
                 with self.assertRaises(ValueError):
-                    store.evidence("tenant-a", bad)
-                with self.assertRaises(ValueError):
                     store.verify_evidence(bad, receipt["request_id"])
-                with self.assertRaises(ValueError):
+                # ...but a bad request id is indistinguishable from missing.
+                with self.assertRaises(RequestNotFound):
+                    store.evidence("tenant-a", bad)
+                with self.assertRaises(RequestNotFound):
                     store.verify_evidence("tenant-a", bad)
 
     def test_missing_and_cross_tenant_raise_not_found(self):
@@ -365,7 +371,8 @@ class EvidenceTests(unittest.TestCase):
         before = store.evidence("tenant-a", receipt["request_id"])
         with self.assertRaises(InvalidStatusTransition):
             store.transition("tenant-a", receipt["request_id"], "completed")
-        with self.assertRaises(InvalidStatusTransition):
+        # An undefined target is out of range, not a graph edge.
+        with self.assertRaises(ValueError):
             store.transition("tenant-a", receipt["request_id"], "cancelled")
         self.assertEqual(
             store.evidence("tenant-a", receipt["request_id"]), before
