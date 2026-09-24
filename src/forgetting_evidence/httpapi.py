@@ -16,7 +16,8 @@ Status advancement (:meth:`RequestStore.transition`), current-status
 lookup (:meth:`RequestStore.get_status`) and the execution orchestration
 (:meth:`RequestStore.claim_next`, :meth:`RequestStore.finish_claim`,
 :meth:`RequestStore.get_execution_log`,
-:meth:`RequestStore.reconcile_execution`) exist only on the storage layer
+:meth:`RequestStore.reconcile_execution`,
+:meth:`RequestStore.reconcile_batch`) exist only on the storage layer
 and are deliberately not exposed over HTTP: this service still opens
 only request acceptance and the acceptance-receipt lookup.
 
@@ -147,6 +148,11 @@ class DeferredRequestStore:
         # Execution reconciliation is storage-layer only; like the rest of
         # the execution orchestration it is never routed over HTTP.
         return self._ready().reconcile_execution(tenant_id, request_id)
+
+    def reconcile_batch(self, tenant_id, cursor=None, limit=None):
+        # Batched, resumable reconciliation is storage-layer only; like the
+        # rest of the execution orchestration it is never routed over HTTP.
+        return self._ready().reconcile_batch(tenant_id, cursor, limit)
 
 
 def _normalize_request_id(value: str) -> str:

@@ -44,6 +44,13 @@ Execution orchestration lives on the same store, storage-layer only:
   accepted, hold a live lease or have already reached a terminal state
   are returned unchanged, and reconcile itself never inserts a request,
   an attempt or a receipt.
+* :meth:`RequestStore.reconcile_batch` applies the same convergence in
+  tenant-scoped, resumable batches. The first call (no cursor) creates a
+  persistent batch whose cursor position survives restarts; the same
+  cursor resumes that batch from its committed position and keeps its
+  batch identifier. ``accepted`` requests are skipped on the first scan
+  without creating an attempt, receipt or status event, and each item's
+  state, attempts, lease, batch row and cursor commit in one transaction.
 
 The lease boundary enforced by :meth:`claim_next` is deliberately
 narrower than "every processing request whose latest timestamp is old":
@@ -75,6 +82,8 @@ text or a filesystem path.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -201,6 +210,38 @@ CREATE TABLE IF NOT EXISTS claim_tokens (
 );
 """
 
+# Persistent reconcile batches. A batch is created by the first batch call
+# for a tenant (cursor omitted) and survives restarts, so a caller that
+# presents the same cursor again resumes from the durably committed
+# position instead of restarting the sweep. ``position_created_at`` /
+# ``position_request_id`` hold the keyset position (the last scanned row);
+# both NULL means "before the first row". ``finished`` is 1 once the sweep
+# has seen every row that existed when it ran out of candidates.
+_BATCH_TABLE = """
+CREATE TABLE IF NOT EXISTS reconcile_batches (
+    batch_id            TEXT PRIMARY KEY,
+    tenant_id           TEXT NOT NULL,
+    position_created_at TEXT,
+    position_request_id TEXT,
+    finished            INTEGER NOT NULL DEFAULT 0
+);
+"""
+
+# Per-item outcomes of a batch, one row per scanned request. Items are
+# written in the same transaction as the status/attempt/lease effects of
+# reconciling that request and the batch position update, so a crash can
+# never leave a reconciled request without its batch bookkeeping (or vice
+# versa) and a retry of the same cursor never rewrites a settled row.
+_BATCH_ITEM_TABLE = """
+CREATE TABLE IF NOT EXISTS reconcile_batch_items (
+    batch_id    TEXT NOT NULL,
+    seq         INTEGER NOT NULL,
+    request_id  TEXT NOT NULL,
+    status      TEXT NOT NULL,
+    PRIMARY KEY (batch_id, seq)
+);
+"""
+
 # Column probes used to upgrade database files created before chain
 # hashes existed. The upgrade is purely additive (nullable columns plus a
 # one-time backfill derived from the already-persisted timeline); it never
@@ -251,6 +292,78 @@ _TERMINAL_RESULTS = frozenset({_STATUS_COMPLETED, _STATUS_FAILED})
 _TOKEN_BYTES = 32
 # Fixed, detail-free text for every claim failure.
 _CLAIM_CONFLICT_MESSAGE = "claim conflict"
+
+# Batch reconciliation. A batch sweeps the tenant's requests in stable
+# (created_at, request_id) order; each call processes at most ``limit``
+# reconcilable items. The default and the upper bound keep a single call
+# bounded without letting a caller ask for an unbounded sweep.
+_DEFAULT_BATCH_LIMIT = 100
+_MAX_BATCH_LIMIT = 1000
+# Opaque cursor format: a fixed version prefix plus base64url(JSON) carrying
+# only the batch id and the item count it was issued at. The authoritative
+# position always lives in reconcile_batches; the cursor only identifies
+# which persisted batch to resume. Anything outside this exact shape --
+# wrong prefix, bad padding, foreign JSON, unknown or cross-tenant batch --
+# is an invalid cursor and raises ValueError without touching storage.
+_CURSOR_PREFIX = "rc1."
+_B64URL_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+)
+
+
+def _require_batch_limit(value: object) -> int:
+    """Validate a batch limit: a non-boolean int in 1..1000."""
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError("limit must be an integer between 1 and 1000")
+    if not 1 <= value <= _MAX_BATCH_LIMIT:
+        raise ValueError("limit must be an integer between 1 and 1000")
+    return value
+
+
+def _encode_cursor(batch_id: str, position: int) -> str:
+    """Render the opaque cursor for a batch at a given item count."""
+    payload = json.dumps(
+        {"v": 1, "b": batch_id, "n": position},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return _CURSOR_PREFIX + base64.urlsafe_b64encode(payload).decode("ascii")
+
+
+def _decode_cursor(value: object) -> tuple[str, int]:
+    """Parse and strictly validate an opaque cursor.
+
+    Every malformed value -- non-string, empty, wrong prefix, bad
+    base64url, foreign JSON shape, wrong types -- raises :class:`ValueError`
+    identically, so the cursor format can never be probed through
+    distinguishable failures.
+    """
+    if not isinstance(value, str) or not value.startswith(_CURSOR_PREFIX):
+        raise ValueError("cursor is not valid")
+    body = value[len(_CURSOR_PREFIX) :]
+    if (
+        not body
+        or len(body) % 4 != 0
+        or any(char not in _B64URL_CHARS and char != "=" for char in body)
+    ):
+        raise ValueError("cursor is not valid")
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(body.encode("ascii")))
+    except (ValueError, binascii.Error):
+        raise ValueError("cursor is not valid") from None
+    if not isinstance(payload, dict) or set(payload) != {"v", "b", "n"}:
+        raise ValueError("cursor is not valid")
+    batch_id = payload["b"]
+    position = payload["n"]
+    if (
+        payload["v"] != 1
+        or not isinstance(batch_id, str)
+        or not batch_id
+        or not isinstance(position, int)
+        or isinstance(position, bool)
+        or position < 0
+    ):
+        raise ValueError("cursor is not valid")
+    return batch_id, position
 
 
 def _require_lease_seconds(value: object) -> int:
@@ -421,6 +534,8 @@ class RequestStore:
                 conn.execute(_CLAIM_TABLE)
                 conn.execute(_CLAIM_TOKEN_TABLE)
                 conn.execute(_CLAIM_CANDIDATE_INDEX)
+                conn.execute(_BATCH_TABLE)
+                conn.execute(_BATCH_ITEM_TABLE)
                 self._migrate_schema(conn)
             except sqlite3.Error:
                 raise _storage_failure() from None
@@ -1179,9 +1294,22 @@ class RequestStore:
             "WHERE token_hash = ? LIMIT 1",
             (presented,),
         ).fetchone()
-        if owner is None or (owner[0], owner[1]) != (tenant_id, request_id):
-            # Unknown, already released (a successor or finish deleted it),
-            # or presented against a different tenant/request.
+        if owner is None:
+            # The credential itself is invalid (unknown or released). The
+            # request id then decides the error with stable precedence:
+            # an unknown or cross-tenant id raises RequestNotFound even
+            # though the credential is also invalid, while an existing
+            # request presented with a bad credential is a ClaimConflict.
+            exists = conn.execute(
+                "SELECT 1 FROM requests WHERE tenant_id = ? AND request_id = ?",
+                (tenant_id, request_id),
+            ).fetchone()
+            if exists is None:
+                raise RequestNotFound("request not found")
+            raise _claim_conflict()
+        if (owner[0], owner[1]) != (tenant_id, request_id):
+            # A live credential presented against a different tenant or
+            # request: already released/foreign for these coordinates.
             raise _claim_conflict()
         attempt_number = owner[2]
 
@@ -1658,6 +1786,358 @@ class RequestStore:
             "status": target_status,
             "created_at": created_at,
         }
+
+    # -- batch reconciliation ------------------------------------------
+
+    def reconcile_batch(
+        self,
+        tenant_id: str,
+        cursor: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, object]:
+        """Reconcile a tenant's pending requests in resumable batches.
+
+        Storage-layer only; never routed over HTTP. With ``cursor``
+        omitted a new persistent batch sweeps the tenant's requests in
+        stable acceptance order (``created_at`` then ``request_id``);
+        with a cursor the batch it names is resumed from its durably
+        committed position, so a retry after an interruption continues
+        instead of restarting, and the same cursor always keeps the same
+        batch identifier. Each call reconciles at most ``limit`` items
+        (default 100, at most 1000) and returns exactly ``batch_id``,
+        ``next_cursor`` (``None`` once the sweep is finished),
+        ``finished`` and ``items`` -- one ``{"request_id", "status"}``
+        entry per reconciled request, in scan order.
+
+        Reconciliation of each request follows
+        :meth:`reconcile_execution`: ``accepted`` rows are skipped
+        without creating an attempt, receipt or extra status event;
+        a ``processing`` request with a live lease stays processing; a
+        ``processing`` request whose lease expired (or that has no
+        explainable lease) is compensated to ``failed``. Every item's
+        status change, attempt rows, lease release, batch bookkeeping
+        and cursor position commit in one transaction, so a failed call
+        leaves no half-settled item and a committed item is never
+        rewritten by a retry.
+
+        A non-string/empty *tenant_id*, a limit outside 1..1000 (or a
+        non-integer), and any malformed, unknown or cross-tenant
+        *cursor* raise :class:`ValueError` without writing. Corrupt
+        persisted batch state and every storage fault raise the
+        fixed-text :class:`OSError`.
+        """
+        # Validate everything before touching the database: no rejected
+        # call may perform a write.
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        if limit is None:
+            limit = _DEFAULT_BATCH_LIMIT
+        limit = _require_batch_limit(limit)
+        cursor_batch: tuple[str, int] | None = None
+        if cursor is not None:
+            cursor_batch = _decode_cursor(cursor)
+
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                # First transaction resolves the batch: a fresh batch row
+                # is inserted when no cursor was given; a cursor names the
+                # persisted batch to resume. An unknown/cross-tenant cursor
+                # is rejected here before anything is written.
+                batch_id, _pos, _rid, finished, start_count = (
+                    self._batch_transaction(
+                        conn,
+                        lambda: self._load_or_init_batch_locked(
+                            conn, tenant_id, cursor_batch
+                        ),
+                    )
+                )
+                items: list[dict[str, str]] = []
+                # Each scanned request is settled in its OWN transaction:
+                # its status change, attempts, lease release, the item row
+                # and the cursor position all commit together. The next
+                # iteration re-reads the persisted position, so an item
+                # already settled by an earlier commit or a concurrent call
+                # is never rewritten.
+                while not finished and len(items) < limit:
+                    kind, payload = self._batch_transaction(
+                        conn,
+                        lambda: self._process_one_batch_item_locked(
+                            conn, tenant_id, batch_id
+                        ),
+                    )
+                    if kind == "finished":
+                        finished = True
+                        break
+                    if kind == "item":
+                        items.append(payload)
+                    # "accepted" only advanced the position and is skipped.
+                if not finished:
+                    # The limit stopped the loop: finish the batch only if
+                    # nothing reconcilable remains beyond the committed
+                    # position, otherwise leave it resumable.
+                    finished = self._batch_transaction(
+                        conn,
+                        lambda: self._finalize_batch_if_end_locked(
+                            conn, tenant_id, batch_id
+                        ),
+                    )
+            finally:
+                self._release(conn)
+        # The write lock serializes batch writers, so the batch's item
+        # count grows only via the items this call committed.
+        next_cursor = (
+            None if finished else _encode_cursor(batch_id, start_count + len(items))
+        )
+        # Log only counts and the stable outcome: no tenant, subject,
+        # worker, credential or SQL text ever reaches the log.
+        _log.info(
+            "reconcile batch settled items=%s finished=%s",
+            len(items),
+            finished,
+        )
+        return {
+            "batch_id": batch_id,
+            "next_cursor": next_cursor,
+            "finished": finished,
+            "items": items,
+        }
+
+    def _batch_transaction(self, conn: sqlite3.Connection, action):
+        """Run ``action`` inside one short-lived write transaction.
+
+        Every batch operation (batch resolution, one item, the end
+        finalization) commits independently, so a fault while settling a
+        later item can never undo an already committed earlier item or
+        leave the shared connection inside an aborted transaction. Domain
+        and storage exceptions propagate after a rollback; any engine
+        error -- including lock conflicts -- becomes the fixed-text
+        :class:`OSError`.
+        """
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.Error:
+            raise _storage_failure() from None
+        try:
+            result = action()
+            conn.execute("COMMIT")
+            return result
+        except ValueError:
+            self._rollback_quietly(conn)
+            raise
+        except (RequestNotFound, InvalidStatusTransition):
+            # Defensive only: rows are read inside this write transaction
+            # and cannot vanish or move illegally underneath it.
+            self._rollback_quietly(conn)
+            raise _storage_failure() from None
+        except OSError:
+            self._rollback_quietly(conn)
+            raise
+        except sqlite3.Error:
+            self._rollback_quietly(conn)
+            raise _storage_failure() from None
+
+    @staticmethod
+    def _rollback_quietly(conn: sqlite3.Connection) -> None:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+
+    def _process_one_batch_item_locked(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        batch_id: str,
+    ) -> tuple[str, object]:
+        """Settle the next scan position inside an open write txn.
+
+        Re-reads the batch's persisted position every call, so the result
+        is independent of any in-memory position. Returns
+        ``("finished", None)`` once the sweep end is reached,
+        ``("accepted", None)`` after advancing past a skipped accepted
+        row, or ``("item", {"request_id", "status"})`` after reconciling
+        a processing request and recording its item.
+        """
+        pos_created, pos_rid, finished, item_count = self._read_batch_state_locked(
+            conn, batch_id
+        )
+        if finished:
+            return "finished", None
+        row = self._next_batch_candidate(conn, tenant_id, pos_created, pos_rid)
+        if row is None:
+            self._finish_batch_locked(conn, batch_id)
+            return "finished", None
+        request_id, created_at, status = row
+        if status == _STATUS_ACCEPTED:
+            # First-scan rule: accepted rows are skipped -- no attempt,
+            # receipt or extra status event -- but the position advances
+            # past them so they are never rescanned.
+            self._advance_batch_locked(conn, batch_id, created_at, request_id)
+            return "accepted", None
+        record = self._reconcile_locked(conn, tenant_id, request_id)
+        # The item row, the reconcile effects and the cursor position land
+        # in this one transaction; the sequence derives from the persisted
+        # count so a resumed batch never reuses a number.
+        conn.execute(
+            "INSERT INTO reconcile_batch_items ("
+            "batch_id, seq, request_id, status"
+            ") VALUES (?, ?, ?, ?)",
+            (batch_id, item_count + 1, request_id, record["status"]),
+        )
+        self._advance_batch_locked(conn, batch_id, created_at, request_id)
+        return "item", {"request_id": request_id, "status": record["status"]}
+
+    def _finalize_batch_if_end_locked(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        batch_id: str,
+    ) -> bool:
+        """Mark a limit-stopped batch finished iff no candidate remains."""
+        pos_created, pos_rid, finished, _count = self._read_batch_state_locked(
+            conn, batch_id
+        )
+        if finished:
+            return True
+        if self._next_batch_candidate(conn, tenant_id, pos_created, pos_rid) is None:
+            self._finish_batch_locked(conn, batch_id)
+            return True
+        return False
+
+    def _read_batch_state_locked(
+        self, conn: sqlite3.Connection, batch_id: str
+    ) -> tuple[str | None, str | None, bool, int]:
+        """Read and strictly validate a batch's persisted position."""
+        row = conn.execute(
+            "SELECT position_created_at, position_request_id, finished, "
+            "(SELECT count(*) FROM reconcile_batch_items i "
+            " WHERE i.batch_id = b.batch_id) "
+            "FROM reconcile_batches b WHERE b.batch_id = ?",
+            (batch_id,),
+        ).fetchone()
+        if row is None:
+            # The batch this transaction is driving vanished out of band.
+            raise _storage_failure()
+        pos_created, pos_rid, finished, item_count = row
+        if (
+            finished not in (0, 1)
+            or not isinstance(item_count, int)
+            or isinstance(item_count, bool)
+        ):
+            raise _storage_failure()
+        if (pos_created is None) != (pos_rid is None):
+            # The keyset position is written atomically; a split pair is
+            # out-of-band corruption, never a resumable state.
+            raise _storage_failure()
+        if pos_created is not None and (
+            not isinstance(pos_created, str)
+            or not pos_created
+            or not isinstance(pos_rid, str)
+            or not pos_rid
+        ):
+            raise _storage_failure()
+        return pos_created, pos_rid, bool(finished), item_count
+
+    def _load_or_init_batch_locked(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        cursor_batch: tuple[str, int] | None,
+    ) -> tuple[str, str | None, str | None, bool, int]:
+        """Resolve the batch for this call inside an open write txn.
+
+        Returns ``(batch_id, position_created_at, position_request_id,
+        finished, item_count)``. Without a cursor a fresh batch row is
+        inserted; with a cursor the persisted batch is resumed from its
+        committed position -- the cursor's own position field is only a
+        format detail, the database is authoritative. An unknown or
+        cross-tenant batch id is an invalid cursor and raises
+        :class:`ValueError`; corrupt persisted state raises the
+        fixed-text :class:`OSError`.
+        """
+        if cursor_batch is None:
+            batch_id = str(uuid.uuid4())
+            conn.execute(
+                "INSERT INTO reconcile_batches ("
+                "batch_id, tenant_id, position_created_at, "
+                "position_request_id, finished"
+                ") VALUES (?, ?, NULL, NULL, 0)",
+                (batch_id, tenant_id),
+            )
+            return batch_id, None, None, False, 0
+        batch_id, _issued_position = cursor_batch
+        # Confirm ownership before reading state: an unknown or
+        # cross-tenant batch id is an invalid cursor, indistinguishable
+        # from one that never existed.
+        owner = conn.execute(
+            "SELECT 1 FROM reconcile_batches WHERE batch_id = ? AND tenant_id = ?",
+            (batch_id, tenant_id),
+        ).fetchone()
+        if owner is None:
+            raise ValueError("cursor is not valid")
+        pos_created, pos_rid, finished, item_count = self._read_batch_state_locked(
+            conn, batch_id
+        )
+        return batch_id, pos_created, pos_rid, finished, item_count
+
+    @staticmethod
+    def _next_batch_candidate(
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        pos_created: str | None,
+        pos_rid: str | None,
+    ) -> tuple[str, str, str] | None:
+        """Oldest non-terminal request strictly after the keyset position.
+
+        Only ``accepted`` and ``processing`` rows are swept; terminal
+        requests are already converged and never need a batch item. The
+        (created_at, request_id) ordering matches the claim candidate
+        index, so the scan is stable across calls, restarts and
+        concurrent submissions.
+        """
+        if pos_created is None:
+            return conn.execute(
+                "SELECT request_id, created_at, status FROM requests "
+                "WHERE tenant_id = ? AND status IN (?, ?) "
+                "ORDER BY created_at ASC, request_id ASC LIMIT 1",
+                (tenant_id, _STATUS_ACCEPTED, _STATUS_PROCESSING),
+            ).fetchone()
+        return conn.execute(
+            "SELECT request_id, created_at, status FROM requests "
+            "WHERE tenant_id = ? AND status IN (?, ?) "
+            "AND (created_at, request_id) > (?, ?) "
+            "ORDER BY created_at ASC, request_id ASC LIMIT 1",
+            (tenant_id, _STATUS_ACCEPTED, _STATUS_PROCESSING, pos_created, pos_rid),
+        ).fetchone()
+
+    @staticmethod
+    def _advance_batch_locked(
+        conn: sqlite3.Connection,
+        batch_id: str,
+        pos_created: str,
+        pos_rid: str,
+    ) -> None:
+        """Move the batch's durable keyset position forward."""
+        cursor = conn.execute(
+            "UPDATE reconcile_batches "
+            "SET position_created_at = ?, position_request_id = ? "
+            "WHERE batch_id = ?",
+            (pos_created, pos_rid, batch_id),
+        )
+        if cursor.rowcount != 1:
+            # The batch row this transaction itself resolved vanished;
+            # that is storage corruption, never a caller error.
+            raise _storage_failure()
+
+    @staticmethod
+    def _finish_batch_locked(conn: sqlite3.Connection, batch_id: str) -> None:
+        """Mark the batch durably finished inside the open transaction."""
+        cursor = conn.execute(
+            "UPDATE reconcile_batches SET finished = 1 WHERE batch_id = ?",
+            (batch_id,),
+        )
+        if cursor.rowcount != 1:
+            raise _storage_failure()
 
     def audit(
         self,
