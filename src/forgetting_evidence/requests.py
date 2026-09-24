@@ -202,24 +202,38 @@ class RequestStore:
     """Persist and retrieve accepted deletion requests."""
 
     def __init__(self, db_path: str | os.PathLike[str]):
-        self._db_path = os.fspath(db_path)
+        # Reject non-string and empty paths before touching the filesystem
+        # so a bad path can never create or modify a database file.
+        try:
+            path = os.fspath(db_path)
+        except TypeError:
+            raise ValueError("db_path must be a non-empty string") from None
+        if not isinstance(path, str) or not path:
+            raise ValueError("db_path must be a non-empty string")
+        self._db_path = path
         # In-process serialization; the unique index additionally guards
         # other processes sharing the same database file.
         self._write_lock = threading.Lock()
-        if self._db_path == ":memory:":
-            self._mem_conn: sqlite3.Connection | None = self._open_connection()
-        else:
-            self._mem_conn = None
-            parent = os.path.dirname(os.path.abspath(self._db_path))
-            os.makedirs(parent, exist_ok=True)
-        conn = self._connect()
         try:
-            conn.execute(_SCHEMA)
-            conn.execute(_UNIQUE_TENANT_KEY)
-            conn.execute(_EVENT_TABLE)
-            self._migrate_schema(conn)
-        finally:
-            self._release(conn)
+            if self._db_path == ":memory:":
+                self._mem_conn: sqlite3.Connection | None = self._open_connection()
+            else:
+                self._mem_conn = None
+                parent = os.path.dirname(os.path.abspath(self._db_path))
+                os.makedirs(parent, exist_ok=True)
+            conn = self._connect()
+            try:
+                conn.execute(_SCHEMA)
+                conn.execute(_UNIQUE_TENANT_KEY)
+                conn.execute(_EVENT_TABLE)
+                self._migrate_schema(conn)
+            finally:
+                self._release(conn)
+        except sqlite3.Error:
+            # Unwritable locations and corrupted database files surface as
+            # OSError; the engine's own message (which can embed internal
+            # paths) never reaches the caller.
+            raise OSError("failed to initialize request store") from None
 
     def _migrate_schema(self, conn: sqlite3.Connection) -> None:
         """Add chain columns to a database written by an older version.
@@ -281,7 +295,7 @@ class RequestStore:
                     conn.execute("ROLLBACK")
                 except sqlite3.Error:
                     pass
-                raise RuntimeError("failed to initialize request store") from None
+                raise OSError("failed to initialize request store") from None
 
     def _open_connection(self) -> sqlite3.Connection:
         conn = sqlite3.connect(
@@ -343,33 +357,33 @@ class RequestStore:
                     created_at,
                     _GENESIS_PREDECESSOR,
                 )
-                conn.execute("BEGIN IMMEDIATE")
                 try:
-                    conn.execute(
-                        "INSERT INTO requests ("
-                        "request_id, tenant_id, idempotency_key, subject_id, "
-                        "scopes_json, status, created_at, chain_hash"
-                        ") VALUES (?, ?, ?, ?, ?, 'accepted', ?, ?)",
-                        (
-                            request_id,
-                            tenant_id,
-                            idempotency_key,
-                            subject_id,
-                            scopes_json,
-                            created_at,
-                            genesis_hash,
-                        ),
-                    )
-                except sqlite3.IntegrityError:
-                    conn.execute("ROLLBACK")
+                    conn.execute("BEGIN IMMEDIATE")
                     try:
-                        return self._load_idempotent(
-                            conn, tenant_id, idempotency_key, subject_id, scope_list
+                        conn.execute(
+                            "INSERT INTO requests ("
+                            "request_id, tenant_id, idempotency_key, subject_id, "
+                            "scopes_json, status, created_at, chain_hash"
+                            ") VALUES (?, ?, ?, ?, ?, 'accepted', ?, ?)",
+                            (
+                                request_id,
+                                tenant_id,
+                                idempotency_key,
+                                subject_id,
+                                scopes_json,
+                                created_at,
+                                genesis_hash,
+                            ),
                         )
-                    except _PrimaryKeyConflict:
-                        # Collision was on request_id; retry with a new UUID.
-                        continue
-                try:
+                    except sqlite3.IntegrityError:
+                        conn.execute("ROLLBACK")
+                        try:
+                            return self._load_idempotent(
+                                conn, tenant_id, idempotency_key, subject_id, scope_list
+                            )
+                        except _PrimaryKeyConflict:
+                            # Collision was on request_id; retry with a new UUID.
+                            continue
                     # The first timeline entry shares the acceptance
                     # transaction: a request can never exist without its
                     # accepted event, nor an event without its request. The
@@ -381,10 +395,17 @@ class RequestStore:
                         ") VALUES (?, ?, 0, 'accepted', ?, ?)",
                         (tenant_id, request_id, created_at, genesis_hash),
                     )
+                    conn.execute("COMMIT")
                 except sqlite3.Error:
-                    conn.execute("ROLLBACK")
-                    raise RuntimeError("failed to persist accepted request") from None
-                conn.execute("COMMIT")
+                    # Lock contention and any other engine failure surface
+                    # as OSError; the transaction is rolled back so a failed
+                    # submit never leaves a partial record behind, and the
+                    # engine's own error text never leaks.
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise OSError("failed to persist accepted request") from None
                 return {
                     "request_id": request_id,
                     "status": "accepted",
@@ -392,7 +413,7 @@ class RequestStore:
                 }
         finally:
             self._release(conn)
-        raise RuntimeError("unable to allocate a unique request id")
+        raise OSError("unable to allocate a unique request id")
 
     def _load_idempotent(
         self,
@@ -433,6 +454,11 @@ class RequestStore:
         }
 
     def get(self, tenant_id: str, request_id: str) -> dict[str, str]:
+        # Same argument contract as submit(): invalid parameters raise
+        # ValueError before any database access, while any well-formed
+        # string id (whatever its shape) is simply looked up.
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        request_id = _require_nonempty_str(request_id, "request_id")
         # The in-memory connection is shared across threads; serialize it
         # against writes. File-backed stores use a fresh connection per
         # call and rely on SQLite's own concurrency.
@@ -444,11 +470,15 @@ class RequestStore:
     def _get(self, tenant_id: str, request_id: str) -> dict[str, str]:
         conn = self._connect()
         try:
-            row = conn.execute(
-                "SELECT request_id, status, created_at FROM requests "
-                "WHERE tenant_id = ? AND request_id = ?",
-                (tenant_id, request_id),
-            ).fetchone()
+            try:
+                row = conn.execute(
+                    "SELECT request_id, status, created_at FROM requests "
+                    "WHERE tenant_id = ? AND request_id = ?",
+                    (tenant_id, request_id),
+                ).fetchone()
+            except sqlite3.Error:
+                # Never surface the database engine's own error text.
+                raise OSError("failed to read request") from None
         finally:
             self._release(conn)
         if row is None:
