@@ -35,14 +35,20 @@ PYTHONPATH=src python3 -m forgetting_evidence serve --db ./data/evidence.db --ho
 - `claim_next(tenant_id, worker_id, lease_seconds)`：原子领取下一个可执行请求。`tenant_id`、`worker_id` 为非空字符串，`lease_seconds` 为 1 至 3600 的非布尔整数秒。候选为 `accepted` 请求及最新租约已过期的 `processing` 请求，按受理时间再按请求编号取最前者；首次领取使请求进入 `processing` 并开始第 1 次尝试，过期重领开始下一次尝试且不改变首次受理时间、编号或当前状态。同一请求同一时刻只有一个 worker 持有有效租约。成功返回恰好三个字段：`request_id`、不可预测的 `claim_token`、UTC RFC3339 的 `lease_expires_at`；无候选返回 `None`。worker 身份只校验不持久化，领取凭证只返回一次、绝不入库（仅存散列）或出现在日志中。
 - `finish_claim(tenant_id, request_id, claim_token, result)`：以终态完成当前租约。`result` 只接受 `completed` 或 `failed`。凭证必须对应该租户该请求当前未过期、未释放的租约；终态状态与审计链事件、尝试结果记录、凭证释放在同一事务提交。返回状态记录（`request_id`、`status`、`created_at`）。
 - `get_execution_log(tenant_id, request_id)`：按租户与请求编号返回执行尝试列表，按尝试序号（从 1 递增）排列。每条恰含 `attempt_number`（正整数）、`claimed_at` 与 `lease_expires_at`（UTC RFC3339 字符串）、`result` 与 `completed_at`（完成后为终态与完成时间，进行中或被过期放弃的尝试为空值）。返回值只含字符串、整数与空值，不含 worker 或领取凭证。
-- 服务重启后租约与尝试记录继续有效；并发领取不会形成两个同时有效的租约，锁冲突不泄露底层数据库错误。
+- `reconcile_execution(tenant_id, request_id)`：按租户和请求编号对账执行结果，返回既有状态记录（`request_id`、`status`、`created_at`）。
+  - `accepted`（含无任何执行尝试）时只返回现状：不创建记录、尝试或回执，也不产生任何变化。
+  - 仍有有效租约的 `processing` 请求保留进行中尝试，不提前写终态、不生成新尝试。
+  - `completed` 或 `failed` 的重复对账幂等：保留首次终态结果与同一状态记录；执行记录中存在多个终态时保留最早完成的结果，后续重复终态记为 `failed` 且不改请求状态。
+  - 最新租约已过期且无其他有效租约（含无结果且无租约、或无任何可解释尝试）的 `processing` 请求，在同一事务内把全部未完成尝试补偿为 `failed`（完成时间为 UTC RFC3339，且每条只写一次），并把请求状态收敛为 `failed`；执行记录已含终态尝试时，以最早完成结果收敛，死租约凭证随补偿一并释放。
+- `claim_next` 的领取边界收紧：仍按受理时间再按请求编号竞争可执行请求；候选仅为 `accepted`，以及具有可解释的已过期租约历史（至少存在一次尝试、最新租约已过期、且不存在仍在租期内的未完成尝试）的 `processing` 请求，过期重领生成递增的新尝试。无可解释租约或尝试的 `processing` 请求不得领取，交由 `reconcile_execution` 收敛。
+- 服务重启后租约与尝试记录继续有效；并发领取、完成与对账都在同一事务原子提交状态、尝试与租约，不会形成两个同时有效的租约，锁冲突不泄露底层数据库错误。
 
 执行编排错误语义（在既有错误语义基础上补充）：
 
 - 入口参数、租期或终态不满足值域：抛 `ValueError` 且不写库。
-- 领取凭证不存在、过期、已释放或跨租户/跨请求使用，或对无有效租约的请求完成：抛 `ClaimConflict` 且不改变状态。
-- 执行记录查询中请求编号缺失、非法或跨租户：抛 `RequestNotFound`。
-- 数据库不可创建、读写失败或内容损坏：统一抛固定文案的 `OSError`，不留下半成记录。
+- 领取凭证不存在、过期、已释放或跨租户/跨请求使用，或对无有效租约的请求完成（含对账释放死租约后再用旧凭证完成）：抛 `ClaimConflict` 且不改变状态、尝试或证据。
+- 执行记录查询与对账中请求编号缺失、空、非字符串、非法、不存在或跨租户：统一抛 `RequestNotFound`，不区分记录是否存在；对账租户为空或非字符串抛 `ValueError`，不改变状态、尝试或回执。
+- 数据库不可创建、读写失败、执行记录损坏或补偿提交失败：统一抛固定文案的 `OSError`，不返回半成结果、不留下半成记录。
 
 错误语义（存储层异常类型稳定，回执、返回值与日志只暴露请求编号、状态、时间与稳定错误类型，不含主体、范围、幂等键、其他租户信息、SQL 原文或路径）：
 
