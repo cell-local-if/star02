@@ -5,6 +5,24 @@ payload in logs, return values beyond the fixed receipt fields, or
 exception messages. SQLite integrity conflicts are translated into the
 module's own idempotency semantics and never surface to callers.
 
+Requests start in ``accepted`` and advance through the persistent
+lifecycle ``accepted -> processing -> {completed, failed}`` (with
+``accepted -> failed`` also permitted; completed and failed are
+terminal). :meth:`RequestStore.transition` performs those moves and
+:meth:`RequestStore.get_status` returns the current status record; both
+survive a store rebuild. Re-advancing to the current status is an
+idempotent no-op that appends no event. Separately,
+:meth:`RequestStore.get_acceptance` returns the first acceptance receipt
+frozen at ``accepted``; it backs idempotent replay and the existing
+lookup endpoint, neither of which changes as the status advances.
+
+Caller mistakes raise :class:`ValueError` (invalid arguments),
+:class:`RequestNotFound` (unknown id, illegal id, cross-tenant access),
+:class:`InvalidStatusTransition` (an edge the graph forbids) and
+:class:`IdempotencyConflict`; every backend failure -- the database
+cannot be created, read or written, or its contents are corrupt -- is a
+single fixed-text :class:`OSError` that never quotes SQL or a path.
+
 Every accepted request carries a persistent, append-only status timeline
 in ``status_events``. Events are written in the same transaction as the
 request row or status change they describe, so the final timeline entry
@@ -56,6 +74,24 @@ class InvalidStatusTransition(Exception):
 
 class _PrimaryKeyConflict(Exception):
     """Internal signal: retry insertion with a freshly generated id."""
+
+
+class _StorageUnavailable(OSError):
+    """Fixed-text storage failure.
+
+    The message never carries the database engine's error text, a SQL
+    statement or the storage path, so callers, logs and responses cannot
+    leak them. It is an :class:`OSError` because every such condition --
+    the database cannot be created, opened, read or written, or its
+    contents are corrupt -- is presented as one stable storage error.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("request storage is unavailable")
+
+
+def _storage_failure() -> _StorageUnavailable:
+    return _StorageUnavailable()
 
 
 _SCHEMA = """
@@ -202,7 +238,20 @@ class RequestStore:
     """Persist and retrieve accepted deletion requests."""
 
     def __init__(self, db_path: str | os.PathLike[str]):
-        self._db_path = os.fspath(db_path)
+        # Validate the path before anything touches the filesystem. A
+        # missing/empty/non-string path is a caller error (ValueError);
+        # everything that goes wrong afterwards with the storage backend
+        # is a single fixed-text OSError.
+        if isinstance(db_path, os.PathLike):
+            path = os.fspath(db_path)
+        elif isinstance(db_path, str):
+            path = db_path
+        else:
+            raise ValueError("db_path must be a non-empty string")
+        if not isinstance(path, str) or not path:
+            # bytes paths and empty strings are rejected.
+            raise ValueError("db_path must be a non-empty string")
+        self._db_path = path
         # In-process serialization; the unique index additionally guards
         # other processes sharing the same database file.
         self._write_lock = threading.Lock()
@@ -211,13 +260,24 @@ class RequestStore:
         else:
             self._mem_conn = None
             parent = os.path.dirname(os.path.abspath(self._db_path))
-            os.makedirs(parent, exist_ok=True)
+            try:
+                os.makedirs(parent, exist_ok=True)
+            except OSError:
+                # Unwritable or impossible directory: never surface the
+                # filesystem message (it quotes the rejected path).
+                raise _storage_failure() from None
         conn = self._connect()
         try:
-            conn.execute(_SCHEMA)
-            conn.execute(_UNIQUE_TENANT_KEY)
-            conn.execute(_EVENT_TABLE)
-            self._migrate_schema(conn)
+            try:
+                conn.execute(_SCHEMA)
+                conn.execute(_UNIQUE_TENANT_KEY)
+                conn.execute(_EVENT_TABLE)
+                self._migrate_schema(conn)
+            except sqlite3.Error:
+                # Corrupt file, unreadable/writable database, I/O error.
+                # The migration already raises the fixed-text OSError for
+                # its own failures.
+                raise _storage_failure() from None
         finally:
             self._release(conn)
 
@@ -281,16 +341,23 @@ class RequestStore:
                     conn.execute("ROLLBACK")
                 except sqlite3.Error:
                     pass
-                raise RuntimeError("failed to initialize request store") from None
+                raise _storage_failure() from None
 
     def _open_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(
-            self._db_path,
-            timeout=_BUSY_TIMEOUT_MS / 1000,
-            check_same_thread=False,
-        )
-        conn.isolation_level = None  # explicit transaction control
-        conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+        try:
+            conn = sqlite3.connect(
+                self._db_path,
+                timeout=_BUSY_TIMEOUT_MS / 1000,
+                check_same_thread=False,
+            )
+        except sqlite3.Error:
+            raise _storage_failure() from None
+        try:
+            conn.isolation_level = None  # explicit transaction control
+            conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+        except sqlite3.Error:
+            conn.close()
+            raise _storage_failure() from None
         return conn
 
     def _connect(self) -> sqlite3.Connection:
@@ -300,7 +367,19 @@ class RequestStore:
 
     def _release(self, conn: sqlite3.Connection) -> None:
         if conn is not self._mem_conn:
-            conn.close()
+            try:
+                conn.close()
+            except sqlite3.Error:
+                raise _storage_failure() from None
+
+    @staticmethod
+    def _rollback_quietly(conn: sqlite3.Connection) -> None:
+        # End an explicitly opened transaction without surfacing the
+        # engine's own error text.
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
 
     def submit(
         self,
@@ -343,8 +422,8 @@ class RequestStore:
                     created_at,
                     _GENESIS_PREDECESSOR,
                 )
-                conn.execute("BEGIN IMMEDIATE")
                 try:
+                    conn.execute("BEGIN IMMEDIATE")
                     conn.execute(
                         "INSERT INTO requests ("
                         "request_id, tenant_id, idempotency_key, subject_id, "
@@ -361,14 +440,18 @@ class RequestStore:
                         ),
                     )
                 except sqlite3.IntegrityError:
-                    conn.execute("ROLLBACK")
+                    self._rollback_quietly(conn)
                     try:
                         return self._load_idempotent(
                             conn, tenant_id, idempotency_key, subject_id, scope_list
                         )
                     except _PrimaryKeyConflict:
-                        # Collision was on request_id; retry with a new UUID.
+                        # Collision was on request_id, not the idempotency
+                        # index; retry with a freshly generated UUID.
                         continue
+                except sqlite3.Error:
+                    self._rollback_quietly(conn)
+                    raise _storage_failure() from None
                 try:
                     # The first timeline entry shares the acceptance
                     # transaction: a request can never exist without its
@@ -381,10 +464,10 @@ class RequestStore:
                         ") VALUES (?, ?, 0, 'accepted', ?, ?)",
                         (tenant_id, request_id, created_at, genesis_hash),
                     )
+                    conn.execute("COMMIT")
                 except sqlite3.Error:
-                    conn.execute("ROLLBACK")
-                    raise RuntimeError("failed to persist accepted request") from None
-                conn.execute("COMMIT")
+                    self._rollback_quietly(conn)
+                    raise _storage_failure() from None
                 return {
                     "request_id": request_id,
                     "status": "accepted",
@@ -392,7 +475,7 @@ class RequestStore:
                 }
         finally:
             self._release(conn)
-        raise RuntimeError("unable to allocate a unique request id")
+        raise _storage_failure()
 
     def _load_idempotent(
         self,
@@ -402,16 +485,19 @@ class RequestStore:
         subject_id: str,
         scope_list: list[str],
     ) -> dict[str, str]:
-        row = conn.execute(
-            "SELECT request_id, status, created_at, subject_id, scopes_json "
-            "FROM requests WHERE tenant_id = ? AND idempotency_key = ?",
-            (tenant_id, idempotency_key),
-        ).fetchone()
+        try:
+            row = conn.execute(
+                "SELECT request_id, created_at, subject_id, scopes_json "
+                "FROM requests WHERE tenant_id = ? AND idempotency_key = ?",
+                (tenant_id, idempotency_key),
+            ).fetchone()
+        except sqlite3.Error:
+            raise _storage_failure() from None
         if row is None:
             # The conflict came from the primary key rather than the
             # idempotency index; signal a fresh-UUID retry.
             raise _PrimaryKeyConflict
-        existing_request_id, status, created_at, existing_subject, existing_scopes_json = row
+        existing_request_id, created_at, existing_subject, existing_scopes_json = row
         try:
             existing_scopes = json.loads(existing_scopes_json)
         except (TypeError, ValueError):
@@ -426,13 +512,18 @@ class RequestStore:
             raise IdempotencyConflict(
                 "idempotency key was already submitted with a different payload"
             )
+        # The idempotent replay returns the first acceptance receipt, frozen
+        # at accepted; later status advances never alter it.
         return {
             "request_id": existing_request_id,
-            "status": status,
+            "status": _STATUS_ACCEPTED,
             "created_at": created_at,
         }
 
     def get(self, tenant_id: str, request_id: str) -> dict[str, str]:
+        # Validate before touching storage; a rejected call performs no I/O.
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        request_id = _require_nonempty_str(request_id, "request_id")
         # The in-memory connection is shared across threads; serialize it
         # against writes. File-backed stores use a fresh connection per
         # call and rely on SQLite's own concurrency.
@@ -444,11 +535,14 @@ class RequestStore:
     def _get(self, tenant_id: str, request_id: str) -> dict[str, str]:
         conn = self._connect()
         try:
-            row = conn.execute(
-                "SELECT request_id, status, created_at FROM requests "
-                "WHERE tenant_id = ? AND request_id = ?",
-                (tenant_id, request_id),
-            ).fetchone()
+            try:
+                row = conn.execute(
+                    "SELECT request_id, status, created_at FROM requests "
+                    "WHERE tenant_id = ? AND request_id = ?",
+                    (tenant_id, request_id),
+                ).fetchone()
+            except sqlite3.Error:
+                raise _storage_failure() from None
         finally:
             self._release(conn)
         if row is None:
@@ -459,6 +553,64 @@ class RequestStore:
             "request_id": row[0],
             "status": row[1],
             "created_at": row[2],
+        }
+
+    def get_status(self, tenant_id: str, request_id: str) -> dict[str, str]:
+        """Return the request's current status record.
+
+        The record has exactly ``request_id``, ``status`` and
+        ``created_at`` (the original acceptance time), in that order, and
+        reflects the latest persisted transition. It is stable across
+        store rebuilds. Unknown ids, illegal ids and cross-tenant lookups
+        raise :class:`RequestNotFound` with identical behaviour; invalid
+        arguments raise :class:`ValueError`; storage failures raise
+        :class:`OSError` with a fixed message.
+        """
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        request_id = _require_nonempty_str(request_id, "request_id")
+        if self._mem_conn is not None:
+            with self._write_lock:
+                return self._get(tenant_id, request_id)
+        return self._get(tenant_id, request_id)
+
+    def get_acceptance(self, tenant_id: str, request_id: str) -> dict[str, str]:
+        """Return the frozen acceptance receipt for a request.
+
+        Unlike :meth:`get_status`, this always reports ``accepted`` with
+        the id and time captured when the request was first accepted; the
+        receipt never changes as the status advances. It backs the
+        idempotent submission replay and the existing lookup endpoint.
+        Unknown ids, illegal ids and cross-tenant lookups raise
+        :class:`RequestNotFound`; invalid arguments raise
+        :class:`ValueError`; storage failures raise :class:`OSError`.
+        """
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        request_id = _require_nonempty_str(request_id, "request_id")
+        if self._mem_conn is not None:
+            with self._write_lock:
+                return self._get_acceptance(tenant_id, request_id)
+        return self._get_acceptance(tenant_id, request_id)
+
+    def _get_acceptance(self, tenant_id: str, request_id: str) -> dict[str, str]:
+        conn = self._connect()
+        try:
+            try:
+                row = conn.execute(
+                    "SELECT created_at FROM requests "
+                    "WHERE tenant_id = ? AND request_id = ?",
+                    (tenant_id, request_id),
+                ).fetchone()
+            except sqlite3.Error:
+                raise _storage_failure() from None
+        finally:
+            self._release(conn)
+        if row is None:
+            # Identical outcome for unknown ids and cross-tenant lookups.
+            raise RequestNotFound("request not found")
+        return {
+            "request_id": request_id,
+            "status": _STATUS_ACCEPTED,
+            "created_at": row[0],
         }
 
     def transition(
@@ -487,10 +639,6 @@ class RequestStore:
             try:
                 try:
                     conn.execute("BEGIN IMMEDIATE")
-                except sqlite3.Error:
-                    # Never surface the database engine's own error text.
-                    raise RuntimeError("failed to persist status transition") from None
-                try:
                     row = conn.execute(
                         "SELECT status, created_at FROM requests "
                         "WHERE tenant_id = ? AND request_id = ?",
@@ -498,12 +646,11 @@ class RequestStore:
                     ).fetchone()
                     if row is None:
                         # Same outcome for unknown ids and cross-tenant lookups.
-                        conn.execute("ROLLBACK")
                         raise RequestNotFound("request not found")
                     current_status, created_at = row
                     if current_status == target_status:
                         # Idempotent replay: nothing to persist.
-                        conn.execute("ROLLBACK")
+                        self._rollback_quietly(conn)
                         return {
                             "request_id": request_id,
                             "status": current_status,
@@ -511,7 +658,6 @@ class RequestStore:
                         }
                     allowed = _ALLOWED_TRANSITIONS.get(current_status, frozenset())
                     if target_status not in allowed:
-                        conn.execute("ROLLBACK")
                         raise InvalidStatusTransition("illegal status transition")
                     # Read the predecessor link before writing so the new
                     # link binds the exact persisted predecessor. BEGIN
@@ -528,8 +674,7 @@ class RequestStore:
                         # seq-0 event with a valid link, so reaching here
                         # means the timeline invariant was broken out of
                         # band. Never fabricate a replacement link.
-                        conn.execute("ROLLBACK")
-                        raise RuntimeError("failed to persist status transition")
+                        raise _storage_failure()
                     next_seq, latest_occurred_at, predecessor_hash = latest
                     occurred_at = _occurred_at_not_before(latest_occurred_at)
                     next_link_hash = _chain_hash(
@@ -555,7 +700,6 @@ class RequestStore:
                         # The row vanished or changed under us; refuse rather
                         # than persisting a state that breaks the transition
                         # graph observed at read time.
-                        conn.execute("ROLLBACK")
                         raise InvalidStatusTransition("illegal status transition")
                     # The event is appended in the same transaction as the
                     # status update. The event's chain link binds the
@@ -575,18 +719,20 @@ class RequestStore:
                         ),
                     )
                     conn.execute("COMMIT")
-                except InvalidStatusTransition:
-                    raise
-                except RequestNotFound:
+                except (InvalidStatusTransition, RequestNotFound):
+                    # Business outcomes: roll back any open transaction and
+                    # propagate unchanged. A failing rollback must not mask
+                    # the stable business error.
+                    self._rollback_quietly(conn)
                     raise
                 except sqlite3.Error:
                     # Best-effort cleanup; the rollback failure must not mask
                     # the original problem or leak engine text.
-                    try:
-                        conn.execute("ROLLBACK")
-                    except sqlite3.Error:
-                        pass
-                    raise RuntimeError("failed to persist status transition") from None
+                    self._rollback_quietly(conn)
+                    raise _storage_failure() from None
+                except _StorageUnavailable:
+                    self._rollback_quietly(conn)
+                    raise
             finally:
                 self._release(conn)
         _log.info(
@@ -627,17 +773,22 @@ class RequestStore:
             # alone would still distinguish "missing" from "foreign record"
             # via an empty timeline, so gate on the request row exactly
             # like get().
-            owner = conn.execute(
-                "SELECT 1 FROM requests WHERE tenant_id = ? AND request_id = ?",
-                (tenant_id, request_id),
-            ).fetchone()
-            if owner is None:
-                raise RequestNotFound("request not found")
-            rows = conn.execute(
-                "SELECT status, occurred_at FROM status_events "
-                "WHERE tenant_id = ? AND request_id = ? ORDER BY seq",
-                (tenant_id, request_id),
-            ).fetchall()
+            try:
+                owner = conn.execute(
+                    "SELECT 1 FROM requests WHERE tenant_id = ? AND request_id = ?",
+                    (tenant_id, request_id),
+                ).fetchone()
+                if owner is None:
+                    raise RequestNotFound("request not found")
+                rows = conn.execute(
+                    "SELECT status, occurred_at FROM status_events "
+                    "WHERE tenant_id = ? AND request_id = ? ORDER BY seq",
+                    (tenant_id, request_id),
+                ).fetchall()
+            except RequestNotFound:
+                raise
+            except sqlite3.Error:
+                raise _storage_failure() from None
         finally:
             self._release(conn)
         return [
@@ -731,7 +882,7 @@ class RequestStore:
                 raise
             except sqlite3.Error:
                 # Never surface the database engine's own error text.
-                raise RuntimeError("failed to verify request evidence") from None
+                raise _storage_failure() from None
         finally:
             self._release(conn)
 
@@ -788,7 +939,7 @@ class RequestStore:
                     (tenant_id, request_id),
                 ).fetchone()
             except sqlite3.Error:
-                raise RuntimeError("failed to read request evidence") from None
+                raise _storage_failure() from None
         finally:
             self._release(conn)
         if row is None:

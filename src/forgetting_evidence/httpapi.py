@@ -6,14 +6,18 @@ The service exposes exactly two business endpoints:
   body must carry non-empty ``tenant_id``, ``subject_id`` and
   ``idempotency_key`` strings plus a non-empty ``scopes`` array of
   distinct non-empty strings.
-* ``GET /requests/{request_id}`` -- return the accepted request's
-  receipt, scoped to the tenant identified by the ``X-Tenant-Id`` header
-  (or a ``tenant_id`` query parameter).
+* ``GET /requests/{request_id}`` -- return the request's frozen
+  acceptance receipt, scoped to the tenant identified by the
+  ``X-Tenant-Id`` header (or a ``tenant_id`` query parameter). The
+  receipt always reports ``accepted``; advancing the request's status
+  through the store layer never changes it.
 
 Success responses are a single line of JSON with exactly
 ``request_id``, ``status`` and ``created_at`` (in that order) followed by
 a trailing newline; the same idempotent request and every lookup return
-byte-identical bodies. Error responses are single-line JSON objects with
+byte-identical bodies. The HTTP layer deliberately exposes no status
+advancement or current-status endpoint: those are store-only operations
+(``RequestStore.transition`` and ``RequestStore.get_status``). Error responses are single-line JSON objects with
 exactly one key, ``error``, holding a stable error code:
 
 ``invalid_request`` (400), ``idempotency_conflict`` (409),
@@ -106,7 +110,18 @@ class DeferredRequestStore:
         return self._ready().submit(tenant_id, subject_id, scopes, idempotency_key)
 
     def get(self, tenant_id, request_id):
-        return self._ready().get(tenant_id, request_id)
+        return self._ready().get_acceptance(tenant_id, request_id)
+
+    def get_acceptance(self, tenant_id, request_id):
+        return self._ready().get_acceptance(tenant_id, request_id)
+
+    def get_status(self, tenant_id, request_id):
+        return self._ready().get_status(tenant_id, request_id)
+
+    def transition(self, tenant_id, request_id, target_status):
+        # Store-layer only: no HTTP verb reaches this. It is forwarded so a
+        # lazily initialising store can still drive the state machine.
+        return self._ready().transition(tenant_id, request_id, target_status)
 
 
 def _normalize_request_id(value: str) -> str:
@@ -272,7 +287,9 @@ def make_handler(store: RequestStore) -> type[BaseHTTPRequestHandler]:
                 self._reply_error(400, _INVALID_REQUEST)
                 return
             try:
-                receipt = store.get(tenant_id, request_id)
+                # The existing lookup always returns the frozen acceptance
+                # receipt; it must not change as the status advances.
+                receipt = store.get_acceptance(tenant_id, request_id)
             except RequestNotFound:
                 # Missing ids and cross-tenant lookups are indistinguishable.
                 self._reply_error(404, _NOT_FOUND)
