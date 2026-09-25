@@ -165,15 +165,29 @@ stable acceptance order (first acceptance time, then request id) in
 resumable, persistent batches. The first call creates a durable batch
 whose keyset position survives restarts; presenting the issued cursor
 resumes that batch from its committed position without re-reporting
-settled items. Each item carries only the request id, a boolean
-verified flag and a stable reason code (empty when verified): the
-request's own event chain, chain head, status, event/anchor binding
-and anchor authentication are assessed together with the file-wide
-seal (meta head, secret generations, commit order and the replayed
-global head). The sweep is strictly read-only for every audit, anchor
-and key record -- it never repairs, backfills, recomputes or
-overwrites them; only the inspection bookkeeping tables are written,
-each item and the cursor position committing in one transaction.
+settled items. When the same tenant, batch and cursor are continued
+concurrently, exactly one call atomically advances the whole page --
+the batch row, that page's per-item results and the cursor position
+all commit in one transaction; the winning call returns the page and
+every competing call keeps the same shape but reports an empty item
+list positioned after the winner's commit. Each item carries only the
+request id, a boolean verified flag and a stable reason code (empty
+when verified): the request's own event chain, chain head, status,
+event/anchor binding and anchor authentication are assessed together
+with the file-wide seal (meta head, secret generations, commit order
+and the replayed global head). The sweep is strictly read-only for
+every business, execution, audit, anchor and key record -- it never
+compensates an attempt, changes a status, execution record, audit
+chain, anchor or receipt, and never repairs, backfills, recomputes or
+overwrites any of them; only the inspection bookkeeping is written, a
+whole page of items and the cursor position committing together.
+:meth:`RequestStore.audit_inspection_summary` is the strictly
+read-only companion: given only a tenant and a batch id it returns a
+compact single-line JSON summary (``batch_id``, ``scanned``,
+``verified``, ``unverified``, ``next_cursor``, ``finished``) of the
+persisted batch without advancing a cursor, creating a batch,
+repairing evidence or writing anything; a missing or cross-tenant
+batch raises :class:`AuditInspectionNotFound`.
 
 Caller errors are always :class:`ValueError` (invalid parameters) or the
 module's own domain exceptions; every database failure -- an unwritable
@@ -209,6 +223,7 @@ __all__ = [
     "ReceiptUnavailable",
     "ReceiptKeyConflict",
     "AnchorKeyConflict",
+    "AuditInspectionNotFound",
 ]
 
 _log = logging.getLogger(__name__)
@@ -269,8 +284,34 @@ class AnchorKeyConflict(Exception):
     """
 
 
+class AuditInspectionNotFound(Exception):
+    """Raised when a read-only inspection summary names no visible batch.
+
+    A missing batch id and another tenant's batch share one identical
+    outcome, so the summary entry point can never be used to probe which
+    batches exist or which tenant owns a batch. The fixed message never
+    identifies the tenant or batch supplied.
+    """
+
+
 class _PrimaryKeyConflict(Exception):
     """Internal signal: retry insertion with a freshly generated id."""
+
+
+class _InspectionPageLost(Exception):
+    """Internal signal: a concurrent caller advanced the inspection page.
+
+    Raised inside the single page transaction once a re-read of the
+    batch's committed position shows it moved past where this call's
+    page started. The loser rolls its transaction back (no batch row,
+    item row or cursor position is written) and replays the winner's
+    committed state instead of recording a second page for the same
+    cursor. ``state`` is the winner's ``(finished, item_count)``.
+    """
+
+    def __init__(self, finished: bool, item_count: int):
+        super().__init__("inspection page was advanced concurrently")
+        self.state: tuple[bool, int] = (finished, item_count)
 
 
 _SCHEMA = """
@@ -850,6 +891,11 @@ _ANCHOR_REASON_KEY_MISSING = "anchor_key_missing"
 # Fixed, detail-free text for every lost anchor rotation race. It never
 # says which secret or generation was involved.
 _ANCHOR_KEY_CONFLICT_MESSAGE = "anchor key conflict"
+
+# Fixed, detail-free text for an inspection summary naming a batch the
+# tenant cannot see. A missing batch and another tenant's batch share
+# this one outcome so existence or ownership can never be probed.
+_INSPECTION_NOT_FOUND_MESSAGE = "audit inspection batch not found"
 
 
 def _anchor_mac(
@@ -2913,7 +2959,7 @@ class RequestStore:
         omitted a new persistent batch sweeps the tenant's requests in
         stable acceptance order (``created_at`` then ``request_id``);
         with a cursor the batch it names is resumed from its durably
-        committed position, so a retry after an interruption or a
+        committed position, so a sequential retry, an interruption or a
         service restart continues instead of restarting, and the same
         cursor always keeps the same batch identifier. Each call
         inspects at most ``limit`` requests (default 100, at most 1000)
@@ -2923,6 +2969,17 @@ class RequestStore:
         request, in scan order. ``verified`` is a boolean and
         ``reason`` the stable, detail-free reason code the request's
         chain failed with (the empty string when it verified).
+
+        Concurrent continuations of the same tenant, batch and cursor
+        settle exactly one page: the first call to take the write
+        transaction atomically advances the whole page and lands the
+        inspection bookkeeping; every concurrent loser keeps the same
+        return shape but reports an empty ``items`` list, with
+        ``next_cursor``/``finished`` reflecting the position the winner
+        committed. A sequential retry after a committed page, or a
+        resume after a restart or once the batch is finished, likewise
+        continues from the durable frontier without re-reporting a
+        settled item, and the finished cursor stays ``None``.
 
         Each request is assessed against its settled audit evidence
         exactly like the read-only full-chain verification: the event
@@ -2939,13 +2996,17 @@ class RequestStore:
         legacy database and an interrupted commit all report
         ``verified`` false with a stable reason code.
 
-        The sweep is strictly read-only for every audit, anchor and key
-        record: it never repairs, backfills, recomputes or overwrites
-        them. Only the inspection bookkeeping tables are written -- the
-        batch row, one item row per scanned request and the cursor
-        position, each item committing in its own transaction together
-        with the position advance, so a failed call never returns
-        half-settled results and a committed item is never re-reported.
+        The sweep is strictly read-only for every business, execution,
+        audit, anchor and key record: it never compensates an attempt,
+        changes a request status, execution record, audit chain, anchor
+        or receipt, and never repairs, backfills, recomputes or
+        overwrites any of them. Only the inspection bookkeeping is
+        written -- the batch row, one item row per scanned request and
+        the cursor position -- and the item results for the whole page
+        commit together with that cursor position in one transaction,
+        so a failed call never returns half-settled results, a
+        committed page is never reported twice and a concurrent loser
+        never writes a second page for the same cursor.
 
         A non-string/empty *tenant_id*, a limit outside 1..1000 (or a
         non-integer or boolean), and any malformed, unknown or
@@ -2966,52 +3027,35 @@ class RequestStore:
         with self._write_lock:
             conn = self._connect()
             try:
-                # First transaction resolves the batch: a fresh batch row
-                # is inserted when no cursor was given; a cursor names the
-                # persisted batch to resume. An unknown/cross-tenant cursor
-                # is rejected here before anything is written.
-                batch_id, _pos, _rid, finished, _start_count = (
-                    self._batch_transaction(
-                        conn,
-                        lambda: self._load_or_init_inspection_locked(
-                            conn, tenant_id, cursor_batch
-                        ),
+                # The batch row, every item result and the cursor position
+                # for this call's whole page all commit in ONE transaction.
+                # BEGIN IMMEDIATE serialises same-batch continuations: the
+                # first caller to take the lock advances the whole page and
+                # settles the bookkeeping; a concurrent caller holding the
+                # same cursor only acquires the lock after that commit, sees
+                # the frontier already past its cursor, writes nothing and
+                # replays the winner's committed position.
+                try:
+                    batch_id, items, finished, durable_count = (
+                        self._inspection_page_transaction(
+                            conn,
+                            lambda: self._advance_inspection_page_locked(
+                                conn, tenant_id, cursor_batch, limit
+                            ),
+                        )
                     )
-                )
-                items: list[dict[str, object]] = []
-                # Each scanned request is assessed and recorded in its OWN
-                # transaction: the item row and the cursor position commit
-                # together. The next iteration re-reads the persisted
-                # position, so an item already settled by an earlier commit
-                # or a concurrent call is never re-reported.
-                while not finished and len(items) < limit:
-                    kind, payload = self._batch_transaction(
-                        conn,
-                        lambda: self._process_one_inspection_item_locked(
-                            conn, tenant_id, batch_id
-                        ),
-                    )
-                    if kind == "finished":
-                        finished = True
-                        break
-                    items.append(payload)
-                # Resolve the authoritative outcome in one final short
-                # transaction: whether the sweep is finished AND the durable
-                # settled-item count are both read from the database rather
-                # than from this call's in-memory tally, so the issued
-                # cursor names a position that matches what is durably
-                # committed (another store instance may share the file).
-                finished, durable_count = self._batch_transaction(
-                    conn,
-                    lambda: self._finalize_inspection_if_end_locked(
-                        conn, tenant_id, batch_id
-                    ),
-                )
+                except _InspectionPageLost as lost:
+                    # A concurrent (or earlier identical-cursor) call won
+                    # this page. It wrote nothing; report the winner's
+                    # post-commit position with an empty item list.
+                    finished, durable_count = lost.state
+                    items = []
+                    batch_id = cursor_batch[0]
             finally:
                 self._release(conn)
         # The cursor only identifies the persisted batch; its item count is
-        # the database-authoritative settled count read in the final
-        # transaction.
+        # the database-authoritative settled count read in the page
+        # transaction (the winner's committed count for a losing call).
         next_cursor = (
             None
             if finished
@@ -3031,22 +3075,63 @@ class RequestStore:
             "items": items,
         }
 
-    def _load_or_init_inspection_locked(
+    def _inspection_page_transaction(self, conn: sqlite3.Connection, action):
+        """Run one whole inspection-page advance inside a write transaction.
+
+        The batch row, up to ``limit`` item rows and the cursor position
+        all commit together, so concurrent continuations of the same
+        cursor cannot interleave partial pages and a fault never leaves
+        a page half-settled. The internal :class:`_InspectionPageLost`
+        outcome (this call lost the same-cursor race) rolls the
+        transaction back and propagates with the winner's state; every
+        engine error becomes the fixed-text :class:`OSError`.
+        """
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.Error:
+            raise _storage_failure() from None
+        try:
+            result = action()
+            conn.execute("COMMIT")
+            return result
+        except _InspectionPageLost:
+            self._rollback_quietly(conn)
+            raise
+        except ValueError:
+            self._rollback_quietly(conn)
+            raise
+        except OSError:
+            self._rollback_quietly(conn)
+            raise
+        except sqlite3.Error:
+            self._rollback_quietly(conn)
+            raise _storage_failure() from None
+
+    def _advance_inspection_page_locked(
         self,
         conn: sqlite3.Connection,
         tenant_id: str,
         cursor_batch: tuple[str, int] | None,
-    ) -> tuple[str, str | None, str | None, bool, int]:
-        """Resolve the inspection batch for this call in an open write txn.
+        limit: int,
+    ) -> tuple[str, list[dict[str, object]], bool, int]:
+        """Create or resume an inspection batch and advance one whole page.
 
-        Returns ``(batch_id, position_created_at, position_request_id,
-        finished, item_count)``. Without a cursor a fresh batch row is
-        inserted; with a cursor the persisted batch is resumed from its
-        committed position -- the cursor's own position field is only a
-        format detail, the database is authoritative. An unknown or
+        Runs inside the single page write transaction. Without a cursor a
+        fresh batch row is inserted and the first page assessed; with a
+        cursor the named batch is resumed strictly from its committed
+        frontier -- the cursor's own count is only a format detail, the
+        database is authoritative.
+
+        Ownership of a resumed batch is confirmed first: an unknown or
         cross-tenant batch id is an invalid cursor and raises
-        :class:`ValueError`; corrupt persisted state raises the
-        fixed-text :class:`OSError`.
+        :class:`ValueError`. When the batch's durable settled count is
+        already past the count the cursor was issued at, a concurrent
+        (or identical-cursor) call won the page: nothing is written and
+        :class:`_InspectionPageLost` carries the winner's committed
+        ``(finished, item_count)``. A durable count behind the cursor is
+        damaged bookkeeping and raises the fixed-text :class:`OSError`.
+
+        Returns ``(batch_id, items, finished, durable_item_count)``.
         """
         if cursor_batch is None:
             batch_id = str(uuid.uuid4())
@@ -3057,21 +3142,82 @@ class RequestStore:
                 ") VALUES (?, ?, NULL, NULL, 0)",
                 (batch_id, tenant_id),
             )
-            return batch_id, None, None, False, 0
-        batch_id, _issued_position = cursor_batch
-        # Confirm ownership before reading state: an unknown or
-        # cross-tenant batch id is an invalid cursor, indistinguishable
-        # from one that never existed.
-        owner = conn.execute(
-            "SELECT 1 FROM inspection_batches WHERE batch_id = ? AND tenant_id = ?",
-            (batch_id, tenant_id),
-        ).fetchone()
-        if owner is None:
-            raise ValueError("cursor is not valid")
-        pos_created, pos_rid, finished, item_count = (
+            pos_created, pos_rid, finished, item_count = None, None, False, 0
+        else:
+            batch_id, issued_count = cursor_batch
+            # Confirm ownership before reading state: an unknown or
+            # cross-tenant batch id is an invalid cursor, indistinguishable
+            # from one that never existed.
+            owner = conn.execute(
+                "SELECT 1 FROM inspection_batches "
+                "WHERE batch_id = ? AND tenant_id = ?",
+                (batch_id, tenant_id),
+            ).fetchone()
+            if owner is None:
+                raise ValueError("cursor is not valid")
+            pos_created, pos_rid, finished, item_count = (
+                self._read_inspection_state_locked(conn, batch_id)
+            )
+            if item_count != issued_count:
+                if item_count < issued_count:
+                    # Item rows disappeared out of band: the bookkeeping
+                    # is damaged, never a page this call may rebuild.
+                    raise _storage_failure()
+                # The frontier is already past this cursor: a concurrent
+                # call committed the page (or an identical cursor was
+                # replayed after it). The loser reports nothing.
+                raise _InspectionPageLost(finished, item_count)
+            if finished:
+                return batch_id, [], True, item_count
+
+        items: list[dict[str, object]] = []
+        # Assess up to ``limit`` requests, inserting each item row and
+        # advancing the position inside this same transaction; the audit
+        # evidence itself is only ever read, never repaired or rewritten.
+        while len(items) < limit:
+            row = self._next_inspection_candidate(
+                conn, tenant_id, pos_created, pos_rid
+            )
+            if row is None:
+                self._finish_inspection_locked(conn, batch_id)
+                finished = True
+                break
+            request_id, created_at = row
+            item = self._inspect_request_locked(conn, tenant_id, request_id)
+            conn.execute(
+                "INSERT INTO inspection_batch_items ("
+                "batch_id, seq, request_id, verified, reason"
+                ") VALUES (?, ?, ?, ?, ?)",
+                (
+                    batch_id,
+                    item_count + len(items) + 1,
+                    request_id,
+                    1 if item["verified"] else 0,
+                    item["reason"],
+                ),
+            )
+            self._advance_inspection_locked(
+                conn, batch_id, created_at, request_id
+            )
+            pos_created, pos_rid = created_at, request_id
+            items.append(item)
+
+        # A page stopped exactly at ``limit`` may also be the last page:
+        # check the next candidate inside this same transaction and finish
+        # the sweep when none remains, so the final cursor stays None.
+        if not finished and not self._next_inspection_candidate(
+            conn, tenant_id, pos_created, pos_rid
+        ):
+            self._finish_inspection_locked(conn, batch_id)
+            finished = True
+
+        # Re-read the authoritative tally rather than trusting this
+        # transaction's arithmetic: the returned cursor must name exactly
+        # the settled count durable on commit.
+        _pos_c, _pos_r, finished, durable_count = (
             self._read_inspection_state_locked(conn, batch_id)
         )
-        return batch_id, pos_created, pos_rid, finished, item_count
+        return batch_id, items, finished, durable_count
 
     def _read_inspection_state_locked(
         self, conn: sqlite3.Connection, batch_id: str
@@ -3106,76 +3252,6 @@ class RequestStore:
         ):
             raise _storage_failure()
         return pos_created, pos_rid, bool(finished), item_count
-
-    def _process_one_inspection_item_locked(
-        self,
-        conn: sqlite3.Connection,
-        tenant_id: str,
-        batch_id: str,
-    ) -> tuple[str, object]:
-        """Inspect the next request in scan order inside an open write txn.
-
-        Re-reads the batch's persisted position every call, so the
-        result is independent of any in-memory position. Returns
-        ``("finished", None)`` once the sweep end is reached, or
-        ``("item", {"request_id", "verified", "reason"})`` after
-        assessing one request and recording its item. The request's
-        audit evidence is only read: the assessment never repairs,
-        backfills, recomputes or overwrites any audit, anchor or key
-        record -- the item row and the batch position are the only
-        writes, and they commit together.
-        """
-        pos_created, pos_rid, finished, item_count = (
-            self._read_inspection_state_locked(conn, batch_id)
-        )
-        if finished:
-            return "finished", None
-        row = self._next_inspection_candidate(conn, tenant_id, pos_created, pos_rid)
-        if row is None:
-            self._finish_inspection_locked(conn, batch_id)
-            return "finished", None
-        request_id, created_at = row
-        item = self._inspect_request_locked(conn, tenant_id, request_id)
-        # The item row and the cursor position land in this one
-        # transaction; the sequence derives from the persisted count so
-        # a resumed batch never reuses a number.
-        conn.execute(
-            "INSERT INTO inspection_batch_items ("
-            "batch_id, seq, request_id, verified, reason"
-            ") VALUES (?, ?, ?, ?, ?)",
-            (
-                batch_id,
-                item_count + 1,
-                request_id,
-                1 if item["verified"] else 0,
-                item["reason"],
-            ),
-        )
-        self._advance_inspection_locked(conn, batch_id, created_at, request_id)
-        return "item", item
-
-    def _finalize_inspection_if_end_locked(
-        self,
-        conn: sqlite3.Connection,
-        tenant_id: str,
-        batch_id: str,
-    ) -> tuple[bool, int]:
-        """Finish a limit-stopped inspection iff no candidate remains.
-
-        Always returns the authoritative ``(finished, item_count)`` read
-        from the persisted batch inside this write transaction, so the
-        caller can issue a cursor whose position matches the durable
-        tally rather than its own per-call snapshot.
-        """
-        pos_created, pos_rid, finished, item_count = (
-            self._read_inspection_state_locked(conn, batch_id)
-        )
-        if finished:
-            return True, item_count
-        if self._next_inspection_candidate(conn, tenant_id, pos_created, pos_rid) is None:
-            self._finish_inspection_locked(conn, batch_id)
-            return True, item_count
-        return False, item_count
 
     @staticmethod
     def _next_inspection_candidate(
@@ -3669,6 +3745,137 @@ class RequestStore:
             global_reasons.add(_ANCHOR_REASON_SECRET_MISSING)
 
         return sorted(global_reasons | scoped_reasons)
+
+    # -- read-only inspection summary ----------------------------------
+
+    def audit_inspection_summary(
+        self,
+        tenant_id: str,
+        batch_id: str,
+    ) -> str:
+        """Return a compact, read-only JSON summary of an inspection batch.
+
+        Storage-layer only; never routed over HTTP. The caller supplies
+        only the *tenant_id* and the *batch_id* previously issued by
+        :meth:`audit_inspection`. The summary never advances a cursor,
+        creates a batch, repairs evidence or writes any business, audit
+        or bookkeeping record -- it only reads the batch's settled
+        results.
+
+        The output is a single compact JSON object with exactly one
+        trailing newline and exactly these fields in order:
+        ``batch_id``, ``scanned``, ``verified``, ``unverified``,
+        ``next_cursor`` and ``finished``. The three counts are
+        non-negative integers with ``scanned`` equal to
+        ``verified + unverified``; ``batch_id`` and ``next_cursor`` are
+        strings or null (the cursor is null once the sweep is finished)
+        and ``finished`` is a boolean. No per-item results are
+        included. No float, negative zero or non-finite value can
+        occur.
+
+        An empty or non-string *tenant_id* or *batch_id* raises
+        :class:`ValueError` without touching storage. A batch that is
+        missing or owned by another tenant raises
+        :class:`AuditInspectionNotFound` with one identical,
+        detail-free outcome, so another tenant's batch can never be
+        revealed. Storage that is unavailable or inspection
+        bookkeeping that is corrupt or cannot be read raises the
+        fixed-text :class:`OSError`; a fabricated summary is never
+        returned.
+        """
+        # Validate before touching storage: a rejected call performs
+        # no read and certainly no write.
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        batch_id = _require_nonempty_str(batch_id, "batch_id")
+
+        if self._mem_conn is not None:
+            with self._write_lock:
+                summary = self._read_inspection_summary(tenant_id, batch_id)
+        else:
+            summary = self._read_inspection_summary(tenant_id, batch_id)
+
+        ordered = {
+            "batch_id": summary["batch_id"],
+            "scanned": summary["scanned"],
+            "verified": summary["verified"],
+            "unverified": summary["unverified"],
+            "next_cursor": summary["next_cursor"],
+            "finished": summary["finished"],
+        }
+        return json.dumps(
+            ordered, ensure_ascii=False, separators=(",", ":")
+        ) + "\n"
+
+    def _read_inspection_summary(
+        self, tenant_id: str, batch_id: str
+    ) -> dict[str, object]:
+        """Read and strictly validate an inspection batch's summary."""
+        conn = self._connect()
+        try:
+            try:
+                # Gate on ownership in the same lookup: a missing batch
+                # and another tenant's batch share the not-found outcome.
+                batch_row = conn.execute(
+                    "SELECT position_created_at, position_request_id, "
+                    "finished FROM inspection_batches "
+                    "WHERE batch_id = ? AND tenant_id = ?",
+                    (batch_id, tenant_id),
+                ).fetchone()
+                if batch_row is None:
+                    raise AuditInspectionNotFound(
+                        _INSPECTION_NOT_FOUND_MESSAGE
+                    )
+                pos_created, pos_rid, finished = batch_row
+                item_rows = conn.execute(
+                    "SELECT verified FROM inspection_batch_items "
+                    "WHERE batch_id = ? ORDER BY seq",
+                    (batch_id,),
+                ).fetchall()
+            except AuditInspectionNotFound:
+                raise
+            except sqlite3.Error:
+                raise _storage_failure() from None
+        finally:
+            self._release(conn)
+
+        # Strictly validate the persisted bookkeeping: a split keyset
+        # position, a non-boolean finish flag or a non-0/1 item verdict
+        # is corruption, never a summary silently computed off garbage.
+        if finished not in (0, 1):
+            raise _storage_failure()
+        if (pos_created is None) != (pos_rid is None):
+            raise _storage_failure()
+        if pos_created is not None and (
+            not isinstance(pos_created, str)
+            or not pos_created
+            or not isinstance(pos_rid, str)
+            or not pos_rid
+        ):
+            raise _storage_failure()
+        scanned = 0
+        verified = 0
+        for (verdict,) in item_rows:
+            if verdict not in (0, 1):
+                raise _storage_failure()
+            scanned += 1
+            verified += verdict
+        unverified = scanned - verified
+        is_finished = bool(finished)
+        next_cursor = (
+            None
+            if is_finished
+            else _encode_cursor(
+                batch_id, scanned, _INSPECTION_CURSOR_PREFIX
+            )
+        )
+        return {
+            "batch_id": batch_id,
+            "scanned": scanned,
+            "verified": verified,
+            "unverified": unverified,
+            "next_cursor": next_cursor,
+            "finished": is_finished,
+        }
 
     def audit(
         self,

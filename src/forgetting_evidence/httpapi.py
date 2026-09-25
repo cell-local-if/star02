@@ -24,8 +24,9 @@ lookup (:meth:`RequestStore.get_status`), the execution orchestration
 (:meth:`RequestStore.verify_chain`,
 :meth:`RequestStore.diagnose_chain`,
 :meth:`RequestStore.rotate_anchor_key`) and the read-only batched
-audit inspection (:meth:`RequestStore.audit_inspection`) exist only on
-the storage layer and are deliberately not exposed over HTTP: this
+audit inspection (:meth:`RequestStore.audit_inspection`,
+:meth:`RequestStore.audit_inspection_summary`) exist only on the
+storage layer and are deliberately not exposed over HTTP: this
 service still opens only request acceptance and the acceptance-receipt
 lookup.
 
