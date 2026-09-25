@@ -157,6 +157,16 @@ class DeferredRequestStore:
         # rest of the execution orchestration it is never routed over HTTP.
         return self._ready().reconcile_batch(tenant_id, cursor, limit)
 
+    def verify_chain(self, tenant_id=None, request_id=None):
+        # Full-chain anchor verification is storage-layer only; never
+        # routed over HTTP.
+        return self._ready().verify_chain(tenant_id, request_id)
+
+    def diagnose_chain(self, tenant_id=None, request_id=None):
+        # Read-only recovery diagnosis is storage-layer only; never
+        # routed over HTTP and never repairs anything.
+        return self._ready().diagnose_chain(tenant_id, request_id)
+
 
 def _normalize_request_id(value: str) -> str:
     """Validate a request id as a UUID and return its canonical text."""

@@ -110,6 +110,40 @@ event is also stored on the request row, so deleting, modifying,
 inserting or reordering persisted events breaks verification. The hash
 preimage is never exposed in return values, exceptions or logs.
 
+A database-only chain cannot, however, tell a genuine timeline from
+one an attacker rewrote in full: with the file in hand every event,
+every request head and every commitment stored *in that file* can be
+recomputed so the internal hashes verify again. The store therefore
+optionally anchors every acceptance and every actual status change to
+an external trust anchor: when constructed with an ``anchor_secret``
+the caller keeps outside the database, each event also receives an
+HMAC-SHA256 anchor keyed with that secret, binding the tenant, request,
+sequence, status, occurrence time, the event's own ``chain_hash`` and
+the preceding anchor. Anchors form their own per-request chain from a
+fixed genesis predecessor, are stored one-to-one with the events they
+anchor, and the current global anchor head is held exactly once in a
+single-row meta table. The event, its request head, its anchor and the
+new global head always commit in one transaction, so a failure at any
+stage rolls the whole write back as the fixed-text :class:`OSError`
+and never leaves a record that could be judged complete.
+
+The anchor secret exists only in the constructing process's memory: it
+is never persisted (only irreversible HMAC outputs are), never placed
+in a receipt, return value, exception or log, and anchors cannot be
+rebuilt from the stored events, heads or other public contents. A
+store opened without a secret keeps the historical, un-anchored
+behaviour; an already anchored database rejects writes from a store
+that cannot settle the next anchor rather than appending an
+un-anchored event. :meth:`RequestStore.verify_chain` performs the
+read-only full-chain check -- event order, request association,
+database link hashes, per-request anchor authentication, the
+events-to-anchors binding and the global head, across restarts and
+across every tenant in the file -- and :meth:`RequestStore.diagnose_chain`
+reports only the fixed reason codes that make a timeline untrusted,
+never repairing, backfilling, recomputing or overwriting anything.
+Old (un-anchored) databases, corrupt anchors, split heads and
+interrupted commits verify as ``False``.
+
 Caller errors are always :class:`ValueError` (invalid parameters) or the
 module's own domain exceptions; every database failure -- an unwritable
 path, an uncreatable or corrupt file, an I/O or read/write error -- is
@@ -349,6 +383,49 @@ CREATE TABLE IF NOT EXISTS receipt_keys (
 _RECEIPT_KEY_FINGERPRINT_INDEX = """
 CREATE UNIQUE INDEX IF NOT EXISTS idx_receipt_keys_tenant_fingerprint
     ON receipt_keys(tenant_id, key_fingerprint);
+"""
+
+# External cross-restart trust anchors, one row per anchored status
+# event. ``commit_seq`` is the file-wide sealing order (1, 2, 3, ...) so
+# the global head can be replayed deterministically; ``anchor_hmac`` is
+# the HMAC-SHA256 of the event's business fields, its database chain
+# hash and the preceding anchor, keyed with the caller-held anchor
+# secret. Neither value can be derived from anything stored in the file
+# without that secret. Rows are inserted in the same transaction as the
+# events they anchor and never updated or deleted by the store, so an
+# event can never exist without its anchor or vice versa.
+_ANCHOR_TABLE = """
+CREATE TABLE IF NOT EXISTS audit_anchors (
+    commit_seq  INTEGER NOT NULL,
+    tenant_id   TEXT NOT NULL,
+    request_id  TEXT NOT NULL,
+    seq         INTEGER NOT NULL,
+    event_hash  TEXT NOT NULL,
+    anchor_hmac TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, request_id, seq)
+);
+"""
+
+# The file-wide sealing order is also unique on its own: a renumbered,
+# duplicated or deleted anchor leaves a gap or a collision that the
+# global-head replay cannot accept.
+_ANCHOR_COMMIT_SEQ_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_anchors_commit_seq
+    ON audit_anchors(commit_seq);
+"""
+
+# Exactly one row (id = 1) holding the current global anchor head. The
+# head chains every anchor in file-wide commit order, so it cannot be
+# recomputed from a single request's rows: a substitution, deletion or
+# reordering anywhere in the file changes it. It is upserted in the
+# same transaction as the anchor it seals; an interrupted commit leaves
+# the old head (or none), never a split one. Only an HMAC is stored --
+# the keying material never enters this table.
+_ANCHOR_META_TABLE = """
+CREATE TABLE IF NOT EXISTS audit_anchor_meta (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    head_hmac  TEXT NOT NULL
+);
 """
 
 # Column probes used to upgrade database files created before chain
@@ -613,6 +690,106 @@ def _is_chain_hash(value: object) -> bool:
     )
 
 
+# -- external trust anchors -------------------------------------------
+
+# Fixed genesis predecessors for the two anchor chains. They are
+# domain-separated from the database chain's genesis and from each
+# other, so the first anchor of a request can never be confused with a
+# link chained onto a forged 64-character predecessor.
+_ANCHOR_GENESIS_PREDECESSOR = hashlib.sha256(
+    b"forgetting-evidence:anchor:request-genesis"
+).hexdigest()
+_ANCHOR_GLOBAL_GENESIS = hashlib.sha256(
+    b"forgetting-evidence:anchor:global-genesis"
+).hexdigest()
+
+# Stable, detail-free reason codes reported by diagnose_chain. They name
+# only *why* the persisted evidence cannot be trusted -- never a tenant,
+# request, credential, SQL text or path -- and diagnosis never repairs,
+# backfills, recomputes or overwrites anything.
+_ANCHOR_REASON_SECRET_MISSING = "anchor_secret_missing"
+_ANCHOR_REASON_UNANCHORED = "unanchored_database"
+_ANCHOR_REASON_STATE_SPLIT = "anchor_state_split"
+_ANCHOR_REASON_META_CORRUPT = "anchor_meta_corrupt"
+_ANCHOR_REASON_EVENT_UNANCHORED = "event_unanchored"
+_ANCHOR_REASON_ANCHOR_ORPHAN = "anchor_orphan"
+_ANCHOR_REASON_EVENT_ORDER = "event_order_invalid"
+_ANCHOR_REASON_CHAIN_MISMATCH = "chain_hash_mismatch"
+_ANCHOR_REASON_HEAD_MISMATCH = "chain_head_mismatch"
+_ANCHOR_REASON_STATUS_MISMATCH = "request_status_mismatch"
+_ANCHOR_REASON_ASSOCIATION = "request_association_mismatch"
+_ANCHOR_REASON_AUTH_FAILED = "anchor_auth_failed"
+_ANCHOR_REASON_SEQUENCE_GAP = "anchor_sequence_gap"
+_ANCHOR_REASON_GLOBAL_HEAD = "anchor_head_mismatch"
+_ANCHOR_REASON_CORRUPT_ROW = "anchor_row_corrupt"
+
+
+def _anchor_mac(
+    secret: str,
+    tenant_id: str,
+    request_id: str,
+    seq: int,
+    status: str,
+    occurred_at: str,
+    event_hash: str,
+    predecessor: str,
+) -> str:
+    """Compute one per-request external anchor under the caller secret.
+
+    The anchor binds the event's business fields, its database chain
+    hash and the preceding anchor, length-prefixed exactly like the
+    database chain so no concatenation can be re-parsed two ways. The
+    secret is used only here and in the global-head MAC; it is never
+    persisted, returned, logged or placed in an exception, and the
+    preimage is never stored either.
+    """
+    mac = hmac.new(secret.encode("utf-8"), digestmod=hashlib.sha256)
+    for field in (
+        tenant_id,
+        request_id,
+        str(seq),
+        status,
+        occurred_at,
+        event_hash,
+        predecessor,
+    ):
+        encoded = field.encode("utf-8")
+        mac.update(struct.pack(">Q", len(encoded)))
+        mac.update(encoded)
+    return mac.hexdigest()
+
+
+def _anchor_head_mac(
+    secret: str,
+    predecessor: str,
+    anchor_hmac: str,
+    tenant_id: str,
+    request_id: str,
+    seq: int,
+) -> str:
+    """Seal one anchor into the file-wide global anchor head.
+
+    The head chains anchors in their global commit order, binding each
+    anchor value to its tenant/request/sequence association. Because the
+    head covers the whole file, deleting, inserting, reordering or
+    substituting an anchor anywhere -- including across requests or
+    tenants -- changes the recomputed head even though every individual
+    anchor value is syntactically valid.
+    """
+    mac = hmac.new(secret.encode("utf-8"), digestmod=hashlib.sha256)
+    for field in (
+        predecessor,
+        anchor_hmac,
+        tenant_id,
+        request_id,
+        str(seq),
+    ):
+        encoded = field.encode("utf-8")
+        mac.update(struct.pack(">Q", len(encoded)))
+        mac.update(encoded)
+    return mac.hexdigest()
+
+
 # -- deletion receipts -------------------------------------------------
 
 # Fixed, detail-free text for every receipt-availability rejection.
@@ -763,7 +940,11 @@ def _parse_receipt_text(text: object) -> dict[str, str]:
 class RequestStore:
     """Persist and retrieve accepted deletion requests."""
 
-    def __init__(self, db_path: str | os.PathLike[str]):
+    def __init__(
+        self,
+        db_path: str | os.PathLike[str],
+        anchor_secret: str | None = None,
+    ):
         # Validate the path before touching the filesystem: an empty or
         # non-string path is caller error (ValueError), never a storage
         # fault, and must not create directories.
@@ -772,6 +953,16 @@ class RequestStore:
         if not isinstance(db_path, str) or not db_path:
             raise ValueError("storage path must be a non-empty string")
         self._db_path = db_path
+        # The external anchor secret is optional and lives only in this
+        # process's memory. It is validated as a non-empty string; a
+        # non-string or empty value is caller error, never silently
+        # downgraded to an un-anchored store. None deliberately opts a
+        # store out of anchoring (historical callers). The secret is
+        # never written anywhere.
+        if anchor_secret is not None:
+            if not isinstance(anchor_secret, str) or not anchor_secret:
+                raise ValueError("anchor_secret must be a non-empty string")
+        self._anchor_secret: str | None = anchor_secret
         # In-process serialization; the unique index additionally guards
         # other processes sharing the same database file.
         self._write_lock = threading.Lock()
@@ -802,6 +993,9 @@ class RequestStore:
                 conn.execute(_RECEIPT_TABLE)
                 conn.execute(_RECEIPT_KEY_TABLE)
                 conn.execute(_RECEIPT_KEY_FINGERPRINT_INDEX)
+                conn.execute(_ANCHOR_TABLE)
+                conn.execute(_ANCHOR_COMMIT_SEQ_INDEX)
+                conn.execute(_ANCHOR_META_TABLE)
                 self._migrate_schema(conn)
             except sqlite3.Error:
                 raise _storage_failure() from None
@@ -940,6 +1134,32 @@ class RequestStore:
                 try:
                     conn.execute("BEGIN IMMEDIATE")
                     try:
+                        # Detect an idempotent replay before gating on the
+                        # anchor state: replaying the frozen acceptance
+                        # record is a read and must still succeed on a
+                        # legacy or differently-anchored file without the
+                        # secret. The INSERT below remains the atomic
+                        # guard against the concurrent first-writer race.
+                        probe = conn.execute(
+                            "SELECT request_id FROM requests "
+                            "WHERE tenant_id = ? AND idempotency_key = ?",
+                            (tenant_id, idempotency_key),
+                        ).fetchone()
+                        if probe is not None:
+                            conn.execute("ROLLBACK")
+                            return self._load_idempotent(
+                                conn,
+                                tenant_id,
+                                idempotency_key,
+                                subject_id,
+                                scope_list,
+                            )
+                        # A genuinely new acceptance first proves the
+                        # committed anchor state is whole under the
+                        # configured secret: a wrong secret or a
+                        # tampered/legacy file must never accept a new
+                        # request.
+                        self._require_anchors_intact_locked(conn)
                         conn.execute(
                             "INSERT INTO requests ("
                             "request_id, tenant_id, idempotency_key, subject_id, "
@@ -972,6 +1192,18 @@ class RequestStore:
                         "tenant_id, request_id, seq, status, occurred_at, chain_hash"
                         ") VALUES (?, ?, 0, 'accepted', ?, ?)",
                         (tenant_id, request_id, created_at, genesis_hash),
+                    )
+                    # The external anchor seals the genesis event in the
+                    # same transaction; a failure here rolls the request
+                    # and event away as the fixed-text storage error.
+                    self._settle_anchor_locked(
+                        conn,
+                        tenant_id,
+                        request_id,
+                        0,
+                        _STATUS_ACCEPTED,
+                        created_at,
+                        genesis_hash,
                     )
                     conn.execute("COMMIT")
                 except _PrimaryKeyConflict:
@@ -1217,6 +1449,12 @@ class RequestStore:
         if target_status not in allowed:
             conn.execute("ROLLBACK")
             raise InvalidStatusTransition("illegal status transition")
+        # Authenticate the committed evidence under the configured secret
+        # before appending anything, so a wrong secret or a tampered,
+        # interrupted or legacy-un-anchored file can never extend the
+        # chain. Runs inside the caller's write transaction and rolls it
+        # back as the fixed-text storage error on any inconsistency.
+        self._require_anchors_intact_locked(conn)
         # Read the predecessor link before writing so the new link binds
         # the exact persisted predecessor. BEGIN IMMEDIATE serializes
         # writers, so two changes can neither claim the same seq nor read a
@@ -1273,6 +1511,19 @@ class RequestStore:
                 occurred_at,
                 next_link_hash,
             ),
+        )
+        # The external anchor for the new event is settled in this same
+        # transaction, after the event insert and before the caller adds
+        # the attempt/token rows, so the event, request head, anchor and
+        # global head either all commit together or none of them do.
+        self._settle_anchor_locked(
+            conn,
+            tenant_id,
+            request_id,
+            next_seq + 1,
+            target_status,
+            occurred_at,
+            next_link_hash,
         )
         return occurred_at
 
@@ -2620,6 +2871,576 @@ class RequestStore:
             # Identical outcome for unknown ids and cross-tenant lookups.
             raise RequestNotFound("request not found")
         return row[0], row[1], row[2]
+
+    # -- external trust anchors ---------------------------------------
+
+    def _fail_anchor_commit_locked(self, conn: sqlite3.Connection):
+        """Abort an anchor write and raise the single storage error.
+
+        Every failure while settling an event's anchor -- an un-anchored
+        legacy database, a corrupt or split anchor state, a missing
+        secret on an anchored file, a bad commit -- rolls the whole
+        surrounding transaction back, so the request row, status event,
+        anchor and global head can never land separately. The caller
+        never sees engine text, SQL or a path.
+        """
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise _storage_failure()
+
+    def _require_anchors_intact_locked(self, conn: sqlite3.Connection) -> None:
+        """Authenticate the committed anchor state before extending it.
+
+        A write under an external secret is only allowed on a database
+        whose committed evidence is already whole under *that* secret.
+        The read-only full assessment is replayed inside the write
+        transaction -- per-request chains, every external anchor's
+        authentication and the file-wide global head -- so a store
+        configured with a wrong secret, or an already tampered,
+        interrupted or legacy-un-anchored file, can never append an
+        event or a fresh anchor. A genuinely empty file vacuously
+        passes and bootstraps. The no-secret historical path is gated
+        later by :meth:`_settle_anchor_locked`.
+        """
+        secret = self._anchor_secret
+        if secret is None:
+            return
+        try:
+            meta_rows = conn.execute(
+                "SELECT head_hmac FROM audit_anchor_meta"
+            ).fetchall()
+            event_rows = conn.execute(
+                "SELECT tenant_id, request_id, seq, status, occurred_at, "
+                "chain_hash FROM status_events ORDER BY tenant_id, request_id, seq"
+            ).fetchall()
+            anchor_rows = conn.execute(
+                "SELECT commit_seq, tenant_id, request_id, seq, event_hash, "
+                "anchor_hmac FROM audit_anchors ORDER BY commit_seq"
+            ).fetchall()
+            request_rows = conn.execute(
+                "SELECT tenant_id, request_id, status, chain_hash FROM requests"
+            ).fetchall()
+        except sqlite3.Error:
+            self._fail_anchor_commit_locked(conn)
+            return
+        reasons = self._evaluate_chain_rows(
+            tuple(meta_rows),
+            tuple(event_rows),
+            tuple(anchor_rows),
+            tuple(request_rows),
+            secret,
+        )
+        if reasons:
+            self._fail_anchor_commit_locked(conn)
+
+    def _settle_anchor_locked(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        request_id: str,
+        seq: int,
+        status: str,
+        occurred_at: str,
+        event_hash: str,
+    ) -> None:
+        """Settle the external anchor for one event inside an open txn.
+
+        Called after the event's database link has been computed but in
+        the same transaction as the request row/event insert. With no
+        configured secret the store keeps the historical un-anchored
+        behaviour only for a database that has never carried an anchor;
+        an already anchored file can never accept an un-anchored append.
+        With a secret, a legacy database (events but no anchors) is
+        refused rather than having its past retroactively "anchored" by
+        recomputation -- anchors can only cover events committed under a
+        secret from the genesis on.
+        """
+        secret = self._anchor_secret
+        try:
+            anchor_count = conn.execute(
+                "SELECT count(*) FROM audit_anchors"
+            ).fetchone()[0]
+            event_count = conn.execute(
+                "SELECT count(*) FROM status_events"
+            ).fetchone()[0]
+            meta_row = conn.execute(
+                "SELECT head_hmac FROM audit_anchor_meta WHERE id = 1"
+            ).fetchone()
+        except sqlite3.Error:
+            self._fail_anchor_commit_locked(conn)
+            return  # unreachable; keeps type checkers on the branch
+
+        if secret is None:
+            # An un-anchored store may only write to an un-anchored
+            # database; anchors or a sealed head mean this file belongs
+            # to a secret-holding deployment and must not be extended
+            # blindly. The pending event is already inserted, so a
+            # genuinely un-anchored file shows exactly one event with no
+            # anchors and no head.
+            if anchor_count != 0 or meta_row is not None:
+                self._fail_anchor_commit_locked(conn)
+            return
+
+        if anchor_count == 0:
+            # The pending event is already in status_events. A fresh
+            # database has exactly that one event and no head; anything
+            # larger is legacy content that must never receive
+            # retroactive anchors by recomputation.
+            if event_count != 1 or meta_row is not None:
+                self._fail_anchor_commit_locked(conn)
+            request_predecessor = _ANCHOR_GENESIS_PREDECESSOR
+            head_predecessor = _ANCHOR_GLOBAL_GENESIS
+            commit_seq = 1
+        else:
+            # An anchored database must be internally whole before it is
+            # extended: one valid head and exactly one anchor per
+            # previously committed event (the pending event accounts
+            # for the +1).
+            if (
+                meta_row is None
+                or not _is_chain_hash(meta_row[0])
+                or event_count != anchor_count + 1
+            ):
+                self._fail_anchor_commit_locked(conn)
+            head_predecessor = meta_row[0]
+            commit_seq = anchor_count + 1
+            try:
+                previous = conn.execute(
+                    "SELECT anchor_hmac FROM audit_anchors "
+                    "WHERE tenant_id = ? AND request_id = ? ORDER BY seq DESC LIMIT 1",
+                    (tenant_id, request_id),
+                ).fetchone()
+            except sqlite3.Error:
+                self._fail_anchor_commit_locked(conn)
+                return
+            if seq == 0:
+                # A genesis event can never extend an existing chain.
+                if previous is not None:
+                    self._fail_anchor_commit_locked(conn)
+                request_predecessor = _ANCHOR_GENESIS_PREDECESSOR
+            else:
+                if previous is None or not _is_chain_hash(previous[0]):
+                    self._fail_anchor_commit_locked(conn)
+                request_predecessor = previous[0]
+
+        anchor = _anchor_mac(
+            secret,
+            tenant_id,
+            request_id,
+            seq,
+            status,
+            occurred_at,
+            event_hash,
+            request_predecessor,
+        )
+        new_head = _anchor_head_mac(
+            secret, head_predecessor, anchor, tenant_id, request_id, seq
+        )
+        try:
+            conn.execute(
+                "INSERT INTO audit_anchors ("
+                "commit_seq, tenant_id, request_id, seq, event_hash, anchor_hmac"
+                ") VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    commit_seq,
+                    tenant_id,
+                    request_id,
+                    seq,
+                    event_hash,
+                    anchor,
+                ),
+            )
+            # Upsert the singleton head in the same transaction.
+            conn.execute(
+                "INSERT INTO audit_anchor_meta (id, head_hmac) VALUES (1, ?) "
+                "ON CONFLICT(id) DO UPDATE SET head_hmac = excluded.head_hmac",
+                (new_head,),
+            )
+        except sqlite3.Error:
+            self._fail_anchor_commit_locked(conn)
+
+    def verify_chain(
+        self,
+        tenant_id: str | None = None,
+        request_id: str | None = None,
+    ) -> bool:
+        """Read-only full-chain verification across restarts.
+
+        With no arguments the whole database is assessed: event order,
+        per-request association with the request row, database link
+        hashes and anchored heads, every external anchor's
+        authentication, the events-to-anchors one-to-one binding and the
+        file-wide global anchor head. With *tenant_id* and *request_id*
+        the same assessment runs (the global head still seals every
+        tenant, so a cross-request or cross-tenant substitution is
+        visible), gated on the request belonging to the tenant exactly
+        like :meth:`audit`.
+
+        Returns ``True`` only when every check passes; deleting,
+        altering, inserting or reordering events, substituting events or
+        anchors across requests or tenants, tampering with a head, a
+        corrupt anchor, an interrupted commit, an un-anchored legacy
+        database and a missing secret on an anchored file all yield
+        ``False``. Recomputing the database events and heads alone can
+        never forge validity: without the external secret the anchors do
+        not authenticate. Verification never writes, repairs,
+        backfills, recomputes or overwrites anything.
+
+        Invalid, unknown or cross-tenant ids raise
+        :class:`RequestNotFound`; an empty/non-string *tenant_id* or a
+        scope supplied as only one of the two coordinates raises
+        :class:`ValueError`. A storage fault is the fixed-text
+        :class:`OSError`.
+        """
+        scope = self._validate_chain_scope(tenant_id, request_id)
+        if self._mem_conn is not None:
+            with self._write_lock:
+                return not self._assess_chain(scope)
+        return not self._assess_chain(scope)
+
+    def verify_audit_chain(
+        self,
+        tenant_id: str | None = None,
+        request_id: str | None = None,
+    ) -> bool:
+        """Alias of :meth:`verify_chain` under the audit vocabulary."""
+        return self.verify_chain(tenant_id, request_id)
+
+    def diagnose_chain(
+        self,
+        tenant_id: str | None = None,
+        request_id: str | None = None,
+    ) -> list[str]:
+        """Report the fixed reason codes that make the chain untrusted.
+
+        Read-only recovery diagnosis: returns an empty list for a
+        trusted chain, otherwise a sorted list of stable, detail-free
+        codes (e.g. ``unanchored_database``, ``anchor_auth_failed``,
+        ``anchor_head_mismatch``). It only ever reports why the
+        persisted evidence cannot be trusted -- it never repairs,
+        backfills, recomputes or overwrites an event, a head or an
+        anchor. The same scoping and error semantics as
+        :meth:`verify_chain` apply.
+        """
+        scope = self._validate_chain_scope(tenant_id, request_id)
+        if self._mem_conn is not None:
+            with self._write_lock:
+                return self._assess_chain(scope)
+        return self._assess_chain(scope)
+
+    def diagnose_audit_chain(
+        self,
+        tenant_id: str | None = None,
+        request_id: str | None = None,
+    ) -> list[str]:
+        """Alias of :meth:`diagnose_chain` under the audit vocabulary."""
+        return self.diagnose_chain(tenant_id, request_id)
+
+    @staticmethod
+    def _validate_chain_scope(
+        tenant_id: str | None, request_id: str | None
+    ) -> tuple[str, str] | None:
+        """Validate an optional (tenant, request) verification scope."""
+        if tenant_id is None and request_id is None:
+            return None
+        if tenant_id is None:
+            # A request coordinate without a tenant is caller error,
+            # never a read.
+            raise ValueError("chain scope requires tenant_id and request_id")
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        # With a tenant supplied, a missing/non-string/malformed request
+        # id collapses to not-found exactly like audit()/evidence().
+        request_id = _require_identifier(request_id)
+        return tenant_id, request_id
+
+    def _assess_chain(self, scope: tuple[str, str] | None) -> list[str]:
+        """Run the read-only whole-file assessment and return reasons."""
+        conn = self._connect()
+        try:
+            try:
+                if scope is not None:
+                    owner = conn.execute(
+                        "SELECT 1 FROM requests WHERE tenant_id = ? AND request_id = ?",
+                        scope,
+                    ).fetchone()
+                    if owner is None:
+                        raise RequestNotFound("request not found")
+                meta_rows = conn.execute(
+                    "SELECT head_hmac FROM audit_anchor_meta"
+                ).fetchall()
+                event_rows = conn.execute(
+                    "SELECT tenant_id, request_id, seq, status, occurred_at, "
+                    "chain_hash FROM status_events "
+                    "ORDER BY tenant_id, request_id, seq"
+                ).fetchall()
+                anchor_rows = conn.execute(
+                    "SELECT commit_seq, tenant_id, request_id, seq, event_hash, "
+                    "anchor_hmac FROM audit_anchors ORDER BY commit_seq"
+                ).fetchall()
+                request_rows = conn.execute(
+                    "SELECT tenant_id, request_id, status, chain_hash FROM requests"
+                ).fetchall()
+            except RequestNotFound:
+                raise
+            except sqlite3.Error:
+                raise _storage_failure() from None
+        finally:
+            self._release(conn)
+        return self._evaluate_chain_rows(
+            tuple(meta_rows),
+            tuple(event_rows),
+            tuple(anchor_rows),
+            tuple(request_rows),
+            self._anchor_secret,
+        )
+
+    @staticmethod
+    def _evaluate_chain_rows(
+        meta_rows: tuple,
+        event_rows: tuple,
+        anchor_rows: tuple,
+        request_rows: tuple,
+        secret: str | None,
+    ) -> list[str]:
+        """Pure, read-only evaluation of the persisted chain state.
+
+        Kept free of any connection so the logic is deterministic and
+        side-effect free: it only compares and recomputes, never writes.
+        """
+        reasons: set[str] = set()
+
+        # -- singleton meta head -------------------------------------
+        stored_head: str | None = None
+        if len(meta_rows) > 1:
+            reasons.add(_ANCHOR_REASON_META_CORRUPT)
+        elif meta_rows:
+            stored_head = meta_rows[0][0]
+            if not _is_chain_hash(stored_head):
+                reasons.add(_ANCHOR_REASON_META_CORRUPT)
+                stored_head = None
+
+        # -- the empty database is vacuously trusted -----------------
+        if not event_rows and not anchor_rows and stored_head is None:
+            return []
+
+        # -- event/anchor population invariants ----------------------
+        # A database with events but no anchor rows is the historical
+        # un-anchored shape: report exactly one reason, rather than a
+        # cascade of consequences of the missing anchors.
+        legacy_unanchored = bool(event_rows) and not anchor_rows
+        if legacy_unanchored:
+            reasons.add(_ANCHOR_REASON_UNANCHORED)
+        if anchor_rows and not event_rows:
+            reasons.add(_ANCHOR_REASON_STATE_SPLIT)
+        if event_rows and anchor_rows and len(event_rows) != len(anchor_rows):
+            reasons.add(_ANCHOR_REASON_STATE_SPLIT)
+        if anchor_rows and stored_head is None:
+            # Sealed anchors without a global head: an interrupted
+            # commit or out-of-band deletion.
+            reasons.add(_ANCHOR_REASON_META_CORRUPT)
+
+        # -- index the rows ------------------------------------------
+        events: dict[tuple[str, str, int], tuple] = {}
+        for row in event_rows:
+            tenant_id, request_id, seq, status, occurred_at, chain_hash = row
+            key = (tenant_id, request_id, seq)
+            if (
+                not isinstance(tenant_id, str)
+                or not tenant_id
+                or not isinstance(request_id, str)
+                or not request_id
+                or not isinstance(seq, int)
+                or isinstance(seq, bool)
+                or not isinstance(status, str)
+                or not status
+                or not isinstance(occurred_at, str)
+                or not occurred_at
+                or not _is_chain_hash(chain_hash)
+            ):
+                reasons.add(_ANCHOR_REASON_CORRUPT_ROW)
+            events[key] = row
+
+        anchors: dict[tuple[str, str, int], tuple] = {}
+        for row in anchor_rows:
+            commit_seq, tenant_id, request_id, seq, event_hash, anchor_hmac = row
+            key = (tenant_id, request_id, seq)
+            if (
+                not isinstance(commit_seq, int)
+                or isinstance(commit_seq, bool)
+                or commit_seq < 1
+                or not isinstance(tenant_id, str)
+                or not tenant_id
+                or not isinstance(request_id, str)
+                or not request_id
+                or not isinstance(seq, int)
+                or isinstance(seq, bool)
+                or not _is_chain_hash(event_hash)
+                or not _is_chain_hash(anchor_hmac)
+            ):
+                reasons.add(_ANCHOR_REASON_CORRUPT_ROW)
+            if key in anchors:
+                reasons.add(_ANCHOR_REASON_CORRUPT_ROW)
+            anchors[key] = row
+
+        # One-to-one keys binding: every event anchored, every anchor an
+        # event, same tenant/request/sequence. A legacy database with no
+        # anchors at all is already reported as a single unanchored
+        # reason and must not cascade into per-event consequences.
+        event_keys = set(events)
+        anchor_keys = set(anchors)
+        if not legacy_unanchored and event_keys - anchor_keys:
+            reasons.add(_ANCHOR_REASON_EVENT_UNANCHORED)
+        if anchor_keys - event_keys:
+            reasons.add(_ANCHOR_REASON_ANCHOR_ORPHAN)
+
+        # -- per-request database chains -----------------------------
+        requests_by_key = {
+            (tenant_id, request_id): (status, chain_hash)
+            for tenant_id, request_id, status, chain_hash in request_rows
+        }
+
+        grouped: dict[tuple[object, object], list[tuple]] = {}
+        for key in event_keys:
+            grouped.setdefault((key[0], key[1]), []).append(events[key])
+
+        for (tenant_id, request_id), rows in grouped.items():
+            # A tampered seq must not raise out of the sort; such a row
+            # is already flagged and sorts deterministically to the front.
+            rows.sort(
+                key=lambda row: (
+                    not isinstance(row[2], int) or isinstance(row[2], bool),
+                    row[2] if isinstance(row[2], int) and not isinstance(row[2], bool) else -1,
+                )
+            )
+            predecessor = _GENESIS_PREDECESSOR
+            anchor_predecessor = _ANCHOR_GENESIS_PREDECESSOR
+            for expected_seq, row in enumerate(rows):
+                _t, _r, seq, status, occurred_at, chain_hash = row
+                well_typed = (
+                    isinstance(tenant_id, str)
+                    and isinstance(request_id, str)
+                    and isinstance(seq, int)
+                    and not isinstance(seq, bool)
+                    and isinstance(status, str)
+                    and isinstance(occurred_at, str)
+                )
+                if not well_typed:
+                    reasons.add(_ANCHOR_REASON_CORRUPT_ROW)
+                if isinstance(seq, int) and not isinstance(seq, bool) and seq != expected_seq:
+                    # Deleted, inserted or renumbered event.
+                    reasons.add(_ANCHOR_REASON_EVENT_ORDER)
+                if well_typed:
+                    recomputed = _chain_hash(
+                        tenant_id,
+                        request_id,
+                        expected_seq,
+                        status,
+                        occurred_at,
+                        predecessor,
+                    )
+                    if not hmac.compare_digest(recomputed, chain_hash):
+                        reasons.add(_ANCHOR_REASON_CHAIN_MISMATCH)
+                predecessor = chain_hash if isinstance(chain_hash, str) else ""
+
+                anchor_row = anchors.get((tenant_id, request_id, expected_seq))
+                if anchor_row is not None:
+                    _cs, at, ar, aseq, event_hash, anchor_hmac = anchor_row
+                    if (at, ar, aseq) != (tenant_id, request_id, expected_seq):
+                        reasons.add(_ANCHOR_REASON_ASSOCIATION)
+                    if event_hash != chain_hash:
+                        # The anchor seals a different event than the one
+                        # persisted here: a cross-request/cross-tenant
+                        # substitution cannot silently rebind.
+                        reasons.add(_ANCHOR_REASON_ASSOCIATION)
+                    if (
+                        secret is not None
+                        and well_typed
+                        and _is_chain_hash(chain_hash)
+                        and _is_chain_hash(anchor_hmac)
+                    ):
+                        expected_anchor = _anchor_mac(
+                            secret,
+                            tenant_id,
+                            request_id,
+                            expected_seq,
+                            status,
+                            occurred_at,
+                            chain_hash,
+                            anchor_predecessor,
+                        )
+                        if not hmac.compare_digest(expected_anchor, anchor_hmac):
+                            reasons.add(_ANCHOR_REASON_AUTH_FAILED)
+                    anchor_predecessor = (
+                        anchor_hmac if isinstance(anchor_hmac, str) else ""
+                    )
+
+            request_row = requests_by_key.get((tenant_id, request_id))
+            if request_row is None:
+                reasons.add(_ANCHOR_REASON_ASSOCIATION)
+            else:
+                current_status, anchored_head = request_row
+                if not _is_chain_hash(anchored_head):
+                    reasons.add(_ANCHOR_REASON_HEAD_MISMATCH)
+                elif not hmac.compare_digest(anchored_head, predecessor):
+                    reasons.add(_ANCHOR_REASON_HEAD_MISMATCH)
+                final_status = rows[-1][3]
+                if (
+                    not isinstance(current_status, str)
+                    or not isinstance(final_status, str)
+                    or current_status != final_status
+                ):
+                    reasons.add(_ANCHOR_REASON_STATUS_MISMATCH)
+
+        # An anchor whose request row does not exist at all.
+        for tenant_id, request_id, _seq in anchor_keys:
+            if (tenant_id, request_id) not in requests_by_key:
+                reasons.add(_ANCHOR_REASON_ASSOCIATION)
+
+        # -- global seal: gap-free commit order and the head ---------
+        if anchor_rows:
+            ordered = sorted(
+                (
+                    row
+                    for row in anchor_rows
+                    if isinstance(row[0], int) and not isinstance(row[0], bool)
+                ),
+                key=lambda row: row[0],
+            )
+            if [row[0] for row in ordered] != list(range(1, len(anchor_rows) + 1)):
+                reasons.add(_ANCHOR_REASON_SEQUENCE_GAP)
+            elif secret is not None and stored_head is not None:
+                head = _ANCHOR_GLOBAL_GENESIS
+                replay_ok = True
+                for row in ordered:
+                    commit_seq, tenant_id, request_id, seq, _event_hash, anchor_hmac = (
+                        row
+                    )
+                    if not (
+                        isinstance(tenant_id, str)
+                        and isinstance(request_id, str)
+                        and isinstance(seq, int)
+                        and not isinstance(seq, bool)
+                        and _is_chain_hash(anchor_hmac)
+                    ):
+                        # A malformed sealing row is already flagged; the
+                        # head cannot authenticate off garbage preimages.
+                        replay_ok = False
+                        break
+                    head = _anchor_head_mac(
+                        secret, head, anchor_hmac, tenant_id, request_id, seq
+                    )
+                if replay_ok and not hmac.compare_digest(head, stored_head):
+                    reasons.add(_ANCHOR_REASON_GLOBAL_HEAD)
+
+        if secret is None and anchor_rows:
+            # An anchored file assessed by a store that holds no secret
+            # cannot be authenticated: never call an unverifiable chain
+            # trusted, however internally consistent it looks.
+            reasons.add(_ANCHOR_REASON_SECRET_MISSING)
+
+        return sorted(reasons)
 
     # -- deletion receipts ---------------------------------------------
 
