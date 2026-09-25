@@ -13,11 +13,13 @@ The service exposes exactly two business endpoints:
   when the request's status subsequently advances.
 
 Status advancement (:meth:`RequestStore.transition`), current-status
-lookup (:meth:`RequestStore.get_status`) and the execution orchestration
+lookup (:meth:`RequestStore.get_status`), the execution orchestration
 (:meth:`RequestStore.claim_next`, :meth:`RequestStore.finish_claim`,
 :meth:`RequestStore.get_execution_log`,
 :meth:`RequestStore.reconcile_execution`,
-:meth:`RequestStore.reconcile_batch`) exist only on the storage layer
+:meth:`RequestStore.reconcile_batch`) and the deletion receipts
+(:meth:`RequestStore.generate_receipt`,
+:meth:`RequestStore.verify_receipt`) exist only on the storage layer
 and are deliberately not exposed over HTTP: this service still opens
 only request acceptance and the acceptance-receipt lookup.
 

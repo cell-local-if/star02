@@ -52,6 +52,28 @@ Execution orchestration lives on the same store, storage-layer only:
   without creating an attempt, receipt or status event, and each item's
   state, attempts, lease, batch row and cursor commit in one transaction.
 
+Deletion receipts close the lifecycle with an externally verifiable
+record, storage-layer only like the rest of the orchestration:
+
+* :meth:`RequestStore.generate_receipt` issues the deletion receipt for
+  a request whose deletion completed and whose execution record has
+  settled (a terminal attempt recorded ``completed``; the earliest
+  completion wins when several terminal attempts exist). The receipt is
+  a single compact JSON line binding the tenant, request id, first
+  acceptance time, final completion time, a scope commitment digest and
+  a completing-attempt digest, plus an authentication tag keyed with a
+  caller-held secret that never enters the database, the receipt, an
+  exception or a log. The first receipt is persisted atomically;
+  regenerating returns the stored bytes unchanged, whatever key is
+  presented, and a corrupt stored record raises the fixed-text
+  :class:`OSError` instead of being repaired or recomputed.
+* :meth:`RequestStore.verify_receipt` authenticates a presented receipt
+  text against the persisted record and the caller's key, returning
+  ``True`` only on a complete match. A well-formed receipt whose fields,
+  tag, times or tenant/request association were replaced returns
+  ``False`` -- the request merely existing never substitutes for the
+  authentication -- and verification never writes or repairs anything.
+
 The lease boundary enforced by :meth:`claim_next` is deliberately
 narrower than "every processing request whose latest timestamp is old":
 a processing request is reclaimable after expiry only when its attempts
@@ -89,6 +111,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import sqlite3
 import struct
@@ -103,6 +126,7 @@ __all__ = [
     "RequestNotFound",
     "InvalidStatusTransition",
     "ClaimConflict",
+    "ReceiptUnavailable",
 ]
 
 _log = logging.getLogger(__name__)
@@ -128,6 +152,17 @@ class ClaimConflict(Exception):
     attempted against a request that no longer holds a live claim. The
     fixed message never identifies which condition applied, so the outcome
     can never be used to probe for requests, workers or claim tokens.
+    """
+
+
+class ReceiptUnavailable(Exception):
+    """Raised when no deletion receipt can be issued for the request.
+
+    The request exists and is visible to the tenant, but its deletion
+    has not completed with a settled execution record: it is still
+    accepted or processing, it failed, or no terminal attempt recorded
+    the completed deletion. The fixed message never identifies which
+    condition applied.
     """
 
 
@@ -239,6 +274,21 @@ CREATE TABLE IF NOT EXISTS reconcile_batch_items (
     request_id  TEXT NOT NULL,
     status      TEXT NOT NULL,
     PRIMARY KEY (batch_id, seq)
+);
+"""
+
+# Issued deletion receipts, at most one per request. ``receipt_json``
+# holds the exact canonical text returned to the first caller (compact
+# JSON plus the trailing newline), so a regeneration, a rebuilt instance
+# or a restarted service always serves byte-identical content without
+# ever recomputing it. Rows are inserted once and never updated or
+# deleted by the store; the caller's authentication key is never stored.
+_RECEIPT_TABLE = """
+CREATE TABLE IF NOT EXISTS deletion_receipts (
+    tenant_id    TEXT NOT NULL,
+    request_id   TEXT NOT NULL,
+    receipt_json TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, request_id)
 );
 """
 
@@ -504,6 +554,136 @@ def _is_chain_hash(value: object) -> bool:
     )
 
 
+# -- deletion receipts -------------------------------------------------
+
+# Fixed, detail-free text for every receipt-availability rejection.
+_RECEIPT_UNAVAILABLE_MESSAGE = "receipt is not available"
+
+# The receipt is a single compact JSON object with exactly these fields
+# in exactly this order, followed by a trailing newline. Every value is
+# a string; the digests and the tag are 64 lowercase hex characters and
+# the timestamps are UTC RFC3339. The object carries only business
+# fields -- never a subject, raw scope, idempotency key, worker,
+# credential, SQL text or path.
+_RECEIPT_FIELDS = (
+    "tenant_id",
+    "request_id",
+    "created_at",
+    "completed_at",
+    "scope_digest",
+    "attempt_digest",
+    "tag",
+)
+# The fields the authentication tag binds (everything but the tag).
+_RECEIPT_TAG_FIELDS = _RECEIPT_FIELDS[:-1]
+
+# Shape of the UTC RFC3339 timestamps the store emits (and accepts back
+# when parsing a presented receipt): seconds precision with an optional
+# fraction and a ``Z`` or numeric offset suffix.
+_RFC3339_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$"
+)
+
+
+def _scope_digest(tenant_id: str, request_id: str, scopes: list[str]) -> str:
+    """Commit to the request's scope set without revealing it.
+
+    The digest binds the tenant, the request and each canonical
+    (sorted) scope with the same length-prefixed encoding as the audit
+    chain, so no concatenation can be re-parsed two ways. The preimage
+    is never persisted on the receipt or returned.
+    """
+    digest = hashlib.sha256()
+    for field in [tenant_id, request_id, *scopes]:
+        encoded = field.encode("utf-8")
+        digest.update(struct.pack(">Q", len(encoded)))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+def _attempt_digest(
+    tenant_id: str,
+    request_id: str,
+    attempt: dict[str, object],
+) -> str:
+    """Commit to the completing execution attempt.
+
+    Binds the tenant, request, attempt number, claim and lease-expiry
+    times, terminal result and completion time. No worker identity or
+    claim token is ever part of the preimage (neither is persisted).
+    """
+    digest = hashlib.sha256()
+    fields = (
+        tenant_id,
+        request_id,
+        str(attempt["attempt_number"]),
+        attempt["claimed_at"],
+        attempt["lease_expires_at"],
+        attempt["result"],
+        attempt["completed_at"],
+    )
+    for field in fields:
+        encoded = str(field).encode("utf-8")
+        digest.update(struct.pack(">Q", len(encoded)))
+        digest.update(encoded)
+    return digest.hexdigest()
+
+
+def _receipt_tag(key: str, fields: dict[str, str]) -> str:
+    """Compute the receipt's authentication tag under the caller's key.
+
+    HMAC-SHA256 over the length-prefixed business fields, keyed with a
+    secret the caller keeps outside the database. The key is used here
+    only: it is never persisted, returned, logged or placed in an
+    exception message.
+    """
+    mac = hmac.new(key.encode("utf-8"), digestmod=hashlib.sha256)
+    for name in _RECEIPT_TAG_FIELDS:
+        encoded = fields[name].encode("utf-8")
+        mac.update(struct.pack(">Q", len(encoded)))
+        mac.update(encoded)
+    return mac.hexdigest()
+
+
+def _render_receipt(fields: dict[str, str]) -> str:
+    """Render the canonical receipt text: compact JSON, fixed field
+    order, exactly one trailing newline."""
+    ordered = {name: fields[name] for name in _RECEIPT_FIELDS}
+    return json.dumps(ordered, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+
+def _parse_receipt_text(text: object) -> dict[str, str]:
+    """Parse and strictly validate a presented receipt text.
+
+    Every malformed value -- non-string, unparsable JSON, a missing or
+    extra field, a non-string value, a malformed timestamp or a digest
+    or tag that is not 64 lowercase hex characters -- raises
+    :class:`ValueError` identically, so the format can never be probed
+    through distinguishable failures.
+    """
+    if not isinstance(text, str) or not text:
+        raise ValueError("receipt must be a non-empty string")
+    try:
+        parsed = json.loads(text)
+    except (ValueError, RecursionError):
+        raise ValueError("receipt is not valid") from None
+    if not isinstance(parsed, dict) or set(parsed) != set(_RECEIPT_FIELDS):
+        raise ValueError("receipt is not valid")
+    fields: dict[str, str] = {}
+    for name in _RECEIPT_FIELDS:
+        value = parsed[name]
+        if not isinstance(value, str) or not value:
+            raise ValueError("receipt is not valid")
+        fields[name] = value
+    for name in ("created_at", "completed_at"):
+        if not _RFC3339_RE.match(fields[name]):
+            raise ValueError("receipt is not valid")
+    for name in ("scope_digest", "attempt_digest", "tag"):
+        if not _is_chain_hash(fields[name]):
+            raise ValueError("receipt is not valid")
+    return fields
+
+
 class RequestStore:
     """Persist and retrieve accepted deletion requests."""
 
@@ -543,6 +723,7 @@ class RequestStore:
                 conn.execute(_CLAIM_CANDIDATE_INDEX)
                 conn.execute(_BATCH_TABLE)
                 conn.execute(_BATCH_ITEM_TABLE)
+                conn.execute(_RECEIPT_TABLE)
                 self._migrate_schema(conn)
             except sqlite3.Error:
                 raise _storage_failure() from None
@@ -2361,3 +2542,329 @@ class RequestStore:
             # Identical outcome for unknown ids and cross-tenant lookups.
             raise RequestNotFound("request not found")
         return row[0], row[1], row[2]
+
+    # -- deletion receipts ---------------------------------------------
+
+    def generate_receipt(
+        self,
+        tenant_id: str,
+        request_id: str,
+        key: str,
+    ) -> str:
+        """Issue the externally verifiable deletion receipt for a request.
+
+        Storage-layer only; never routed over HTTP. The receipt is a
+        single compact JSON line (fixed field order, exactly one
+        trailing newline) binding the tenant, the request id, the first
+        acceptance time, the final completion time, a scope commitment
+        digest and a completing-attempt digest, plus an authentication
+        tag computed under the caller-held *key*. Only a request whose
+        deletion completed with a settled execution record -- the
+        earliest terminal attempt recorded ``completed`` -- can be
+        issued a receipt; an accepted, processing or failed request (or
+        a completed status without a completed terminal attempt) raises
+        :class:`ReceiptUnavailable`.
+
+        The first receipt commits atomically with nothing else changing:
+        no status, attempt, lease or audit record is created or altered.
+        Regenerating returns the stored first receipt byte-for-byte,
+        whichever key is presented, and concurrent generations persist
+        exactly one record. A corrupt stored receipt raises the
+        fixed-text :class:`OSError`; it is never repaired, recomputed or
+        overwritten. The key is never persisted, returned or logged.
+
+        A non-string or empty *tenant_id*, *request_id* or *key* raises
+        :class:`ValueError` without writing; an unknown, cross-tenant or
+        never-accepted *request_id* raises :class:`RequestNotFound`
+        identically.
+        """
+        # Validate everything before touching the database: no rejected
+        # call may perform a write. Unlike the acceptance/status
+        # entries, a malformed request id here is caller error
+        # (ValueError); only a well-formed id that names no visible
+        # request collapses to RequestNotFound.
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        request_id = _require_nonempty_str(request_id, "request_id")
+        key = _require_nonempty_str(key, "key")
+
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                except sqlite3.Error:
+                    raise _storage_failure() from None
+                try:
+                    text = self._generate_receipt_locked(
+                        conn, tenant_id, request_id, key
+                    )
+                    conn.execute("COMMIT")
+                except (RequestNotFound, ReceiptUnavailable):
+                    self._rollback_quietly(conn)
+                    raise
+                except OSError:
+                    self._rollback_quietly(conn)
+                    raise
+                except sqlite3.IntegrityError:
+                    # Defensive: BEGIN IMMEDIATE plus the write lock
+                    # already serialise creators, so the unique key can
+                    # only fire if a concurrently generated receipt
+                    # committed first. Exactly one record may exist, so
+                    # re-read and return that first content rather than
+                    # overwriting it.
+                    self._rollback_quietly(conn)
+                    text = self._reread_receipt(conn, tenant_id, request_id)
+                except sqlite3.Error:
+                    self._rollback_quietly(conn)
+                    raise _storage_failure() from None
+            finally:
+                self._release(conn)
+        _log.info("deletion receipt generated request_id=%s", request_id)
+        return text
+
+    def _reread_receipt(
+        self, conn: sqlite3.Connection, tenant_id: str, request_id: str
+    ) -> str:
+        """Return the persisted receipt after a lost insert race."""
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            stored = self._load_receipt_row_locked(conn, tenant_id, request_id)
+            conn.execute("COMMIT")
+        except OSError:
+            self._rollback_quietly(conn)
+            raise
+        except sqlite3.Error:
+            self._rollback_quietly(conn)
+            raise _storage_failure() from None
+        if stored is None:
+            # The conflicting row vanished: a broken invariant, never a
+            # caller-visible detail.
+            raise _storage_failure()
+        return stored[1]
+
+    def _generate_receipt_locked(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        request_id: str,
+        key: str,
+    ) -> str:
+        """Issue or replay the receipt inside an open write txn."""
+        row = conn.execute(
+            "SELECT status, created_at, scopes_json FROM requests "
+            "WHERE tenant_id = ? AND request_id = ?",
+            (tenant_id, request_id),
+        ).fetchone()
+        if row is None:
+            # Unknown, cross-tenant and never-accepted ids share one
+            # outcome, so the call cannot reveal which records exist.
+            raise RequestNotFound("request not found")
+        status, created_at, scopes_json = row
+
+        stored = self._load_receipt_row_locked(conn, tenant_id, request_id)
+        if stored is not None:
+            # Idempotent replay: the first receipt is returned exactly
+            # as stored, whichever key is presented now. It is never
+            # recomputed, backfilled or overwritten.
+            return stored[1]
+
+        if (
+            status not in _ALLOWED_TRANSITIONS
+            or not isinstance(created_at, str)
+            or not created_at
+        ):
+            # A status outside the lifecycle or a broken acceptance time
+            # is out-of-band corruption, never a receiptable state.
+            raise _storage_failure()
+        if status != _STATUS_COMPLETED:
+            # Accepted, processing and failed requests cannot obtain a
+            # deletion receipt; the fixed message does not say which.
+            raise ReceiptUnavailable(_RECEIPT_UNAVAILABLE_MESSAGE)
+
+        try:
+            scopes = json.loads(scopes_json)
+        except (TypeError, ValueError):
+            raise _storage_failure() from None
+        if (
+            not isinstance(scopes, list)
+            or not scopes
+            or not all(isinstance(item, str) and item for item in scopes)
+        ):
+            raise _storage_failure()
+
+        attempts = self._load_attempts_for_receipt(conn, tenant_id, request_id)
+        terminals = [
+            attempt for attempt in attempts if attempt["result"] is not None
+        ]
+        if not terminals:
+            # A completed status without any settled execution record
+            # (e.g. a bare status-machine transition) has no completed
+            # deletion to attest.
+            raise ReceiptUnavailable(_RECEIPT_UNAVAILABLE_MESSAGE)
+        # The earliest completion wins; later duplicate terminal rows
+        # never alter the receipt's content.
+        earliest = min(
+            terminals,
+            key=lambda attempt: (
+                attempt["completed_at"],  # type: ignore[index]
+                attempt["attempt_number"],
+            ),
+        )
+        if earliest["result"] != _STATUS_COMPLETED:
+            # The settled execution record does not show a completed
+            # deletion, so no deletion receipt may be issued.
+            raise ReceiptUnavailable(_RECEIPT_UNAVAILABLE_MESSAGE)
+
+        fields: dict[str, str] = {
+            "tenant_id": tenant_id,
+            "request_id": request_id,
+            "created_at": created_at,
+            "completed_at": earliest["completed_at"],  # type: ignore[assignment]
+            "scope_digest": _scope_digest(tenant_id, request_id, scopes),
+            "attempt_digest": _attempt_digest(tenant_id, request_id, earliest),
+        }
+        fields["tag"] = _receipt_tag(key, fields)
+        text = _render_receipt(fields)
+        # The receipt row is the only write of this transaction; it
+        # commits atomically and never half-exists.
+        conn.execute(
+            "INSERT INTO deletion_receipts (tenant_id, request_id, receipt_json) "
+            "VALUES (?, ?, ?)",
+            (tenant_id, request_id, text),
+        )
+        return text
+
+    @staticmethod
+    def _load_receipt_row_locked(
+        conn: sqlite3.Connection, tenant_id: str, request_id: str
+    ) -> tuple[dict[str, str], str] | None:
+        """Return ``(fields, text)`` of the persisted receipt, or None.
+
+        The stored text must parse as a well-formed receipt and be
+        exactly the canonical rendering of its fields. Anything else is
+        out-of-band corruption and raises the fixed-text
+        :class:`OSError`; the record is never repaired, recomputed or
+        overwritten on the way out.
+        """
+        row = conn.execute(
+            "SELECT receipt_json FROM deletion_receipts "
+            "WHERE tenant_id = ? AND request_id = ?",
+            (tenant_id, request_id),
+        ).fetchone()
+        if row is None:
+            return None
+        text = row[0]
+        if not isinstance(text, str):
+            raise _storage_failure()
+        try:
+            fields = _parse_receipt_text(text)
+        except ValueError:
+            raise _storage_failure() from None
+        if _render_receipt(fields) != text:
+            # Only the canonical rendering is ever written; a
+            # re-serialised or reordered record was altered out of band.
+            raise _storage_failure()
+        return fields, text
+
+    @staticmethod
+    def _load_attempts_for_receipt(
+        conn: sqlite3.Connection, tenant_id: str, request_id: str
+    ) -> list[dict[str, object]]:
+        """Read and strictly validate every attempt row for a receipt.
+
+        A malformed sequence, timestamp or result/completion pairing is
+        storage corruption and raises the fixed-text :class:`OSError`
+        before any receipt is built from the rows.
+        """
+        rows = conn.execute(
+            "SELECT attempt_number, claimed_at, lease_expires_at, "
+            "result, completed_at FROM claim_attempts "
+            "WHERE tenant_id = ? AND request_id = ? ORDER BY attempt_number",
+            (tenant_id, request_id),
+        ).fetchall()
+        attempts: list[dict[str, object]] = []
+        for index, row in enumerate(rows, start=1):
+            attempt_number, claimed_at, lease_expires_at, result, completed_at = row
+            if (
+                not isinstance(attempt_number, int)
+                or isinstance(attempt_number, bool)
+                or attempt_number != index
+                or not isinstance(claimed_at, str)
+                or not claimed_at
+                or not isinstance(lease_expires_at, str)
+                or not lease_expires_at
+            ):
+                raise _storage_failure()
+            if result is not None and (
+                not isinstance(result, str) or result not in _TERMINAL_RESULTS
+            ):
+                raise _storage_failure()
+            if completed_at is not None and (
+                not isinstance(completed_at, str) or not completed_at
+            ):
+                raise _storage_failure()
+            # Result and completion time are set together and never
+            # separately; a split row is a broken invariant.
+            if (result is None) != (completed_at is None):
+                raise _storage_failure()
+            attempts.append(
+                {
+                    "attempt_number": attempt_number,
+                    "claimed_at": claimed_at,
+                    "lease_expires_at": lease_expires_at,
+                    "result": result,
+                    "completed_at": completed_at,
+                }
+            )
+        return attempts
+
+    def verify_receipt(self, receipt_text: str, key: str) -> bool:
+        """Authenticate a presented deletion receipt text.
+
+        Returns ``True`` only on a complete match: the text is a
+        well-formed receipt, it names a persisted receipt record whose
+        fields it equals exactly, and its authentication tag recomputes
+        under the caller-held *key*. Any replaced field, tag, timestamp
+        or tenant/request association -- and any well-formed text whose
+        tag does not authenticate -- returns ``False``; the named
+        request merely existing never substitutes for the
+        authentication, and a request or receipt that does not exist is
+        simply ``False`` as well.
+
+        A malformed *receipt_text* or a non-string or empty *key* raises
+        :class:`ValueError`; a corrupt persisted receipt record and
+        every storage fault raise the fixed-text :class:`OSError`.
+        Verification never writes, repairs or recomputes persisted data.
+        """
+        # Validate both parameters before touching the database.
+        fields = _parse_receipt_text(receipt_text)
+        key = _require_nonempty_str(key, "key")
+        if self._mem_conn is not None:
+            with self._write_lock:
+                return self._verify_receipt(receipt_text, fields, key)
+        return self._verify_receipt(receipt_text, fields, key)
+
+    def _verify_receipt(
+        self, text: str, fields: dict[str, str], key: str
+    ) -> bool:
+        conn = self._connect()
+        try:
+            try:
+                stored = self._load_receipt_row_locked(
+                    conn, fields["tenant_id"], fields["request_id"]
+                )
+            except sqlite3.Error:
+                raise _storage_failure() from None
+        finally:
+            self._release(conn)
+        if stored is None:
+            return False
+        _stored_fields, stored_text = stored
+        # A complete match: the presented text is byte-for-byte the
+        # persisted first receipt, and its tag authenticates under the
+        # presented key. A re-serialised, reordered or re-spaced copy,
+        # or a copy named after another tenant/request, is False.
+        if not hmac.compare_digest(stored_text, text):
+            return False
+        expected = _receipt_tag(key, fields)
+        return hmac.compare_digest(expected, fields["tag"])
