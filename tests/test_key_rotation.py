@@ -408,6 +408,81 @@ class KeyRotationTests(unittest.TestCase):
             store.generate_receipt("tenant-a", accepted["request_id"], KEY_A)
         self.assertEqual(self._generations(), [])
 
+    def test_old_key_conflict_precedes_availability_for_receiptless(self):
+        # Once a generation exists, a retired or foreign key on ANY
+        # receipt-less request raises ReceiptKeyConflict before the
+        # request's own availability is assessed, and changes nothing.
+        store = self._store()
+        seed = self._completed(store, idem="idem-seed")
+        store.generate_receipt("tenant-a", seed["request_id"], KEY_A)
+        store.rotate_receipt_key("tenant-a", KEY_A, KEY_B)
+
+        # States that need a claim are prepared before any stray
+        # accepted request exists, so claim_next always picks the
+        # intended request.
+        other_completed = self._completed(store, idem="idem-other")
+        processing = store.submit("tenant-a", "subject-p", ["email"], "k-proc")
+        claim = store.claim_next("tenant-a", "worker-1", 60)
+        self.assertEqual(claim["request_id"], processing["request_id"])
+        failed = store.submit("tenant-a", "subject-f", ["email"], "k-fail")
+        claim = store.claim_next("tenant-a", "worker-1", 60)
+        self.assertEqual(claim["request_id"], failed["request_id"])
+        store.finish_claim(
+            "tenant-a", failed["request_id"], claim["claim_token"], "failed"
+        )
+        bare = store.submit("tenant-a", "subject-b", ["email"], "k-bare")
+        store.transition("tenant-a", bare["request_id"], "processing")
+        store.transition("tenant-a", bare["request_id"], "completed")
+        accepted = store.submit("tenant-a", "subject-a", ["email"], "k-acc")
+
+        for key in (KEY_A, "never-registered-foreign-key"):
+            for receipt in (accepted, processing, failed, bare, other_completed):
+                with self.subTest(key=key, request_id=receipt["request_id"]):
+                    with self.assertRaises(ReceiptKeyConflict):
+                        store.generate_receipt(
+                            "tenant-a", receipt["request_id"], key
+                        )
+        # The rejected mints wrote neither receipts nor generations and
+        # left statuses and execution records untouched.
+        with self._raw() as conn:
+            self.assertEqual(
+                conn.execute("SELECT count(*) FROM deletion_receipts").fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                conn.execute("SELECT count(*) FROM receipt_keys").fetchone()[0],
+                2,
+            )
+            statuses = dict(
+                conn.execute(
+                    "SELECT request_id, status FROM requests WHERE tenant_id = ?",
+                    ("tenant-a",),
+                ).fetchall()
+            )
+        self.assertEqual(statuses[accepted["request_id"]], "accepted")
+        self.assertEqual(statuses[processing["request_id"]], "processing")
+        self.assertEqual(statuses[failed["request_id"]], "failed")
+        # The active key still mints the other completed request.
+        new_receipt = store.generate_receipt(
+            "tenant-a", other_completed["request_id"], KEY_B
+        )
+        self.assertTrue(store.verify_receipt(new_receipt, KEY_B))
+        self.assertFalse(store.verify_receipt(new_receipt, KEY_A))
+
+    def test_unknown_request_with_old_key_still_not_found(self):
+        # The request-id boundary stays ahead of the key check: an
+        # unknown or cross-tenant id is RequestNotFound even with a
+        # retired key, so existence is never revealed.
+        store = self._store()
+        seed = self._completed(store, idem="idem-seed")
+        store.generate_receipt("tenant-a", seed["request_id"], KEY_A)
+        store.rotate_receipt_key("tenant-a", KEY_A, KEY_B)
+        with self.assertRaises(RequestNotFound):
+            store.generate_receipt("tenant-a", "does-not-exist", KEY_A)
+        other = self._completed(store, tenant="tenant-b", idem="idem-b")
+        with self.assertRaises(RequestNotFound):
+            store.generate_receipt("tenant-a", other["request_id"], KEY_A)
+
     # -- concurrency -------------------------------------------------------
 
     def test_concurrent_identical_rotation_produces_one_generation(self):

@@ -24,7 +24,8 @@ lookup (:meth:`RequestStore.get_status`), the execution orchestration
 (:meth:`RequestStore.verify_chain`,
 :meth:`RequestStore.diagnose_chain`,
 :meth:`RequestStore.rotate_anchor_key`) and the read-only batched
-audit inspection (:meth:`RequestStore.audit_inspection`) exist only on
+audit inspection (:meth:`RequestStore.audit_inspection` and
+:meth:`RequestStore.audit_inspection_summary`) exist only on
 the storage layer and are deliberately not exposed over HTTP: this
 service still opens only request acceptance and the acceptance-receipt
 lookup.
@@ -176,6 +177,11 @@ class DeferredRequestStore:
         # Read-only batched audit inspection is storage-layer only;
         # never routed over HTTP and never modifies audit evidence.
         return self._ready().audit_inspection(tenant_id, cursor, limit)
+
+    def audit_inspection_summary(self, tenant_id, batch_id):
+        # The read-only inspection summary is storage-layer only; never
+        # routed over HTTP and never writes anything.
+        return self._ready().audit_inspection_summary(tenant_id, batch_id)
 
 
 def _normalize_request_id(value: str) -> str:

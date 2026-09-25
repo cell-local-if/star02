@@ -6,18 +6,24 @@ flag and stable reason codes, tamper detection (event delete/alter/
 insert/reorder, cross-request and cross-tenant substitution, chain
 head, anchor and global head corruption), legacy un-anchored and
 secret-missing databases, historical-secret rotation handling, cursor
-pagination and resume across rebuilds, validation without writes,
-corruption semantics and the strict read-only guarantee for every
-audit, anchor and key record. This entry point is deliberately not
-exposed over HTTP.
+pagination and resume across rebuilds, atomic same-cursor concurrent
+continuation (one winning page, empty-item losers observing the
+winner's committed progress), the read-only audit_inspection_summary
+entry point, validation without writes, corruption semantics and the
+strict read-only guarantee for every audit, anchor and key record.
+These entry points are deliberately not exposed over HTTP.
 """
 
+import json
 import os
 import sqlite3
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 
 from forgetting_evidence.requests import (
+    AuditInspectionNotFound,
     RequestStore,
     _INSPECTION_CURSOR_PREFIX,
     _encode_cursor,
@@ -552,6 +558,365 @@ class InspectionReadOnlyTests(_StoreCase):
         }
         # The tampered evidence is reported, never repaired or recomputed.
         self.assertEqual(before, after)
+
+
+class InspectionConcurrentContinuationTests(_StoreCase):
+    def _continue(self, store, tenant_id, cursor, limit, barrier=None):
+        if barrier is not None:
+            barrier.wait()
+        return store.audit_inspection(tenant_id, cursor=cursor, limit=limit)
+
+    def test_sequential_same_cursor_replay_reports_nothing_twice(self):
+        store = self._store()
+        request_ids = self._submit_many(store, 6)
+        first = store.audit_inspection("tenant-a", limit=2)
+        self.assertEqual(
+            [item["request_id"] for item in first["items"]], request_ids[:2]
+        )
+        # The first presentation of the cursor is the normal resume and
+        # advances the next page.
+        second = store.audit_inspection(
+            "tenant-a", cursor=first["next_cursor"], limit=2
+        )
+        self.assertEqual(
+            [item["request_id"] for item in second["items"]], request_ids[2:4]
+        )
+        # Re-presenting the now-stale first cursor is a pure replay:
+        # empty items at the post-commit progress, nothing re-reported.
+        replay = store.audit_inspection(
+            "tenant-a", cursor=first["next_cursor"], limit=2
+        )
+        self.assertEqual(replay["batch_id"], first["batch_id"])
+        self.assertEqual(replay["items"], [])
+        self.assertEqual(replay["next_cursor"], second["next_cursor"])
+        self.assertIs(replay["finished"], False)
+        with self._raw() as raw:
+            count = raw.execute(
+                "SELECT count(*) FROM inspection_batch_items WHERE batch_id = ?",
+                (first["batch_id"],),
+            ).fetchone()[0]
+        self.assertEqual(count, 4)
+
+    def test_concurrent_same_cursor_has_one_winning_page(self):
+        # Distinct store instances share the file so the database write
+        # lock (not the in-process lock) decides the race.
+        stores = [self._store() for _ in range(8)]
+        request_ids = self._submit_many(stores[0], 5)
+        first = stores[0].audit_inspection("tenant-a", limit=2)
+        self.assertEqual(len(first["items"]), 2)
+        stale_cursor = first["next_cursor"]
+
+        barrier = threading.Barrier(len(stores))
+        with ThreadPoolExecutor(max_workers=len(stores)) as pool:
+            results = list(
+                pool.map(
+                    lambda store: self._continue(
+                        store, "tenant-a", stale_cursor, 2, barrier
+                    ),
+                    stores,
+                )
+            )
+
+        # Exactly one call won the page; every competitor replayed the
+        # winner's committed progress with an empty item list.
+        winning = [result for result in results if result["items"]]
+        losing = [result for result in results if not result["items"]]
+        self.assertEqual(len(winning), 1)
+        self.assertEqual(len(losing), len(stores) - 1)
+        winner = winning[0]
+        self.assertEqual(
+            [item["request_id"] for item in winner["items"]], request_ids[2:4]
+        )
+        for result in results:
+            self.assertEqual(result["batch_id"], first["batch_id"])
+            self.assertEqual(result["next_cursor"], winner["next_cursor"])
+            self.assertIs(result["finished"], False)
+        # The page committed atomically exactly once.
+        with self._raw() as raw:
+            rows = raw.execute(
+                "SELECT seq, request_id FROM inspection_batch_items "
+                "WHERE batch_id = ? ORDER BY seq",
+                (first["batch_id"],),
+            ).fetchall()
+        self.assertEqual([row[0] for row in rows], [1, 2, 3, 4])
+        self.assertEqual([row[1] for row in rows], request_ids[:4])
+
+    def test_concurrent_first_call_creates_independent_batches(self):
+        # No cursor means a fresh batch per call: concurrency must never
+        # merge two sweeps into one batch or duplicate rows within one.
+        stores = [self._store() for _ in range(6)]
+        self._submit_many(stores[0], 3)
+        barrier = threading.Barrier(len(stores))
+
+        def run(store):
+            barrier.wait()
+            return store.audit_inspection("tenant-a", limit=2)
+
+        with ThreadPoolExecutor(max_workers=len(stores)) as pool:
+            results = list(pool.map(run, stores))
+        batch_ids = {result["batch_id"] for result in results}
+        self.assertEqual(len(batch_ids), len(stores))
+        for result in results:
+            self.assertEqual(len(result["items"]), 2)
+        # Every batch owns its own disjoint seq space.
+        with self._raw() as raw:
+            per_batch = raw.execute(
+                "SELECT batch_id, count(*) FROM inspection_batch_items GROUP BY batch_id"
+            ).fetchall()
+        self.assertEqual(sorted(count for _b, count in per_batch), [2] * len(stores))
+
+    def test_concurrent_finished_cursor_replays_empty_with_null_cursor(self):
+        stores = [self._store() for _ in range(6)]
+        self._submit_many(stores[0], 2)
+        first = stores[0].audit_inspection("tenant-a", limit=1)
+        # Drive the batch to its finished state.
+        stores[0].audit_inspection("tenant-a", cursor=first["next_cursor"])
+        barrier = threading.Barrier(len(stores))
+        with ThreadPoolExecutor(max_workers=len(stores)) as pool:
+            results = list(
+                pool.map(
+                    lambda store: self._continue(
+                        store, "tenant-a", first["next_cursor"], 1, barrier
+                    ),
+                    stores,
+                )
+            )
+        for result in results:
+            self.assertEqual(result["items"], [])
+            self.assertIsNone(result["next_cursor"])
+            self.assertIs(result["finished"], True)
+
+    def test_resume_after_concurrent_win_does_not_re_report(self):
+        stores = [self._store() for _ in range(4)]
+        request_ids = self._submit_many(stores[0], 4)
+        first = stores[0].audit_inspection("tenant-a", limit=1)
+        barrier = threading.Barrier(len(stores))
+        with ThreadPoolExecutor(max_workers=len(stores)) as pool:
+            results = list(
+                pool.map(
+                    lambda store: self._continue(
+                        store, "tenant-a", first["next_cursor"], 1, barrier
+                    ),
+                    stores,
+                )
+            )
+        winner = next(result for result in results if result["items"])
+        losers = [result for result in results if not result["items"]]
+        self.assertTrue(losers)
+        # A sequential resume from the winner's cursor continues after
+        # the winner's page and never repeats a settled request.
+        tail = stores[0].audit_inspection("tenant-a", cursor=winner["next_cursor"])
+        reported = [
+            item["request_id"]
+            for item in first["items"] + winner["items"] + tail["items"]
+        ]
+        self.assertEqual(reported, request_ids)
+        self.assertIs(tail["finished"], True)
+        self.assertIsNone(tail["next_cursor"])
+
+    def test_concurrent_continuation_never_touches_business_records(self):
+        stores = [self._store() for _ in range(6)]
+        request_ids = self._submit_many(stores[0], 3)
+        stores[0].transition("tenant-a", request_ids[0], "processing")
+        tables = (
+            "requests",
+            "status_events",
+            "audit_anchors",
+            "audit_anchor_meta",
+            "anchor_key_generations",
+            "claim_attempts",
+            "claim_tokens",
+            "deletion_receipts",
+            "receipt_keys",
+        )
+        before = {table: self._table_dump(table) for table in tables}
+        first = stores[0].audit_inspection("tenant-a", limit=1)
+        barrier = threading.Barrier(len(stores))
+        with ThreadPoolExecutor(max_workers=len(stores)) as pool:
+            list(
+                pool.map(
+                    lambda store: self._continue(
+                        store, "tenant-a", first["next_cursor"], 1, barrier
+                    ),
+                    stores,
+                )
+            )
+        after = {table: self._table_dump(table) for table in tables}
+        self.assertEqual(before, after)
+
+
+class InspectionSummaryTests(_StoreCase):
+    def _summary(self, store, tenant_id, batch_id):
+        return store.audit_inspection_summary(tenant_id, batch_id)
+
+    def _parse(self, text):
+        self.assertTrue(text.endswith("\n"))
+        self.assertFalse(text.endswith("\n\n"))
+        # Compact JSON: no whitespace outside strings, fields in order.
+        self.assertNotIn(" ", text)
+        parsed = json.loads(text)
+        self.assertEqual(
+            list(parsed),
+            ["batch_id", "scanned", "verified", "unverified", "next_cursor", "finished"],
+        )
+        return parsed
+
+    def test_summary_of_finished_batch(self):
+        store = self._store()
+        request_ids = self._submit_many(store, 3)
+        result = store.audit_inspection("tenant-a")
+        text = self._summary(store, "tenant-a", result["batch_id"])
+        parsed = self._parse(text)
+        self.assertEqual(parsed["batch_id"], result["batch_id"])
+        self.assertEqual(parsed["scanned"], 3)
+        self.assertEqual(parsed["verified"], 3)
+        self.assertEqual(parsed["unverified"], 0)
+        self.assertIsNone(parsed["next_cursor"])
+        self.assertIs(parsed["finished"], True)
+        self.assertEqual(len(request_ids), parsed["scanned"])
+        for name in ("scanned", "verified", "unverified"):
+            self.assertIsInstance(parsed[name], int)
+            self.assertGreaterEqual(parsed[name], 0)
+        self.assertEqual(parsed["scanned"], parsed["verified"] + parsed["unverified"])
+
+    def test_summary_of_partial_batch_carries_resumable_cursor(self):
+        store = self._store()
+        self._submit_many(store, 4)
+        result = store.audit_inspection("tenant-a", limit=3)
+        text = self._summary(store, "tenant-a", result["batch_id"])
+        parsed = self._parse(text)
+        self.assertEqual(parsed["scanned"], 3)
+        self.assertIs(parsed["finished"], False)
+        self.assertEqual(parsed["next_cursor"], result["next_cursor"])
+        # The summary's cursor resumes the batch.
+        tail = store.audit_inspection("tenant-a", cursor=parsed["next_cursor"])
+        self.assertEqual(len(tail["items"]), 1)
+        self.assertIs(tail["finished"], True)
+
+    def test_summary_counts_unverified_items(self):
+        store = self._store()
+        request_ids = self._submit_many(store, 3)
+        with self._raw() as raw:
+            raw.execute(
+                "UPDATE status_events SET status = 'failed' "
+                "WHERE request_id = ? AND seq = 0",
+                (request_ids[0],),
+            )
+        result = store.audit_inspection("tenant-a")
+        parsed = self._parse(
+            self._summary(store, "tenant-a", result["batch_id"])
+        )
+        self.assertEqual(parsed["scanned"], 3)
+        self.assertEqual(parsed["verified"], 2)
+        self.assertEqual(parsed["unverified"], 1)
+
+    def test_summary_of_brand_new_empty_batch(self):
+        store = self._store()
+        result = store.audit_inspection("tenant-a")
+        parsed = self._parse(
+            self._summary(store, "tenant-a", result["batch_id"])
+        )
+        self.assertEqual(parsed["scanned"], 0)
+        self.assertEqual(parsed["verified"], 0)
+        self.assertEqual(parsed["unverified"], 0)
+        self.assertIsNone(parsed["next_cursor"])
+        self.assertIs(parsed["finished"], True)
+
+    def test_summary_is_strictly_read_only(self):
+        store = self._store(secret="secret-1")
+        request_ids = self._submit_many(store, 3)
+        store.transition("tenant-a", request_ids[0], "processing")
+        store.rotate_anchor_key("secret-1", "secret-2")
+        result = store.audit_inspection("tenant-a", limit=2)
+        tables = (
+            "requests",
+            "status_events",
+            "audit_anchors",
+            "audit_anchor_meta",
+            "anchor_key_generations",
+            "claim_attempts",
+            "claim_tokens",
+            "deletion_receipts",
+            "receipt_keys",
+            "inspection_batches",
+            "inspection_batch_items",
+        )
+        before = {table: self._table_dump(table) for table in tables}
+        self._summary(store, "tenant-a", result["batch_id"])
+        # Repeated reads do not advance anything either.
+        self._summary(store, "tenant-a", result["batch_id"])
+        after = {table: self._table_dump(table) for table in tables}
+        self.assertEqual(before, after)
+        # The batch is still mid-sweep, exactly as the summary reported.
+        unchanged = store.audit_inspection(
+            "tenant-a", cursor=result["next_cursor"]
+        )
+        self.assertEqual(len(unchanged["items"]), 1)
+
+    def test_summary_invalid_arguments_raise_value_error_without_writing(self):
+        store = self._store()
+        result = store.audit_inspection("tenant-a")
+
+        def batch_count():
+            with self._raw() as raw:
+                return raw.execute("SELECT count(*) FROM inspection_batches").fetchone()[0]
+
+        before = batch_count()
+        for bad_tenant in ("", None, 5, True, ["tenant-a"]):
+            with self.assertRaises(ValueError):
+                store.audit_inspection_summary(bad_tenant, result["batch_id"])
+        for bad_batch in ("", None, 7, False, {"id": "x"}):
+            with self.assertRaises(ValueError):
+                store.audit_inspection_summary("tenant-a", bad_batch)
+        self.assertEqual(batch_count(), before)
+
+    def test_summary_missing_batch_raises_not_found(self):
+        store = self._store()
+        self._submit_many(store, 1)
+        with self.assertRaises(AuditInspectionNotFound):
+            self._summary(store, "tenant-a", "no-such-batch")
+
+    def test_summary_cross_tenant_batch_raises_not_found(self):
+        store = self._store()
+        self._submit_many(store, 1, tenant="tenant-a")
+        result = store.audit_inspection("tenant-a")
+        with self.assertRaises(AuditInspectionNotFound):
+            self._summary(store, "tenant-b", result["batch_id"])
+
+    def test_summary_corrupt_bookkeeping_raises_storage_error(self):
+        store = self._store()
+        self._submit_many(store, 2)
+        result = store.audit_inspection("tenant-a", limit=1)
+        with self._raw() as raw:
+            raw.execute(
+                "UPDATE inspection_batch_items SET verified = 9 WHERE batch_id = ?",
+                (result["batch_id"],),
+            )
+        with self.assertRaises(OSError) as caught:
+            self._summary(store, "tenant-a", result["batch_id"])
+        self.assertEqual(str(caught.exception), "request store is unavailable")
+
+    def test_summary_missing_table_raises_storage_error(self):
+        store = self._store()
+        result = store.audit_inspection("tenant-a")
+        with self._raw() as raw:
+            raw.execute("DROP TABLE inspection_batches")
+        with self.assertRaises(OSError) as caught:
+            self._summary(store, "tenant-a", result["batch_id"])
+        self.assertEqual(str(caught.exception), "request store is unavailable")
+
+    def test_summary_accepts_batch_id_not_cursor(self):
+        # The raw batch id works; an encoded cursor is not a batch id and
+        # is simply a missing batch, never decoded.
+        store = self._store()
+        self._submit_many(store, 2)
+        result = store.audit_inspection("tenant-a", limit=1)
+        parsed = self._parse(
+            self._summary(store, "tenant-a", result["batch_id"])
+        )
+        self.assertTrue(parsed["next_cursor"])
+        with self.assertRaises(AuditInspectionNotFound):
+            self._summary(store, "tenant-a", result["next_cursor"])
 
 
 if __name__ == "__main__":

@@ -173,7 +173,28 @@ seal (meta head, secret generations, commit order and the replayed
 global head). The sweep is strictly read-only for every audit, anchor
 and key record -- it never repairs, backfills, recomputes or
 overwrites them; only the inspection bookkeeping tables are written,
-each item and the cursor position committing in one transaction.
+and the whole page -- batch resolution or creation, every item, the
+cursor position and the possible finish marker -- commits in one
+transaction. Concurrent continuations naming the same tenant, batch
+and cursor are therefore atomic: the winning call advances exactly
+one page and reports its items with the post-commit progress, while
+the competing call writes nothing, returns the same shape with an
+empty item list and the winner's committed position, and a finished
+cursor stays null for every caller.
+
+:meth:`RequestStore.audit_inspection_summary` is the read-only
+companion entry point, storage-layer only like the sweep itself. It
+takes just a tenant and a batch identifier and returns one compact
+JSON line (exactly one trailing newline) holding, in order,
+``batch_id``, ``scanned``, ``verified``, ``unverified``,
+``next_cursor`` and ``finished`` -- counts only (``scanned`` is the
+sum of the other two), no per-item results, and never a float, a
+negative zero or a non-finite value. It never advances a cursor,
+creates a batch, repairs evidence or writes any business or audit
+record; a missing or cross-tenant batch raises
+:class:`AuditInspectionNotFound`, invalid arguments raise
+:class:`ValueError`, and corrupt bookkeeping or any storage fault is
+the fixed-text :class:`OSError`, never a fabricated summary.
 
 Caller errors are always :class:`ValueError` (invalid parameters) or the
 module's own domain exceptions; every database failure -- an unwritable
@@ -209,6 +230,7 @@ __all__ = [
     "ReceiptUnavailable",
     "ReceiptKeyConflict",
     "AnchorKeyConflict",
+    "AuditInspectionNotFound",
 ]
 
 _log = logging.getLogger(__name__)
@@ -266,6 +288,15 @@ class AnchorKeyConflict(Exception):
     only the first transaction promotes the new generation, and the
     loser observes this single, detail-free outcome so the active
     generation can never be probed through distinguishable failures.
+    """
+
+
+class AuditInspectionNotFound(Exception):
+    """Raised when no inspection batch visible to the tenant matches.
+
+    A summary is requested for a batch id that is missing or owned by
+    another tenant; both share one detail-free outcome, so the
+    read-only summary can never reveal another tenant's batches.
     """
 
 
@@ -2943,9 +2974,19 @@ class RequestStore:
         record: it never repairs, backfills, recomputes or overwrites
         them. Only the inspection bookkeeping tables are written -- the
         batch row, one item row per scanned request and the cursor
-        position, each item committing in its own transaction together
-        with the position advance, so a failed call never returns
-        half-settled results and a committed item is never re-reported.
+        position -- and the whole page (batch creation/resolution, every
+        item and the position advance or end marker) commits in one
+        transaction, so a failed call never returns half-settled results
+        and a committed item is never re-reported.
+
+        Concurrent continuations naming the same tenant, batch and
+        cursor are atomic: the first transaction to run advances the
+        batch by exactly this call's page and returns its items with
+        the post-commit progress, while the competing call changes
+        nothing and returns the same shape with an empty item list and
+        the winner's post-commit progress. Sequential retries of an
+        already-continued cursor are identical replays: empty items,
+        durable progress, no re-reporting.
 
         A non-string/empty *tenant_id*, a limit outside 1..1000 (or a
         non-integer or boolean), and any malformed, unknown or
@@ -2966,52 +3007,28 @@ class RequestStore:
         with self._write_lock:
             conn = self._connect()
             try:
-                # First transaction resolves the batch: a fresh batch row
-                # is inserted when no cursor was given; a cursor names the
-                # persisted batch to resume. An unknown/cross-tenant cursor
-                # is rejected here before anything is written.
-                batch_id, _pos, _rid, finished, _start_count = (
+                # The whole continuation is one atomic write transaction.
+                # BEGIN IMMEDIATE serialises same-batch continuations, in
+                # this process through the write lock and across processes
+                # sharing the file through the database write lock: the
+                # winning transaction advances the entire page (batch row,
+                # item rows and cursor position committing together), and
+                # a competing transaction only ever reads the winner's
+                # committed position.
+                batch_id, items, finished, durable_count = (
                     self._batch_transaction(
                         conn,
-                        lambda: self._load_or_init_inspection_locked(
-                            conn, tenant_id, cursor_batch
+                        lambda: self._continue_inspection_locked(
+                            conn, tenant_id, cursor_batch, limit
                         ),
                     )
-                )
-                items: list[dict[str, object]] = []
-                # Each scanned request is assessed and recorded in its OWN
-                # transaction: the item row and the cursor position commit
-                # together. The next iteration re-reads the persisted
-                # position, so an item already settled by an earlier commit
-                # or a concurrent call is never re-reported.
-                while not finished and len(items) < limit:
-                    kind, payload = self._batch_transaction(
-                        conn,
-                        lambda: self._process_one_inspection_item_locked(
-                            conn, tenant_id, batch_id
-                        ),
-                    )
-                    if kind == "finished":
-                        finished = True
-                        break
-                    items.append(payload)
-                # Resolve the authoritative outcome in one final short
-                # transaction: whether the sweep is finished AND the durable
-                # settled-item count are both read from the database rather
-                # than from this call's in-memory tally, so the issued
-                # cursor names a position that matches what is durably
-                # committed (another store instance may share the file).
-                finished, durable_count = self._batch_transaction(
-                    conn,
-                    lambda: self._finalize_inspection_if_end_locked(
-                        conn, tenant_id, batch_id
-                    ),
                 )
             finally:
                 self._release(conn)
-        # The cursor only identifies the persisted batch; its item count is
-        # the database-authoritative settled count read in the final
-        # transaction.
+        # The cursor only identifies the persisted batch; its item count
+        # is the database-authoritative settled count read in the same
+        # transaction, so the cursor returned to a winner and to a
+        # competing loser names the same durable position.
         next_cursor = (
             None
             if finished
@@ -3031,21 +3048,35 @@ class RequestStore:
             "items": items,
         }
 
-    def _load_or_init_inspection_locked(
+    def _continue_inspection_locked(
         self,
         conn: sqlite3.Connection,
         tenant_id: str,
         cursor_batch: tuple[str, int] | None,
-    ) -> tuple[str, str | None, str | None, bool, int]:
-        """Resolve the inspection batch for this call in an open write txn.
+        limit: int,
+    ) -> tuple[str, list[dict[str, object]], bool, int]:
+        """Advance (or observe) one inspection page in the open write txn.
 
-        Returns ``(batch_id, position_created_at, position_request_id,
-        finished, item_count)``. Without a cursor a fresh batch row is
-        inserted; with a cursor the persisted batch is resumed from its
-        committed position -- the cursor's own position field is only a
-        format detail, the database is authoritative. An unknown or
-        cross-tenant batch id is an invalid cursor and raises
-        :class:`ValueError`; corrupt persisted state raises the
+        Returns ``(batch_id, items, finished, item_count)``. Without a
+        cursor a fresh batch row is inserted and the sweep starts before
+        the first row; with a cursor the named batch is resumed from its
+        durably committed position -- the cursor's own position field is
+        only an envelope detail, the database is authoritative.
+
+        When the durable item count is already ahead of the position the
+        presented cursor was issued at, a concurrent (or retried)
+        continuation committed first: nothing is scanned or written and
+        the winner's post-commit progress is returned with an empty item
+        list, so a settled item is never re-reported. Otherwise up to
+        ``limit`` candidates after the durable position are assessed in
+        stable scan order; the item rows, the cursor position and the
+        possible end-of-sweep marker all commit with the batch row in
+        the caller's single transaction. Only the inspection
+        bookkeeping tables are touched -- never a request, status
+        event, attempt, lease, receipt, anchor or key record.
+
+        An unknown or cross-tenant batch id is an invalid cursor and
+        raises :class:`ValueError`; corrupt persisted state raises the
         fixed-text :class:`OSError`.
         """
         if cursor_batch is None:
@@ -3057,21 +3088,82 @@ class RequestStore:
                 ") VALUES (?, ?, NULL, NULL, 0)",
                 (batch_id, tenant_id),
             )
-            return batch_id, None, None, False, 0
-        batch_id, _issued_position = cursor_batch
-        # Confirm ownership before reading state: an unknown or
-        # cross-tenant batch id is an invalid cursor, indistinguishable
-        # from one that never existed.
-        owner = conn.execute(
-            "SELECT 1 FROM inspection_batches WHERE batch_id = ? AND tenant_id = ?",
-            (batch_id, tenant_id),
-        ).fetchone()
-        if owner is None:
-            raise ValueError("cursor is not valid")
+            issued_position = 0
+        else:
+            batch_id, issued_position = cursor_batch
+            # Confirm ownership before reading state: an unknown or
+            # cross-tenant batch id is an invalid cursor, indistinguishable
+            # from one that never existed.
+            owner = conn.execute(
+                "SELECT 1 FROM inspection_batches WHERE batch_id = ? AND tenant_id = ?",
+                (batch_id, tenant_id),
+            ).fetchone()
+            if owner is None:
+                raise ValueError("cursor is not valid")
+
         pos_created, pos_rid, finished, item_count = (
             self._read_inspection_state_locked(conn, batch_id)
         )
-        return batch_id, pos_created, pos_rid, finished, item_count
+        if item_count > issued_position:
+            # A concurrent same-cursor continuation (or a sequential
+            # replay) already advanced the batch past this cursor's
+            # issued position: observe the committed progress, report
+            # nothing twice and write nothing.
+            return batch_id, [], finished, item_count
+
+        items: list[dict[str, object]] = []
+        # Assess up to ``limit`` rows strictly after the durable
+        # position. Each item row, the position advance and the possible
+        # finish marker land in this one transaction, so the page either
+        # commits whole or rolls back whole.
+        while not finished and len(items) < limit:
+            row = self._next_inspection_candidate(
+                conn, tenant_id, pos_created, pos_rid
+            )
+            if row is None:
+                self._finish_inspection_locked(conn, batch_id)
+                finished = True
+                break
+            request_id, created_at = row
+            item = self._inspect_request_locked(conn, tenant_id, request_id)
+            # The sequence derives from the durable count plus this
+            # page's offset, so a resumed batch never reuses a number.
+            conn.execute(
+                "INSERT INTO inspection_batch_items ("
+                "batch_id, seq, request_id, verified, reason"
+                ") VALUES (?, ?, ?, ?, ?)",
+                (
+                    batch_id,
+                    item_count + 1 + len(items),
+                    request_id,
+                    1 if item["verified"] else 0,
+                    item["reason"],
+                ),
+            )
+            pos_created, pos_rid = created_at, request_id
+            items.append(item)
+        if items:
+            self._advance_inspection_locked(
+                conn, batch_id, pos_created, pos_rid
+            )
+        if not finished:
+            # A limit-stopped page may also have consumed the last
+            # candidate: finish the batch in this same transaction when
+            # nothing remains after the new position.
+            if (
+                self._next_inspection_candidate(
+                    conn, tenant_id, pos_created, pos_rid
+                )
+                is None
+            ):
+                self._finish_inspection_locked(conn, batch_id)
+                finished = True
+        # Re-read the authoritative end flag and count inside the same
+        # transaction rather than trusting the in-memory tally.
+        _pos_created, _pos_rid, finished, final_count = (
+            self._read_inspection_state_locked(conn, batch_id)
+        )
+        return batch_id, items, finished, final_count
 
     def _read_inspection_state_locked(
         self, conn: sqlite3.Connection, batch_id: str
@@ -3107,75 +3199,115 @@ class RequestStore:
             raise _storage_failure()
         return pos_created, pos_rid, bool(finished), item_count
 
-    def _process_one_inspection_item_locked(
+    def audit_inspection_summary(
         self,
-        conn: sqlite3.Connection,
         tenant_id: str,
         batch_id: str,
-    ) -> tuple[str, object]:
-        """Inspect the next request in scan order inside an open write txn.
+    ) -> str:
+        """Return a compact, read-only summary of an inspection batch.
 
-        Re-reads the batch's persisted position every call, so the
-        result is independent of any in-memory position. Returns
-        ``("finished", None)`` once the sweep end is reached, or
-        ``("item", {"request_id", "verified", "reason"})`` after
-        assessing one request and recording its item. The request's
-        audit evidence is only read: the assessment never repairs,
-        backfills, recomputes or overwrites any audit, anchor or key
-        record -- the item row and the batch position are the only
-        writes, and they commit together.
+        Storage-layer only; never routed over HTTP. The caller supplies
+        only the tenant and the batch identifier issued by
+        :meth:`audit_inspection` (not a cursor). The summary never
+        advances a cursor, never creates a batch, never repairs
+        evidence and never writes any business or audit record -- it is
+        a pure read of the existing inspection bookkeeping.
+
+        The result is one compact JSON object with exactly one trailing
+        newline and exactly these fields in order: ``batch_id``,
+        ``scanned``, ``verified``, ``unverified``, ``next_cursor`` and
+        ``finished``. The three counts are non-negative integers with
+        ``scanned`` equal to ``verified`` plus ``unverified``; the
+        batch id and cursor are strings or null and ``finished`` is a
+        boolean -- the text never contains a float, a negative zero or
+        a non-finite number. ``next_cursor`` is null exactly when the
+        batch has finished; otherwise it is the cursor that resumes the
+        batch from its committed position. No per-item results are
+        included.
+
+        An empty or non-string *tenant_id* or *batch_id* raises
+        :class:`ValueError` without touching storage; a batch that is
+        missing or owned by another tenant raises
+        :class:`AuditInspectionNotFound` with one detail-free outcome,
+        so another tenant's batches can never be probed. A storage
+        outage, corrupt inspection bookkeeping or a read failure
+        raises the fixed-text :class:`OSError` instead of a fabricated
+        summary.
         """
-        pos_created, pos_rid, finished, item_count = (
-            self._read_inspection_state_locked(conn, batch_id)
-        )
-        if finished:
-            return "finished", None
-        row = self._next_inspection_candidate(conn, tenant_id, pos_created, pos_rid)
-        if row is None:
-            self._finish_inspection_locked(conn, batch_id)
-            return "finished", None
-        request_id, created_at = row
-        item = self._inspect_request_locked(conn, tenant_id, request_id)
-        # The item row and the cursor position land in this one
-        # transaction; the sequence derives from the persisted count so
-        # a resumed batch never reuses a number.
-        conn.execute(
-            "INSERT INTO inspection_batch_items ("
-            "batch_id, seq, request_id, verified, reason"
-            ") VALUES (?, ?, ?, ?, ?)",
-            (
-                batch_id,
-                item_count + 1,
-                request_id,
-                1 if item["verified"] else 0,
-                item["reason"],
-            ),
-        )
-        self._advance_inspection_locked(conn, batch_id, created_at, request_id)
-        return "item", item
+        # Validate before touching the database: a rejected call never
+        # reads or writes anything.
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        batch_id = _require_nonempty_str(batch_id, "batch_id")
+        if self._mem_conn is not None:
+            with self._write_lock:
+                return self._audit_inspection_summary(tenant_id, batch_id)
+        return self._audit_inspection_summary(tenant_id, batch_id)
 
-    def _finalize_inspection_if_end_locked(
-        self,
-        conn: sqlite3.Connection,
-        tenant_id: str,
-        batch_id: str,
-    ) -> tuple[bool, int]:
-        """Finish a limit-stopped inspection iff no candidate remains.
+    def _audit_inspection_summary(self, tenant_id: str, batch_id: str) -> str:
+        conn = self._connect()
+        try:
+            try:
+                # Resolve ownership first: a missing batch and another
+                # tenant's batch share one indistinguishable outcome.
+                owner = conn.execute(
+                    "SELECT 1 FROM inspection_batches "
+                    "WHERE batch_id = ? AND tenant_id = ?",
+                    (batch_id, tenant_id),
+                ).fetchone()
+                if owner is None:
+                    raise AuditInspectionNotFound("audit inspection batch not found")
+                _pos_created, _pos_rid, finished, scanned = (
+                    self._read_inspection_state_locked(conn, batch_id)
+                )
+                flags = conn.execute(
+                    "SELECT verified FROM inspection_batch_items "
+                    "WHERE batch_id = ?",
+                    (batch_id,),
+                ).fetchall()
+            except AuditInspectionNotFound:
+                raise
+            except sqlite3.Error:
+                raise _storage_failure() from None
+        finally:
+            self._release(conn)
 
-        Always returns the authoritative ``(finished, item_count)`` read
-        from the persisted batch inside this write transaction, so the
-        caller can issue a cursor whose position matches the durable
-        tally rather than its own per-call snapshot.
-        """
-        pos_created, pos_rid, finished, item_count = (
-            self._read_inspection_state_locked(conn, batch_id)
+        # Every persisted item flag must be the 0/1 the sweep writes;
+        # anything else is bookkeeping corruption, never a count to
+        # divide silently.
+        verified = 0
+        for (flag,) in flags:
+            if not isinstance(flag, int) or isinstance(flag, bool) or flag not in (0, 1):
+                raise _storage_failure()
+            verified += flag
+        unverified = len(flags) - verified
+        # The item table and the batch row's own position are committed
+        # together; a split tally is out-of-band damage.
+        if unverified < 0 or scanned != len(flags) or scanned != verified + unverified:
+            raise _storage_failure()
+
+        next_cursor = (
+            None
+            if finished
+            else _encode_cursor(batch_id, scanned, _INSPECTION_CURSOR_PREFIX)
         )
-        if finished:
-            return True, item_count
-        if self._next_inspection_candidate(conn, tenant_id, pos_created, pos_rid) is None:
-            self._finish_inspection_locked(conn, batch_id)
-            return True, item_count
-        return False, item_count
+        summary = {
+            "batch_id": batch_id,
+            "scanned": scanned,
+            "verified": verified,
+            "unverified": unverified,
+            "next_cursor": next_cursor,
+            "finished": finished,
+        }
+        text = json.dumps(summary, ensure_ascii=False, separators=(",", ":")) + "\n"
+        # Log only counts and the stable outcome: no tenant, batch id,
+        # credential or SQL text ever reaches the log.
+        _log.info(
+            "audit inspection summary read scanned=%s verified=%s finished=%s",
+            scanned,
+            verified,
+            finished,
+        )
+        return text
 
     @staticmethod
     def _next_inspection_candidate(
@@ -5072,11 +5204,18 @@ class RequestStore:
 
         The receipt is always tagged with the tenant's current active
         receipt key: the first generation registers the presented key
-        as generation 1, and after a rotation a retired key is rejected
-        with :class:`ReceiptKeyConflict` -- an old key can never mint a
-        new receipt. Existing receipts are unaffected: regeneration
-        still replays the stored first bytes, and an old receipt still
-        verifies under the key generation that signed it.
+        as generation 1 (in the same transaction as the receipt row),
+        and once a generation exists a retired or foreign key is
+        rejected with :class:`ReceiptKeyConflict` for *any*
+        receipt-less request -- before the request's own availability
+        is assessed -- so an old key can never mint a new receipt, and
+        the key state can never be probed through a different
+        availability outcome. Existing receipts are unaffected:
+        regeneration still replays the stored first bytes, and an old
+        receipt still verifies under the key generation that signed
+        it. With no generation registered yet the first-receipt
+        availability rules still apply and the generation-1 bootstrap
+        commits only with the receipt row.
         """
         # Validate everything before touching the database: no rejected
         # call may perform a write. The request id follows the same
@@ -5193,6 +5332,19 @@ class RequestStore:
             # A status outside the lifecycle or a broken acceptance time
             # is out-of-band corruption, never a receiptable state.
             raise _storage_failure()
+
+        # Admit the minting key BEFORE inspecting the request's state:
+        # once a tenant has registered a receipt key, a retired or
+        # foreign key on any receipt-less request -- accepted,
+        # processing, failed or unknown to the execution ledger -- is
+        # the single detail-free ReceiptKeyConflict, whatever the
+        # request state, and writes nothing. With no generation yet the
+        # presented key is a potential generation-1 bootstrap; the
+        # bootstrap row is only inserted below, in the same transaction
+        # as the receipt, so an unavailable request never registers a
+        # key on a rolled-back mint.
+        needs_bootstrap = self._admit_minting_key_locked(conn, tenant_id, key)
+
         if status != _STATUS_COMPLETED:
             # Accepted, processing and failed requests cannot obtain a
             # deletion receipt; the fixed message does not say which.
@@ -5240,15 +5392,15 @@ class RequestStore:
             "scope_digest": _scope_digest(tenant_id, request_id, scopes),
             "attempt_digest": _attempt_digest(tenant_id, request_id, earliest),
         }
-        # Mint only under the tenant's current active key. The first
-        # receipt a tenant ever issues registers its presented key as
-        # generation 1 in the same transaction as the receipt row, so
-        # the two can never disagree (and a rollback never leaves a
-        # key generation without the receipt that introduced it).
-        # After a rotation the active key is the only key allowed to
-        # sign a new receipt: a retired key reaching this mint path
-        # without a stored receipt is rejected without writing.
-        self._require_active_or_bootstrap_key_locked(conn, tenant_id, key)
+        # The first receipt a tenant ever issues registers its presented
+        # key as generation 1 in the same transaction as the receipt row,
+        # so the two can never disagree (and a rollback never leaves a
+        # key generation without the receipt that introduced it). After
+        # a rotation the active key is the only key allowed to sign a new
+        # receipt: a retired or foreign key reaches here only when no
+        # generation exists yet.
+        if needs_bootstrap:
+            self._bootstrap_receipt_key_locked(conn, tenant_id, key)
         fields["tag"] = _receipt_tag(key, fields)
         text = _render_receipt(fields)
         # The receipt row is the only write of this transaction; it
@@ -5379,21 +5531,23 @@ class RequestStore:
             generations.append((generation, fingerprint, effective_at))
         return generations
 
-    def _require_active_or_bootstrap_key_locked(
+    def _admit_minting_key_locked(
         self,
         conn: sqlite3.Connection,
         tenant_id: str,
         key: str,
-    ) -> None:
-        """Admit *key* as the minting key inside an open write txn.
+    ) -> bool:
+        """Decide whether *key* may mint inside an open write txn.
 
-        A tenant's first ever receipt bootstraps generation 1 with the
-        presented key, inserted in the same transaction as the receipt
-        row. Afterwards only the current active generation may sign a
-        new receipt: a retired or never-registered key reaches the mint
-        path without a stored receipt and gets the single, detail-free
+        Read-only: returns ``True`` when the tenant has no registered
+        generation yet (the presented key would bootstrap generation
+        1, inserted later in the mint's own transaction) and ``False``
+        when it matches the current active generation's fingerprint.
+        A retired or never-registered key presented while generations
+        exist gets the single, detail-free
         :class:`ReceiptKeyConflict`, so which fingerprints exist can
-        never be probed through distinct failures.
+        never be probed through distinct failures, and no rejected
+        decision writes anything.
 
         The full generation set is validated (gap-free generations with
         well-formed fingerprints and times) before the active row is
@@ -5402,18 +5556,32 @@ class RequestStore:
         a forged active row.
         """
         generations = self._load_key_generations_locked(conn, tenant_id)
-        fingerprint = _key_fingerprint(key)
         if not generations:
-            conn.execute(
-                "INSERT INTO receipt_keys ("
-                "tenant_id, generation, key_fingerprint, effective_at"
-                ") VALUES (?, 1, ?, ?)",
-                (tenant_id, fingerprint, _utc_now_rfc3339()),
-            )
-            return
+            return True
         active_fingerprint = generations[-1][1]
-        if not hmac.compare_digest(active_fingerprint, fingerprint):
+        if not hmac.compare_digest(active_fingerprint, _key_fingerprint(key)):
             raise ReceiptKeyConflict(_RECEIPT_KEY_CONFLICT_MESSAGE)
+        return False
+
+    @staticmethod
+    def _bootstrap_receipt_key_locked(
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        key: str,
+    ) -> None:
+        """Register generation 1 with *key* inside the mint transaction.
+
+        The bootstrap row is inserted in the same transaction as the
+        receipt row, so a mint that rolls back can never leave a key
+        generation behind. Only invoked once the request has proved
+        receiptable.
+        """
+        conn.execute(
+            "INSERT INTO receipt_keys ("
+            "tenant_id, generation, key_fingerprint, effective_at"
+            ") VALUES (?, 1, ?, ?)",
+            (tenant_id, _key_fingerprint(key), _utc_now_rfc3339()),
+        )
 
     def rotate_receipt_key(
         self,
