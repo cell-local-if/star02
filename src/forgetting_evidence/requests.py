@@ -49,8 +49,11 @@ Execution orchestration lives on the same store, storage-layer only:
   persistent batch whose cursor position survives restarts; the same
   cursor resumes that batch from its committed position and keeps its
   batch identifier. ``accepted`` requests are skipped on the first scan
-  without creating an attempt, receipt or status event, and each item's
-  state, attempts, lease, batch row and cursor commit in one transaction.
+  without creating an attempt, receipt or status event; every other
+  request -- processing or terminal -- is reconciled and reported, so a
+  repeated sweep still observes the retained terminal states. Each
+  item's state, attempts, lease, batch row and cursor commit in one
+  transaction.
 
 The lease boundary enforced by :meth:`claim_next` is deliberately
 narrower than "every processing request whose latest timestamp is old":
@@ -1821,7 +1824,10 @@ class RequestStore:
         without creating an attempt, receipt or extra status event;
         a ``processing`` request with a live lease stays processing; a
         ``processing`` request whose lease expired (or that has no
-        explainable lease) is compensated to ``failed``. Every item's
+        explainable lease) is compensated to ``failed``; a terminal
+        request is an idempotent no-op reported with its retained first
+        terminal status, so a later sweep still observes every request's
+        final state. Every item's
         status change, attempt rows, lease release, batch bookkeeping
         and cursor position commit in one transaction, so a failed call
         leaves no half-settled item and a committed item is never
@@ -2094,10 +2100,15 @@ class RequestStore:
         pos_created: str | None,
         pos_rid: str | None,
     ) -> tuple[str, str, str] | None:
-        """Oldest non-terminal request strictly after the keyset position.
+        """Oldest request of the tenant strictly after the keyset position.
 
-        Only ``accepted`` and ``processing`` rows are swept; terminal
-        requests are already converged and never need a batch item. The
+        Every row is swept in stable (created_at, request_id) order:
+        ``accepted`` rows are skipped by the caller (position advances,
+        no item), while ``processing`` and terminal rows are reconciled
+        and reported. Terminal requests are already converged, so their
+        reconcile is an idempotent no-op that simply reports the retained
+        first terminal status; excluding them would let a later sweep
+        skip requests whose final state was never reported. The
         (created_at, request_id) ordering matches the claim candidate
         index, so the scan is stable across calls, restarts and
         concurrent submissions.
@@ -2105,16 +2116,16 @@ class RequestStore:
         if pos_created is None:
             return conn.execute(
                 "SELECT request_id, created_at, status FROM requests "
-                "WHERE tenant_id = ? AND status IN (?, ?) "
+                "WHERE tenant_id = ? "
                 "ORDER BY created_at ASC, request_id ASC LIMIT 1",
-                (tenant_id, _STATUS_ACCEPTED, _STATUS_PROCESSING),
+                (tenant_id,),
             ).fetchone()
         return conn.execute(
             "SELECT request_id, created_at, status FROM requests "
-            "WHERE tenant_id = ? AND status IN (?, ?) "
+            "WHERE tenant_id = ? "
             "AND (created_at, request_id) > (?, ?) "
             "ORDER BY created_at ASC, request_id ASC LIMIT 1",
-            (tenant_id, _STATUS_ACCEPTED, _STATUS_PROCESSING, pos_created, pos_rid),
+            (tenant_id, pos_created, pos_rid),
         ).fetchone()
 
     @staticmethod

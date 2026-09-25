@@ -197,7 +197,7 @@ class BatchConvergenceTests(_StoreCase):
             ["accepted", "processing", "failed"],
         )
 
-    def test_terminal_requests_are_excluded_from_the_sweep(self):
+    def test_terminal_requests_are_reported_without_state_change(self):
         store = self._store()
         completed = self._submit(store, key="k1")["request_id"]
         failed = self._submit(store, key="k2")["request_id"]
@@ -205,13 +205,41 @@ class BatchConvergenceTests(_StoreCase):
             claim = store.claim_next("tenant-a", "w", 3600)
             self.assertEqual(claim["request_id"], rid)
             store.finish_claim("tenant-a", rid, claim["claim_token"], result)
+        timelines_before = {
+            rid: store.audit("tenant-a", rid) for rid in (completed, failed)
+        }
+        logs_before = {
+            rid: store.get_execution_log("tenant-a", rid)
+            for rid in (completed, failed)
+        }
         batch = store.reconcile_batch("tenant-a")
-        self.assertEqual(batch["items"], [])
+        # Terminal requests are swept and reported with their retained
+        # first terminal status; reconciling them is an idempotent no-op.
+        self.assertEqual(
+            batch["items"],
+            [
+                {"request_id": completed, "status": "completed"},
+                {"request_id": failed, "status": "failed"},
+            ],
+        )
         self.assertIs(batch["finished"], True)
+        # Nothing about the requests, their attempts or their timelines
+        # changed, and no new attempt, token or event was created.
+        for rid in (completed, failed):
+            self.assertEqual(store.audit("tenant-a", rid), timelines_before[rid])
+            self.assertEqual(
+                store.get_execution_log("tenant-a", rid), logs_before[rid]
+            )
+            self.assertTrue(store.verify_evidence("tenant-a", rid))
         with sqlite3.connect(self.db_path) as raw:
             self.assertEqual(
-                raw.execute("SELECT count(*) FROM reconcile_batch_items").fetchone()[0],
-                0,
+                raw.execute("SELECT count(*) FROM claim_tokens").fetchone()[0], 0
+            )
+            self.assertEqual(
+                raw.execute(
+                    "SELECT count(*) FROM reconcile_batch_items"
+                ).fetchone()[0],
+                2,
             )
 
     def test_mixed_batches_follow_reconcile_rules_in_stable_order(self):
@@ -229,13 +257,15 @@ class BatchConvergenceTests(_StoreCase):
         store.transition("tenant-a", ids[5], "processing")
         _wait_for_expiry()
         result = store.reconcile_batch("tenant-a")
-        # Terminal ids[2] excluded; accepted ids[3]/ids[4] skipped. The
-        # reconcilable items come back in the stable scan order.
+        # Accepted ids[3]/ids[4] are skipped; terminal ids[2] is reported
+        # with its retained status. The items come back in the stable
+        # scan order.
         self.assertEqual(
             result["items"],
             [
                 {"request_id": ids[0], "status": "processing"},
                 {"request_id": ids[1], "status": "failed"},
+                {"request_id": ids[2], "status": "completed"},
                 {"request_id": ids[5], "status": "failed"},
             ],
         )
@@ -387,12 +417,28 @@ class BatchResumeIdempotencyTests(_StoreCase):
         self._expire(store, 2)
         first = store.reconcile_batch("tenant-a")
         self.assertEqual(len(first["items"]), 2)
-        # A fresh call (no cursor) starts a new batch; nothing is left to
-        # converge, so it returns no items but a distinct batch id.
+        # A fresh call (no cursor) starts a new batch with a distinct
+        # batch id; it re-observes the converged requests and reports
+        # their retained terminal status without changing any state.
         second = store.reconcile_batch("tenant-a")
         self.assertNotEqual(second["batch_id"], first["batch_id"])
-        self.assertEqual(second["items"], [])
+        self.assertEqual(
+            second["items"],
+            [
+                {"request_id": ids[0], "status": "failed"},
+                {"request_id": ids[1], "status": "failed"},
+            ],
+        )
         self.assertIs(second["finished"], True)
+        for rid in ids:
+            self.assertEqual(
+                [e["status"] for e in store.audit("tenant-a", rid)],
+                ["accepted", "processing", "failed"],
+            )
+            self.assertEqual(
+                [a["result"] for a in store.get_execution_log("tenant-a", rid)],
+                ["failed"],
+            )
 
     def test_batches_are_partitioned_per_tenant(self):
         store = self._store()
