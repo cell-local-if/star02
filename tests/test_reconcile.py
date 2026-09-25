@@ -139,6 +139,44 @@ class ReconcileLiveLeaseTests(_StoreCase):
             "failed",
         )
 
+    def test_live_successor_lease_keeps_processing_with_abandoned_prior_attempt(self):
+        # An expired first lease was superseded by a fresh live one. The
+        # abandoned first attempt is still open, but as long as the latest
+        # lease is valid the request must stay processing: reconcile writes
+        # no terminal, compensates neither attempt, mints no third attempt
+        # and leaves the current credential usable.
+        store = self._store()
+        receipt = self._submit(store)
+        store.claim_next("tenant-a", "worker-1", 1)
+        _wait_for_expiry()
+        current = store.claim_next("tenant-a", "worker-2", 3600)
+        self.assertIsNotNone(current)
+        for _ in range(2):
+            record = store.reconcile_execution(
+                "tenant-a", receipt["request_id"]
+            )
+            self.assertEqual(record["request_id"], receipt["request_id"])
+            self.assertEqual(record["status"], "processing")
+            self.assertEqual(record["created_at"], receipt["created_at"])
+        log = store.get_execution_log("tenant-a", receipt["request_id"])
+        self.assertEqual(
+            [(a["attempt_number"], a["result"], a["completed_at"]) for a in log],
+            [(1, None, None), (2, None, None)],
+        )
+        self.assertEqual(
+            [e["status"] for e in store.audit("tenant-a", receipt["request_id"])],
+            ["accepted", "processing"],
+        )
+        # No successor attempt is generated and the live credential works.
+        self.assertIsNone(store.claim_next("tenant-a", "worker-3", 3600))
+        self.assertEqual(len(store.get_execution_log("tenant-a", receipt["request_id"])), 2)
+        self.assertEqual(
+            store.finish_claim(
+                "tenant-a", receipt["request_id"], current["claim_token"], "completed"
+            )["status"],
+            "completed",
+        )
+
 
 class ReconcileCompensationTests(_StoreCase):
     def test_expired_open_attempt_is_compensated_to_failed_atomically(self):

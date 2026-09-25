@@ -15,6 +15,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 
@@ -683,6 +684,92 @@ class BatchConcurrencyTests(_StoreCase):
             )
         for rid in ids:
             self.assertTrue(store.verify_evidence("tenant-a", rid))
+
+    def test_concurrent_resume_cursor_reports_durable_settled_count(self):
+        # Two independent store instances share the file but hold separate
+        # in-process write locks (the cross-process deployment shape); only
+        # SQLite serializes their per-item transactions. When both resume
+        # the same cursor and each settle two disjoint items, every returned
+        # cursor must name the database-authoritative settled count, never a
+        # per-call snapshot that lags behind committed items.
+        first_store = self._store()
+        self._submit_many(first_store, 8)
+        self._expire(first_store, 8)
+        first = first_store.reconcile_batch("tenant-a", limit=2)
+        _bid, start_n = _decode_cursor(first["next_cursor"])
+        self.assertEqual(start_n, 2)
+
+        store_a = self._store()
+        store_b = self._store()
+        after_first = threading.Barrier(2)
+        after_second = threading.Barrier(2)
+        settled = {"a": 0, "b": 0}
+        original = RequestStore._batch_transaction
+
+        def patched(self, conn, action):
+            result = original(self, conn, action)
+            tag = "a" if self is store_a else "b" if self is store_b else None
+            if tag is not None and isinstance(result, tuple) and result[0] == "item":
+                settled[tag] += 1
+                if settled[tag] == 1:
+                    after_first.wait(timeout=10)
+                elif settled[tag] == 2:
+                    after_second.wait(timeout=10)
+            return result
+
+        pages = {}
+
+        def run(store, tag):
+            pages[tag] = store.reconcile_batch(
+                "tenant-a", first["next_cursor"], limit=2
+            )
+
+        RequestStore._batch_transaction = patched
+        try:
+            threads = [
+                threading.Thread(target=run, args=(store_a, "a")),
+                threading.Thread(target=run, args=(store_b, "b")),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        finally:
+            RequestStore._batch_transaction = original
+
+        with sqlite3.connect(self.db_path) as raw:
+            durable = raw.execute(
+                "SELECT count(*) FROM reconcile_batch_items"
+            ).fetchone()[0]
+            finished_flag = raw.execute(
+                "SELECT finished FROM reconcile_batches"
+            ).fetchone()[0]
+        # Each call settled two disjoint items; six are durably committed
+        # and two candidates remain, so the batch is still resumable.
+        self.assertEqual(durable, 6)
+        self.assertEqual(finished_flag, 0)
+        for tag in ("a", "b"):
+            page = pages[tag]
+            self.assertEqual(page["batch_id"], first["batch_id"])
+            self.assertEqual(len(page["items"]), 2)
+            self.assertIs(page["finished"], False)
+            self.assertIsNotNone(page["next_cursor"])
+            # The cursor must report the durable count (6), not a stale
+            # start+this-call value (4).
+            self.assertEqual(_decode_cursor(page["next_cursor"]), (first["batch_id"], 6))
+        # Resuming from either authoritative cursor settles the final two
+        # exactly once and finishes the batch.
+        resumed = first_store.reconcile_batch(
+            "tenant-a", pages["a"]["next_cursor"], limit=10
+        )
+        self.assertEqual(len(resumed["items"]), 2)
+        self.assertIs(resumed["finished"], True)
+        self.assertIsNone(resumed["next_cursor"])
+        with sqlite3.connect(self.db_path) as raw:
+            self.assertEqual(
+                raw.execute("SELECT count(*) FROM reconcile_batch_items").fetchone()[0],
+                8,
+            )
 
 
 class BatchNoLeakTests(_StoreCase):

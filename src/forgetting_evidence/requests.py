@@ -1850,7 +1850,7 @@ class RequestStore:
                 # is inserted when no cursor was given; a cursor names the
                 # persisted batch to resume. An unknown/cross-tenant cursor
                 # is rejected here before anything is written.
-                batch_id, _pos, _rid, finished, start_count = (
+                batch_id, _pos, _rid, finished, _start_count = (
                     self._batch_transaction(
                         conn,
                         lambda: self._load_or_init_batch_locked(
@@ -1878,22 +1878,29 @@ class RequestStore:
                     if kind == "item":
                         items.append(payload)
                     # "accepted" only advanced the position and is skipped.
-                if not finished:
-                    # The limit stopped the loop: finish the batch only if
-                    # nothing reconcilable remains beyond the committed
-                    # position, otherwise leave it resumable.
-                    finished = self._batch_transaction(
-                        conn,
-                        lambda: self._finalize_batch_if_end_locked(
-                            conn, tenant_id, batch_id
-                        ),
-                    )
+                # Resolve the authoritative outcome in one final short
+                # transaction: whether the sweep is finished AND the durable
+                # settled-item count are both read from the database rather
+                # than from this call's in-memory tally. A file database may
+                # be shared by other RequestStore instances/processes whose
+                # per-item transactions commit disjoint items for the same
+                # resumable batch; the cursor's position must name that
+                # durable count, never a stale "start + this call's items"
+                # snapshot that lags behind what is already settled.
+                finished, durable_count = self._batch_transaction(
+                    conn,
+                    lambda: self._finalize_batch_if_end_locked(
+                        conn, tenant_id, batch_id
+                    ),
+                )
             finally:
                 self._release(conn)
-        # The write lock serializes batch writers, so the batch's item
-        # count grows only via the items this call committed.
+        # The cursor only identifies the persisted batch; its item count is
+        # the database-authoritative settled count read in the final
+        # transaction, so a cursor returned to any concurrent caller reports
+        # a position that matches what is durably committed.
         next_cursor = (
-            None if finished else _encode_cursor(batch_id, start_count + len(items))
+            None if finished else _encode_cursor(batch_id, durable_count)
         )
         # Log only counts and the stable outcome: no tenant, subject,
         # worker, credential or SQL text ever reaches the log.
@@ -1999,17 +2006,25 @@ class RequestStore:
         conn: sqlite3.Connection,
         tenant_id: str,
         batch_id: str,
-    ) -> bool:
-        """Mark a limit-stopped batch finished iff no candidate remains."""
-        pos_created, pos_rid, finished, _count = self._read_batch_state_locked(
-            conn, batch_id
+    ) -> tuple[bool, int]:
+        """Finish a limit-stopped batch iff no candidate remains.
+
+        Always returns the authoritative ``(finished, item_count)`` read
+        from the persisted batch inside this write transaction. The count
+        reflects every settled item -- including items committed for the
+        same batch by another store instance/process -- so the caller can
+        issue a cursor whose position matches the durable tally rather
+        than its own per-call snapshot.
+        """
+        pos_created, pos_rid, finished, item_count = (
+            self._read_batch_state_locked(conn, batch_id)
         )
         if finished:
-            return True
+            return True, item_count
         if self._next_batch_candidate(conn, tenant_id, pos_created, pos_rid) is None:
             self._finish_batch_locked(conn, batch_id)
-            return True
-        return False
+            return True, item_count
+        return False, item_count
 
     def _read_batch_state_locked(
         self, conn: sqlite3.Connection, batch_id: str
