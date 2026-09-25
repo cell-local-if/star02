@@ -20,9 +20,12 @@ lookup (:meth:`RequestStore.get_status`), the execution orchestration
 :meth:`RequestStore.reconcile_batch`) and the deletion receipts
 (:meth:`RequestStore.generate_receipt`,
 :meth:`RequestStore.verify_receipt`,
-:meth:`RequestStore.rotate_receipt_key`) exist only on the storage
-layer and are deliberately not exposed over HTTP: this service still
-opens only request acceptance and the acceptance-receipt lookup.
+:meth:`RequestStore.rotate_receipt_key`) and the anchored full-chain
+checks (:meth:`RequestStore.verify_evidence`,
+:meth:`RequestStore.verify_chain`,
+:meth:`RequestStore.diagnose_chain`) exist only on the storage layer
+and are deliberately not exposed over HTTP: this service still opens
+only request acceptance and the acceptance-receipt lookup.
 
 Success responses are a single line of JSON with exactly
 ``request_id``, ``status`` and ``created_at`` (in that order) followed by
@@ -156,6 +159,16 @@ class DeferredRequestStore:
         # Batched, resumable reconciliation is storage-layer only; like the
         # rest of the execution orchestration it is never routed over HTTP.
         return self._ready().reconcile_batch(tenant_id, cursor, limit)
+
+    def verify_chain(self, tenant_id, request_id):
+        # Full-chain verification is storage-layer only; like the rest of
+        # the audit capability it is never routed over HTTP.
+        return self._ready().verify_chain(tenant_id, request_id)
+
+    def diagnose_chain(self, tenant_id, request_id):
+        # Read-only recovery diagnosis is storage-layer only; it never
+        # routes over HTTP and never repairs or backfills evidence.
+        return self._ready().diagnose_chain(tenant_id, request_id)
 
 
 def _normalize_request_id(value: str) -> str:

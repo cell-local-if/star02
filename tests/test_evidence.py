@@ -501,13 +501,25 @@ class LegacySchemaMigrationTests(unittest.TestCase):
         self.assertEqual(ev["status"], "processing")
         self.assertEqual(ev["event_count"], 2)
         self.assertTrue(HEX64.match(ev["chain_hash"]))
-        self.assertTrue(store.verify_evidence("tenant-a", "rid-1"))
-        # The upgraded chain remains valid after a rebuild and accepts
-        # further transitions that extend the same chain.
+        # The legacy chain hashes are backfilled, but a database written
+        # before external trust anchors existed has no anchors and must
+        # not verify as a fully trusted chain.
+        self.assertFalse(store.verify_evidence("tenant-a", "rid-1"))
+        self.assertEqual(
+            store.diagnose_chain("tenant-a", "rid-1"),
+            {"trusted": False, "reason": "anchors_missing"},
+        )
+        # The upgrade survives a rebuild and accepts further transitions
+        # (which are anchored); the pre-anchor history still cannot be
+        # judged fully trusted and is never silently re-anchored.
         rebuilt = RequestStore(self.db_path)
-        self.assertTrue(rebuilt.verify_evidence("tenant-a", "rid-1"))
+        self.assertFalse(rebuilt.verify_evidence("tenant-a", "rid-1"))
         rebuilt.transition("tenant-a", "rid-1", "completed")
-        self.assertTrue(rebuilt.verify_evidence("tenant-a", "rid-1"))
+        self.assertFalse(rebuilt.verify_evidence("tenant-a", "rid-1"))
+        self.assertEqual(
+            rebuilt.diagnose_chain("tenant-a", "rid-1")["reason"],
+            "anchor_event_mismatch",
+        )
         self.assertEqual(
             rebuilt.evidence("tenant-a", "rid-1")["event_count"], 3
         )

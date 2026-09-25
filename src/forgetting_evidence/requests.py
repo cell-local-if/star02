@@ -110,6 +110,42 @@ event is also stored on the request row, so deleting, modifying,
 inserting or reordering persisted events breaks verification. The hash
 preimage is never exposed in return values, exceptions or logs.
 
+A hash chain whose every value lives in the same database still trusts
+the database: an attacker who can rewrite the rows can recompute every
+link and the head from the stored, public event content and present a
+self-consistent forgery. Each event therefore also carries an
+``anchor_hash`` -- an independent, append-only cross-restart trust
+anchor computed under an anchor key that never enters the database, a
+receipt, a return value, an exception or a log. The anchor binds the
+anchor sequence (a per-store gap-free total order), the event's own
+chain link and the preceding anchor, so the anchors form a second
+chain an in-database rewrite cannot regenerate. The anchor key is
+supplied to the constructor as raw bytes/string or read from a
+sidecar key file next to the database (generated on first open with
+owner-only permissions); it lives outside the database file by
+construction, and a database copied without that key can verify its
+ordinary event links but never its anchors. Anchors are written in the
+very same transaction as the request row (acceptance) or the status
+change, attempt row and lease they accompany: a commit never lands
+ordered events, the request head and the external anchor separately,
+and a failed commit raises :class:`OSError` without leaving a record
+that could be judged complete.
+
+Full-chain verification (:meth:`RequestStore.verify_evidence`) is read
+only and checks, together, the ordered event timeline (gap-free from
+zero), the request association, the request-row head and current
+status, every event anchor against the externally held anchor key and
+the unbroken anchor sequence -- including after a rebuild on a fresh
+process. Deleting, altering, inserting, reordering or substituting
+events across requests or tenants fails, and so does a chain an
+attacker recomputed together with replaced heads and anchors: without
+the external anchor key the replacement anchors cannot authenticate.
+A database written before anchors existed, a damaged anchor or head, a
+head that disagrees with the anchored event, or an interrupted commit
+all verify ``False``. :meth:`RequestStore.diagnose_chain` reports only
+the fixed, detail-free reason such a chain is untrusted; it never
+repairs, backfills, recomputes or overwrites any evidence.
+
 Caller errors are always :class:`ValueError` (invalid parameters) or the
 module's own domain exceptions; every database failure -- an unwritable
 path, an uncreatable or corrupt file, an I/O or read/write error -- is
@@ -131,6 +167,7 @@ import secrets
 import sqlite3
 import struct
 import threading
+import time
 import uuid
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
@@ -349,6 +386,53 @@ CREATE TABLE IF NOT EXISTS receipt_keys (
 _RECEIPT_KEY_FINGERPRINT_INDEX = """
 CREATE UNIQUE INDEX IF NOT EXISTS idx_receipt_keys_tenant_fingerprint
     ON receipt_keys(tenant_id, key_fingerprint);
+"""
+
+# Cross-restart trust anchors, one row per anchored event. ``anchor_seq``
+# is a per-store, gap-free total order assigned from the anchor head row
+# inside the same transaction that lands the event, so the anchors form
+# their own append-only chain across requests and tenants. The event's
+# own chain link is carried redundantly as ``event_hash`` so an anchor
+# row is self-describing. ``anchor_hash`` is an HMAC-SHA256 over the
+# anchor sequence, the event's chain link and the previous anchor hash,
+# keyed with the externally held anchor key -- never with anything
+# stored in this database -- so an attacker who can rewrite every public
+# row still cannot mint a replacement anchor that verifies. Rows are
+# inserted once and never updated or deleted by the store; the key
+# material itself is never persisted here.
+_ANCHOR_TABLE = """
+CREATE TABLE IF NOT EXISTS chain_anchors (
+    anchor_seq   INTEGER NOT NULL PRIMARY KEY,
+    tenant_id    TEXT NOT NULL,
+    request_id   TEXT NOT NULL,
+    event_seq    INTEGER NOT NULL,
+    event_hash   TEXT NOT NULL,
+    anchor_hash  TEXT NOT NULL
+);
+"""
+
+# Lookup of every anchor for one request timeline, in event order.
+_ANCHOR_EVENT_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_chain_anchors_event
+    ON chain_anchors(tenant_id, request_id, event_seq);
+"""
+
+# The anchor head: a single row holding the sequence number and hash of
+# the latest anchor. It is created lazily (create-if-absent) inside the
+# first anchored write's transaction -- the store never writes at open
+# time -- and read and advanced inside the same transaction as every
+# later event and anchor row, so a crash can never leave an anchor
+# written without its head (or vice versa). A database written before
+# anchors existed has no head row and no anchor rows; historical events
+# are never re-anchored (that would be a backfill over evidence), so a
+# pre-anchor database honestly verifies untrusted instead of being
+# silently re-anchored.
+_ANCHOR_HEAD_TABLE = """
+CREATE TABLE IF NOT EXISTS chain_anchor_head (
+    id           INTEGER NOT NULL PRIMARY KEY CHECK (id = 1),
+    anchor_seq   INTEGER NOT NULL,
+    anchor_hash  TEXT NOT NULL
+);
 """
 
 # Column probes used to upgrade database files created before chain
@@ -613,6 +697,215 @@ def _is_chain_hash(value: object) -> bool:
     )
 
 
+# -- cross-restart trust anchors ---------------------------------------
+
+# Fixed, domain-separated predecessor of the first anchor. It is derived
+# from a constant rather than from anything in the database, so a forged
+# genesis anchor cannot be made to chain onto a conveniently chosen
+# predecessor the database itself contains.
+_ANCHOR_GENESIS_HASH = hashlib.sha256(
+    b"forgetting-evidence/trust-anchor/genesis/v1"
+).hexdigest()
+
+# The externally held anchor key lives in a sidecar file next to the
+# database, never inside the database. Random material generated by the
+# store is always this many bytes; a caller-supplied key may be any
+# non-empty string/byte string.
+_ANCHOR_KEY_BYTES = 32
+_ANCHOR_KEY_SUFFIX = ".anchor-key"
+
+# Fixed, detail-free reason codes reported by diagnose_chain(). They name
+# only *which structural check* failed -- never a value, a key, a tenant,
+# a SQL statement or a path -- so the report cannot aid a forgery.
+_DIAG_EVENT_CHAIN = "event_chain_invalid"
+_DIAG_HEAD = "request_head_mismatch"
+_DIAG_MISSING_ANCHORS = "anchors_missing"
+_DIAG_ANCHOR_COUNT = "anchor_event_mismatch"
+_DIAG_ANCHOR_SEQUENCE = "anchor_sequence_broken"
+_DIAG_ANCHOR_HEAD = "anchor_head_mismatch"
+_DIAG_ANCHOR_MAC = "anchor_authentication_failed"
+
+
+def _anchor_mac(
+    key: bytes,
+    anchor_seq: int,
+    tenant_id: str,
+    request_id: str,
+    event_seq: int,
+    event_hash: str,
+    predecessor: str,
+) -> str:
+    """Authenticate one trust anchor under the external anchor key.
+
+    HMAC-SHA256 over length-prefixed fields: the store-wide anchor
+    sequence, the owning tenant and request, the per-request event
+    sequence, the event's own chain link and the preceding anchor hash.
+    The key is held outside the database and never persisted with the
+    data it authenticates, so the anchors cannot be regenerated from
+    anything an in-database attacker can read or rewrite.
+    """
+    mac = hmac.new(key, digestmod=hashlib.sha256)
+    for field in (
+        str(anchor_seq),
+        tenant_id,
+        request_id,
+        str(event_seq),
+        event_hash,
+        predecessor,
+    ):
+        encoded = field.encode("utf-8")
+        mac.update(struct.pack(">Q", len(encoded)))
+        mac.update(encoded)
+    return mac.hexdigest()
+
+
+def _anchor_sidecar_path(db_path: str) -> str:
+    """Return the external anchor-key path for a file database path."""
+    return os.path.join(
+        os.path.dirname(os.path.abspath(db_path)),
+        "." + os.path.basename(db_path) + _ANCHOR_KEY_SUFFIX,
+    )
+
+
+def _write_anchor_key_file(path: str, material: bytes) -> None:
+    """Create the anchor-key sidecar exclusively, with owner-only mode.
+
+    A single ``O_CREAT|O_EXCL`` open is the atomic create-if-absent: it
+    fails with :class:`FileExistsError` when another creator won, and it
+    never truncates an existing key. The brief window in which the file
+    exists but is not yet fully written is covered by the bounded
+    re-read in :func:`_adopt_existing_anchor_key`; a crash inside the
+    window leaves an empty sidecar that is treated as damaged trust
+    material (fixed-text :class:`OSError`), never silently replaced.
+    Every filesystem failure becomes the fixed-text storage error; the
+    key bytes themselves are never placed in that error or a log.
+    """
+    try:
+        fd = os.open(
+            path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+    except FileExistsError:
+        raise
+    except OSError:
+        raise _storage_failure() from None
+    try:
+        written = 0
+        while written < len(material):
+            written += os.write(fd, material[written:])
+        os.fsync(fd)
+    except OSError:
+        raise _storage_failure() from None
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            raise _storage_failure() from None
+
+
+# Bounded wait for a concurrent first-opener to finish publishing the
+# sidecar: after losing the atomic create race the winner's link exists
+# while its data may not yet be observable on every shared filesystem.
+# The retry window is short and never masks a persistently empty/damaged
+# sidecar (which keeps raising the fixed-text storage error afterwards).
+_ANCHOR_KEY_READ_ATTEMPTS = 50
+_ANCHOR_KEY_READ_DELAY_S = 0.01
+
+
+def _adopt_existing_anchor_key(
+    path: str, caller_material: bytes | None
+) -> bytes:
+    """Read a sidecar another opener just won the race to publish.
+
+    Retries briefly while the winner's linked file is still appearing,
+    then enforces a caller-supplied key match. A file that stays empty
+    or unreadable past the bounded window is damaged trust material and
+    raises the fixed-text :class:`OSError` like any other storage fault.
+    """
+    last_error: OSError | None = None
+    for _ in range(_ANCHOR_KEY_READ_ATTEMPTS):
+        try:
+            with open(path, "rb") as handle:
+                existing = handle.read()
+        except FileNotFoundError:
+            # The winner publishes with an exclusive create, so this is
+            # only the tiny pre-create window; wait for it.
+            existing = b""
+        except OSError as exc:
+            last_error = exc
+            existing = b""
+        if existing:
+            if caller_material is not None and not hmac.compare_digest(
+                existing, caller_material
+            ):
+                raise _storage_failure()
+            return existing
+        time.sleep(_ANCHOR_KEY_READ_DELAY_S)
+    raise _storage_failure() from last_error
+
+
+
+def _resolve_anchor_key(
+    db_path: str, anchor_key: str | bytes | None
+) -> bytes:
+    """Resolve the external trust-anchor key for this store.
+
+    A non-empty ``str``/``bytes`` *anchor_key* is the caller-held key:
+    it is used directly and, for a file database, matched against (or
+    first written to) the owner-only sidecar so the key survives
+    restarts outside the database. ``None`` loads the existing sidecar
+    or generates fresh random material on first open. ``:memory:``
+    stores keep an instance-private key (their data never leaves the
+    process). A mismatched explicit key, an unreadable/empty sidecar or
+    a sidecar that cannot be created is the fixed-text
+    :class:`OSError`; an empty or wrong-typed argument is
+    :class:`ValueError`. The material never enters the database, a
+    return value beyond this method, an exception or a log.
+    """
+    if anchor_key is None:
+        material: bytes | None = None
+    elif isinstance(anchor_key, str):
+        if not anchor_key:
+            raise ValueError("anchor_key must be a non-empty string")
+        material = anchor_key.encode("utf-8")
+    elif isinstance(anchor_key, bytes):
+        if not anchor_key:
+            raise ValueError("anchor_key must be a non-empty byte string")
+        material = anchor_key
+    else:
+        raise ValueError("anchor_key must be a string or bytes")
+
+    if db_path == ":memory:":
+        # An in-memory database is process-private; there is no file to
+        # anchor across restarts, so an ephemeral random key is used when
+        # the caller supplied none.
+        return material if material is not None else secrets.token_bytes(
+            _ANCHOR_KEY_BYTES
+        )
+
+    sidecar = _anchor_sidecar_path(db_path)
+    if os.path.exists(sidecar):
+        # The adoption helper also enforces an explicit-key match and
+        # tolerates the tiny window in which another opener's freshly
+        # created sidecar is present but not yet fully written.
+        return _adopt_existing_anchor_key(sidecar, material)
+    caller_supplied = material is not None
+    if material is None:
+        material = secrets.token_bytes(_ANCHOR_KEY_BYTES)
+    try:
+        _write_anchor_key_file(sidecar, material)
+    except FileExistsError:
+        # Another opener sharing the database generated the sidecar
+        # first; its key is the database's key. A caller-supplied key
+        # that differs is a genuine mismatch; a generated one simply
+        # loses the race and the persisted key is adopted.
+        return _adopt_existing_anchor_key(
+            sidecar, material if caller_supplied else None
+        )
+    return material
+
+
 # -- deletion receipts -------------------------------------------------
 
 # Fixed, detail-free text for every receipt-availability rejection.
@@ -763,7 +1056,11 @@ def _parse_receipt_text(text: object) -> dict[str, str]:
 class RequestStore:
     """Persist and retrieve accepted deletion requests."""
 
-    def __init__(self, db_path: str | os.PathLike[str]):
+    def __init__(
+        self,
+        db_path: str | os.PathLike[str],
+        anchor_key: str | bytes | None = None,
+    ):
         # Validate the path before touching the filesystem: an empty or
         # non-string path is caller error (ValueError), never a storage
         # fault, and must not create directories.
@@ -782,11 +1079,19 @@ class RequestStore:
                 self._mem_conn = None
                 parent = os.path.dirname(os.path.abspath(self._db_path))
                 os.makedirs(parent, exist_ok=True)
+            # The external anchor key is resolved after the parent
+            # directory exists and before any table is created: it is the
+            # one piece of trust material that deliberately lives outside
+            # the database (a caller-held key or an owner-only sidecar),
+            # so anchors written below cannot be regenerated from the
+            # database alone.
+            self._anchor_key = _resolve_anchor_key(self._db_path, anchor_key)
         except sqlite3.Error:
             raise _storage_failure() from None
         except OSError:
             # makedirs/connect errors embed the offending path; replace
-            # them with the fixed-text storage error.
+            # them with the fixed-text storage error. (The anchor-key
+            # resolver already raises the same fixed-text error.)
             raise _storage_failure() from None
         conn = self._connect()
         try:
@@ -802,6 +1107,9 @@ class RequestStore:
                 conn.execute(_RECEIPT_TABLE)
                 conn.execute(_RECEIPT_KEY_TABLE)
                 conn.execute(_RECEIPT_KEY_FINGERPRINT_INDEX)
+                conn.execute(_ANCHOR_TABLE)
+                conn.execute(_ANCHOR_EVENT_INDEX)
+                conn.execute(_ANCHOR_HEAD_TABLE)
                 self._migrate_schema(conn)
             except sqlite3.Error:
                 raise _storage_failure() from None
@@ -972,6 +1280,14 @@ class RequestStore:
                         "tenant_id, request_id, seq, status, occurred_at, chain_hash"
                         ") VALUES (?, ?, 0, 'accepted', ?, ?)",
                         (tenant_id, request_id, created_at, genesis_hash),
+                    )
+                    # The external trust anchor lands in the same
+                    # transaction: request row, genesis event, request head
+                    # and anchor either commit together or never land at
+                    # all, so no accepted request can ever look complete
+                    # without its anchor.
+                    self._anchor_event_locked(
+                        conn, tenant_id, request_id, 0, genesis_hash
                     )
                     conn.execute("COMMIT")
                 except _PrimaryKeyConflict:
@@ -1260,7 +1576,9 @@ class RequestStore:
             raise InvalidStatusTransition("illegal status transition")
         # The event is appended in the same transaction as the status
         # update and the attempt row; its link is anchored on the request
-        # row by the UPDATE above.
+        # row by the UPDATE above. The external trust anchor lands in
+        # that same transaction, so an actual status change can never
+        # commit an event and head without its cross-restart anchor.
         conn.execute(
             "INSERT INTO status_events ("
             "tenant_id, request_id, seq, status, occurred_at, chain_hash"
@@ -1274,7 +1592,78 @@ class RequestStore:
                 next_link_hash,
             ),
         )
+        self._anchor_event_locked(
+            conn, tenant_id, request_id, next_seq + 1, next_link_hash
+        )
         return occurred_at
+
+    def _anchor_event_locked(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        request_id: str,
+        event_seq: int,
+        event_hash: str,
+    ) -> None:
+        """Append the external trust anchor for one event in an open txn.
+
+        Reads and advances the single anchor head, inserts the anchor row
+        and updates the head inside the caller's transaction, so the
+        ordered event, the request head and the external anchor land
+        atomically. The genesis head row is created lazily here (the
+        store never writes at open time) with an idempotent
+        create-if-absent; ``BEGIN IMMEDIATE`` serializes first writers
+        across store instances and processes. A damaged or missing head
+        that fails validation is storage corruption and never silently
+        resets. Every failure rolls the caller's transaction back and
+        raises the fixed-text :class:`OSError`.
+        """
+        conn.execute(
+            "INSERT OR IGNORE INTO chain_anchor_head (id, anchor_seq, anchor_hash) "
+            "VALUES (1, 0, ?)",
+            (_ANCHOR_GENESIS_HASH,),
+        )
+        head = conn.execute(
+            "SELECT anchor_seq, anchor_hash FROM chain_anchor_head WHERE id = 1"
+        ).fetchone()
+        if (
+            head is None
+            or not isinstance(head[0], int)
+            or isinstance(head[0], bool)
+            or head[0] < 0
+            or not _is_chain_hash(head[1])
+        ):
+            conn.execute("ROLLBACK")
+            raise _storage_failure()
+        prev_seq, prev_anchor = head
+        next_seq = prev_seq + 1
+        anchor = _anchor_mac(
+            self._anchor_key,
+            next_seq,
+            tenant_id,
+            request_id,
+            event_seq,
+            event_hash,
+            prev_anchor,
+        )
+        conn.execute(
+            "INSERT INTO chain_anchors ("
+            "anchor_seq, tenant_id, request_id, event_seq, event_hash, anchor_hash"
+            ") VALUES (?, ?, ?, ?, ?, ?)",
+            (next_seq, tenant_id, request_id, event_seq, event_hash, anchor),
+        )
+        cursor = conn.execute(
+            "UPDATE chain_anchor_head SET anchor_seq = ?, anchor_hash = ? "
+            "WHERE id = 1 AND anchor_seq = ? AND anchor_hash = ?",
+            (next_seq, anchor, prev_seq, prev_anchor),
+        )
+        if cursor.rowcount != 1:
+            # Another writer advanced the head despite the write lock /
+            # BEGIN IMMEDIATE contract; refuse rather than forking the
+            # anchor chain.
+            conn.execute("ROLLBACK")
+            raise _storage_failure()
+
 
     # -- execution orchestration ---------------------------------------
 
@@ -2508,34 +2897,94 @@ class RequestStore:
         }
 
     def verify_evidence(self, tenant_id: str, request_id: str) -> bool:
-        """Verify the persisted audit chain for a request.
+        """Verify the full persisted evidence chain for a request.
 
-        Every link is checked against the stored rows only; verification
-        never recomputes-and-overwrites persisted evidence. Deleting,
-        altering, inserting or reordering events, tampering with the
-        request head, or substituting events from another request or
-        tenant all yield ``False``. Returns ``True`` only when every link
-        recomputes to its stored hash from the genesis predecessor, the
-        sequences are gap-free from zero, and the final link matches the
-        request's anchored head and current status. Invalid, unknown and
-        cross-tenant ids raise :class:`RequestNotFound`; a non-string or
-        empty *tenant_id* raises :class:`ValueError`.
+        The check is read only and evaluates, together:
+
+        * the ordered event timeline -- gap-free sequences from zero,
+          every link recomputed from the genesis predecessor;
+        * the request association -- every event belongs to this tenant
+          and request, and the final link matches the request-row head
+          and current status;
+        * the external trust anchors -- one per event, each authentic
+          under the anchor key held outside the database, chained in
+          store-wide anchor order onto the persisted anchor head;
+        * the cross-restart result -- the anchor sequence is intact
+          globally and the persisted head equals the final anchor.
+
+        Deleting, altering, inserting, reordering or substituting
+        events across requests or tenants, a missing/damaged anchor or
+        head, a database written before anchors existed, or an
+        interrupted commit all yield ``False`` -- and so does a chain
+        whose events, request head and stored anchors were all
+        recomputed by an attacker: without the external anchor key no
+        replacement anchor authenticates. Verification never writes,
+        repairs, backfills, recomputes-for-storage or overwrites
+        anything, and repeated calls change no record. Invalid,
+        unknown and cross-tenant ids raise :class:`RequestNotFound`; a
+        non-string or empty *tenant_id* raises :class:`ValueError`.
+        """
+        return self.verify_chain(tenant_id, request_id)
+
+    def verify_chain(self, tenant_id: str, request_id: str) -> bool:
+        """Full-chain verification: events, head, anchors and head anchor.
+
+        Same read-only check as :meth:`verify_evidence`, offered under
+        its explicit name. Returns ``True`` only when every layer is
+        intact; every tampering, substitution or interrupted commit
+        returns ``False`` and never raises a forgery into place.
         """
         tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
         request_id = _require_identifier(request_id)
         if self._mem_conn is not None:
             with self._write_lock:
-                return self._verify_evidence(tenant_id, request_id)
-        return self._verify_evidence(tenant_id, request_id)
+                reason = self._full_chain_check(tenant_id, request_id)
+        else:
+            reason = self._full_chain_check(tenant_id, request_id)
+        return reason is None
 
-    def _verify_evidence(
+    def diagnose_chain(
         self, tenant_id: str, request_id: str
-    ) -> bool:
+    ) -> dict[str, object]:
+        """Read-only recovery diagnosis for a request's evidence chain.
+
+        Returns exactly ``trusted`` (a bool) and ``reason`` (``None``
+        when trusted, otherwise a fixed, detail-free code naming only
+        the structural check that failed): ``event_chain_invalid``,
+        ``request_head_mismatch``, ``anchors_missing``,
+        ``anchor_event_mismatch``, ``anchor_sequence_broken``,
+        ``anchor_head_mismatch`` or ``anchor_authentication_failed``.
+        The report contains no tenant, request id, hash, key, SQL or
+        path and never repairs, backfills, recomputes or overwrites any
+        evidence. Invalid, unknown and cross-tenant ids raise
+        :class:`RequestNotFound`; a non-string or empty *tenant_id*
+        raises :class:`ValueError`; a storage fault raises the
+        fixed-text :class:`OSError`.
+        """
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        request_id = _require_identifier(request_id)
+        if self._mem_conn is not None:
+            with self._write_lock:
+                reason = self._full_chain_check(tenant_id, request_id)
+        else:
+            reason = self._full_chain_check(tenant_id, request_id)
+        return {"trusted": reason is None, "reason": reason}
+
+    def _full_chain_check(
+        self, tenant_id: str, request_id: str
+    ) -> str | None:
+        """Return ``None`` for a fully trusted chain, else a reason code.
+
+        Raises :class:`RequestNotFound` for an unknown/cross-tenant id
+        and the fixed-text :class:`OSError` for an unreadable store;
+        every structural or cryptographic failure is one fixed reason
+        code, never an engine text or a piece of evidence.
+        """
         conn = self._connect()
         try:
-            # Gate on the request row exactly like audit(): an empty
-            # timeline must not distinguish "missing" from "foreign".
             try:
+                # Gate on the request row exactly like audit(): an empty
+                # timeline must not distinguish "missing" from "foreign".
                 owner = conn.execute(
                     "SELECT status, chain_hash FROM requests "
                     "WHERE tenant_id = ? AND request_id = ?",
@@ -2544,14 +2993,24 @@ class RequestStore:
                 if owner is None:
                     raise RequestNotFound("request not found")
                 current_status, anchored_head = owner
-                if not _is_chain_hash(anchored_head):
-                    return False
-                rows = conn.execute(
+                event_rows = conn.execute(
                     "SELECT seq, status, occurred_at, chain_hash "
                     "FROM status_events "
                     "WHERE tenant_id = ? AND request_id = ? ORDER BY seq",
                     (tenant_id, request_id),
                 ).fetchall()
+                # The whole store's anchor chain is the single source: a
+                # forgery appended anywhere in the global sequence must be
+                # caught even if this request's own anchors are untouched.
+                global_anchor_rows = conn.execute(
+                    "SELECT anchor_seq, tenant_id, request_id, event_seq, "
+                    "event_hash, anchor_hash FROM chain_anchors "
+                    "ORDER BY anchor_seq"
+                ).fetchall()
+                global_head = conn.execute(
+                    "SELECT anchor_seq, anchor_hash FROM chain_anchor_head "
+                    "WHERE id = 1"
+                ).fetchone()
             except RequestNotFound:
                 raise
             except sqlite3.Error:
@@ -2560,8 +3019,16 @@ class RequestStore:
         finally:
             self._release(conn)
 
+        # Layer 1: the ordered event chain itself.
+        if (
+            not isinstance(current_status, str)
+            or current_status not in _ALLOWED_TRANSITIONS
+            or not _is_chain_hash(anchored_head)
+            or not event_rows
+        ):
+            return _DIAG_EVENT_CHAIN
         predecessor = _GENESIS_PREDECESSOR
-        for expected_seq, row in enumerate(rows):
+        for expected_seq, row in enumerate(event_rows):
             seq, status, occurred_at, stored_hash = row
             # Gap-free sequences from zero: a deleted, inserted or
             # renumbered event cannot reach here unnoticed. Strict type
@@ -2572,10 +3039,12 @@ class RequestStore:
                 or isinstance(seq, bool)
                 or seq != expected_seq
                 or not isinstance(status, str)
+                or status not in _ALLOWED_TRANSITIONS
                 or not isinstance(occurred_at, str)
+                or not occurred_at
                 or not _is_chain_hash(stored_hash)
             ):
-                return False
+                return _DIAG_EVENT_CHAIN
             recomputed = _chain_hash(
                 tenant_id,
                 request_id,
@@ -2584,19 +3053,119 @@ class RequestStore:
                 occurred_at,
                 predecessor,
             )
-            # Constant-time comparison; either mismatch breaks the chain.
             if not hmac.compare_digest(recomputed, stored_hash):
-                return False
+                return _DIAG_EVENT_CHAIN
             predecessor = stored_hash
 
-        # At least the genesis event must exist, the final link must be
-        # the head anchored on the request row, and its status must match
-        # the authoritative current status.
-        if not rows:
-            return False
+        # Layer 2: the final link is the head anchored on the request row
+        # and its status is the authoritative current status.
         if not hmac.compare_digest(predecessor, anchored_head):
-            return False
-        return rows[-1][1] == current_status
+            return _DIAG_HEAD
+        if event_rows[-1][1] != current_status:
+            return _DIAG_HEAD
+
+        # Layer 3: the global anchor table must be structurally sound
+        # (gap-free from one, well-formed rows, one anchor per event
+        # anywhere in the store). A forgery inserted anywhere in the
+        # global sequence -- even on another tenant's request -- must
+        # fail the verification of every chain.
+        if not global_anchor_rows:
+            # A database written before anchors existed (or one stripped
+            # of its anchors) must never be treated as fully verified.
+            return _DIAG_MISSING_ANCHORS
+        anchors_by_event: dict[tuple[str, str, int], tuple[int, str, str]] = {}
+        for expected_global, row in enumerate(global_anchor_rows, start=1):
+            anchor_seq, a_tenant, a_request, event_seq, event_hash, anchor_hash = (
+                row
+            )
+            if (
+                not isinstance(anchor_seq, int)
+                or isinstance(anchor_seq, bool)
+                or anchor_seq != expected_global
+                or not isinstance(a_tenant, str)
+                or not a_tenant
+                or not isinstance(a_request, str)
+                or not a_request
+                or not isinstance(event_seq, int)
+                or isinstance(event_seq, bool)
+                or event_seq < 0
+                or not _is_chain_hash(event_hash)
+                or not _is_chain_hash(anchor_hash)
+            ):
+                return _DIAG_ANCHOR_SEQUENCE
+            key = (a_tenant, a_request, event_seq)
+            if key in anchors_by_event:
+                # Two anchors for one event: the table is not a faithful
+                # one-anchor-per-event ledger.
+                return _DIAG_ANCHOR_COUNT
+            anchors_by_event[key] = (anchor_seq, event_hash, anchor_hash)
+
+        # Layer 4: exactly one external anchor for each event of THIS
+        # request, covering the same gap-free event sequences and naming
+        # the event's own link.
+        own_by_event: dict[int, tuple[int, str, str]] = {}
+        for (a_tenant, a_request, event_seq), value in anchors_by_event.items():
+            if a_tenant == tenant_id and a_request == request_id:
+                own_by_event[event_seq] = value
+        if len(own_by_event) != len(event_rows):
+            return _DIAG_ANCHOR_COUNT
+        for expected_event in range(len(event_rows)):
+            if expected_event not in own_by_event:
+                return _DIAG_ANCHOR_COUNT
+            _anchor_seq, event_hash, _anchor_hash = own_by_event[expected_event]
+            # The anchor must name this exact event link: a substituted
+            # event from another request or tenant cannot match.
+            if not hmac.compare_digest(
+                event_hash, event_rows[expected_event][3]
+            ):
+                return _DIAG_ANCHOR_COUNT
+
+        # Layer 5: the persisted anchor head equals the final global
+        # anchor, and EVERY global anchor -- from the genesis sentinel
+        # through the head -- authenticates under the key held outside
+        # the database, chaining onto the real global predecessor (which
+        # may belong to another request). An attacker who recomputed the
+        # events, the request head and every stored anchor, or appended a
+        # forged anchor and advanced the head, still fails here without
+        # the external anchor key: the MAC is the one value such a
+        # rewrite cannot regenerate.
+        if global_head is None:
+            return _DIAG_ANCHOR_HEAD
+        head_seq, head_hash = global_head
+        if (
+            not isinstance(head_seq, int)
+            or isinstance(head_seq, bool)
+            or head_seq != len(global_anchor_rows)
+            or not _is_chain_hash(head_hash)
+            or not hmac.compare_digest(head_hash, global_anchor_rows[-1][5])
+        ):
+            return _DIAG_ANCHOR_HEAD
+        predecessor = _ANCHOR_GENESIS_HASH
+        for row in global_anchor_rows:
+            anchor_seq, a_tenant, a_request, event_seq, event_hash, anchor_hash = (
+                row
+            )
+            expected = _anchor_mac(
+                self._anchor_key,
+                anchor_seq,
+                a_tenant,
+                a_request,
+                event_seq,
+                event_hash,
+                predecessor,
+            )
+            if not hmac.compare_digest(expected, anchor_hash):
+                return _DIAG_ANCHOR_MAC
+            predecessor = anchor_hash
+        return None
+
+    def _verify_evidence(
+        self, tenant_id: str, request_id: str
+    ) -> bool:
+        # Retained as the private hook used by the read paths; the full
+        # check (events, head, external anchors, anchor head) is the
+        # single implementation.
+        return self._full_chain_check(tenant_id, request_id) is None
 
     def _load_chain_head(
         self, tenant_id: str, request_id: str
