@@ -17,11 +17,12 @@ lookup (:meth:`RequestStore.get_status`), the execution orchestration
 (:meth:`RequestStore.claim_next`, :meth:`RequestStore.finish_claim`,
 :meth:`RequestStore.get_execution_log`,
 :meth:`RequestStore.reconcile_execution`,
-:meth:`RequestStore.reconcile_batch`) and the deletion receipts
+:meth:`RequestStore.reconcile_batch`), the deletion receipts
 (:meth:`RequestStore.generate_receipt`,
-:meth:`RequestStore.verify_receipt`) exist only on the storage layer
-and are deliberately not exposed over HTTP: this service still opens
-only request acceptance and the acceptance-receipt lookup.
+:meth:`RequestStore.verify_receipt`) and the receipt-key rotation
+(:meth:`RequestStore.rotate_receipt_key`) exist only on the storage
+layer and are deliberately not exposed over HTTP: this service still
+opens only request acceptance and the acceptance-receipt lookup.
 
 Success responses are a single line of JSON with exactly
 ``request_id``, ``status`` and ``created_at`` (in that order) followed by

@@ -206,7 +206,7 @@ class ReceiptTests(unittest.TestCase):
             count = conn.execute("SELECT count(*) FROM deletion_receipts").fetchone()[0]
         self.assertEqual(count, 0)
 
-    def test_invalid_arguments_raise_value_error_without_writing(self):
+    def test_invalid_tenant_and_key_raise_value_error_without_writing(self):
         store, accepted = self._completed()
         request_id = accepted["request_id"]
         for bad in ("", None, 7, b"x", ["x"], 3.14):
@@ -214,9 +214,20 @@ class ReceiptTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     store.generate_receipt(bad, request_id, KEY)
                 with self.assertRaises(ValueError):
-                    store.generate_receipt("tenant-a", bad, KEY)
-                with self.assertRaises(ValueError):
                     store.generate_receipt("tenant-a", request_id, bad)
+        with self._raw() as conn:
+            count = conn.execute("SELECT count(*) FROM deletion_receipts").fetchone()[0]
+        self.assertEqual(count, 0)
+
+    def test_invalid_unknown_request_id_raises_not_found(self):
+        # Empty, non-string or malformed request ids are indistinguishable
+        # from unknown ones and raise RequestNotFound, so the validation
+        # layer can never probe which ids exist.
+        store, accepted = self._completed()
+        for bad in ("", None, 7, b"x", ["x"], 3.14, "does-not-exist"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(RequestNotFound):
+                    store.generate_receipt("tenant-a", bad, KEY)
         with self._raw() as conn:
             count = conn.execute("SELECT count(*) FROM deletion_receipts").fetchone()[0]
         self.assertEqual(count, 0)

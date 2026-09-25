@@ -66,13 +66,33 @@ record, storage-layer only like the rest of the orchestration:
   exception or a log. The first receipt is persisted atomically;
   regenerating returns the stored bytes unchanged, whatever key is
   presented, and a corrupt stored record raises the fixed-text
-  :class:`OSError` instead of being repaired or recomputed.
+  :class:`OSError` instead of being repaired or recomputed. The first
+  key a tenant presents is registered as key generation 1; from then on
+  only the tenant's current receipt key may issue a new receipt, so a
+  retired or unknown key raises :class:`ReceiptKeyConflict` while every
+  receipt already issued stays verifiable under its original key.
 * :meth:`RequestStore.verify_receipt` authenticates a presented receipt
   text against the persisted record and the caller's key, returning
   ``True`` only on a complete match. A well-formed receipt whose fields,
   tag, times or tenant/request association were replaced returns
   ``False`` -- the request merely existing never substitutes for the
   authentication -- and verification never writes or repairs anything.
+* :meth:`RequestStore.rotate_receipt_key` retires the tenant's current
+  receipt key and enables a new one in a single atomic transaction,
+  returning the new active generation and its UTC rotation time. The
+  first rotation (before any key generation exists) registers the
+  retired and enabling keys as generations 1 and 2; later rotations
+  append one generation and advance the active pointer together. Only
+  irreversible key fingerprints, generations and times are persisted --
+  never the key material. An identical rotation is idempotent and
+  returns the first generation and time; a retired key that is not the
+  current one, a reused already-superseded rotation combination, or a
+  concurrent rotation that lost the race raises
+  :class:`ReceiptKeyConflict` and leaves the active generation
+  unchanged. Old receipts remain verifiable under their original key,
+  and only the active key may mint new receipts. Generations, rotation
+  times and historical receipts all survive restarts; an unfinished
+  rotation is never visible as in effect.
 
 The lease boundary enforced by :meth:`claim_next` is deliberately
 narrower than "every processing request whose latest timestamp is old":
@@ -127,6 +147,7 @@ __all__ = [
     "InvalidStatusTransition",
     "ClaimConflict",
     "ReceiptUnavailable",
+    "ReceiptKeyConflict",
 ]
 
 _log = logging.getLogger(__name__)
@@ -163,6 +184,20 @@ class ReceiptUnavailable(Exception):
     accepted or processing, it failed, or no terminal attempt recorded
     the completed deletion. The fixed message never identifies which
     condition applied.
+    """
+
+
+class ReceiptKeyConflict(Exception):
+    """Raised when a receipt-key rotation cannot take effect.
+
+    The tenant's current receipt key is not the retired key presented,
+    the retired and enabling keys are the same, a generation is missing,
+    or the identical rotation already superseded it (an already-replaced
+    rotation combination). The fixed message never identifies which
+    condition applied and never echoes either key; the tenant's active
+    generation is left unchanged. Also resolves a race between two
+    different enabling keys committed concurrently: exactly one
+    transaction wins and every loser raises this conflict.
     """
 
 
@@ -289,6 +324,41 @@ CREATE TABLE IF NOT EXISTS deletion_receipts (
     request_id   TEXT NOT NULL,
     receipt_json TEXT NOT NULL,
     PRIMARY KEY (tenant_id, request_id)
+);
+"""
+
+# Tenant receipt-key generations, append-only. A row records that
+# generation ``generation`` became the tenant's active receipt key at
+# ``rotated_at`` (UTC RFC3339). Only an irreversible, domain-separated
+# SHA-256 fingerprint of the key material is stored -- never the key
+# itself -- so the database at rest cannot authenticate a receipt or be
+# replayed as the caller's secret. Generation 1 is registered the first
+# time a receipt key is presented (at first receipt generation); the
+# first rotation then registers generations 1 and 2 atomically, and
+# every later rotation appends one row. Rows are never updated or
+# deleted, so every key that ever issued a receipt stays verifiable.
+_KEY_GENERATION_TABLE = """
+CREATE TABLE IF NOT EXISTS receipt_key_generations (
+    tenant_id   TEXT NOT NULL,
+    generation  INTEGER NOT NULL,
+    key_fingerprint TEXT NOT NULL,
+    rotated_at  TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, generation)
+);
+"""
+
+# Each tenant's current (active) receipt-key generation. The row is
+# inserted by the first registration/first rotation and advanced in the
+# same transaction that appends a new generation row, so a crash can
+# never publish a generation without its history nor leave an active
+# generation pointing at a missing row. A single row per tenant is the
+# concurrency arbitration point: BEGIN IMMEDIATE serializes rotations,
+# and a concurrent rotation that changed the active generation first is
+# detected and rejected rather than overwritten.
+_KEY_STATE_TABLE = """
+CREATE TABLE IF NOT EXISTS receipt_key_state (
+    tenant_id        TEXT PRIMARY KEY,
+    active_generation INTEGER NOT NULL
 );
 """
 
@@ -559,6 +629,12 @@ def _is_chain_hash(value: object) -> bool:
 # Fixed, detail-free text for every receipt-availability rejection.
 _RECEIPT_UNAVAILABLE_MESSAGE = "receipt is not available"
 
+# Fixed, detail-free text for every receipt-key rotation rejection. The
+# text never says whether the retired key was wrong, the combination was
+# already superseded or a concurrent rotation won, and never embeds a
+# key or a tenant.
+_RECEIPT_KEY_CONFLICT_MESSAGE = "receipt key conflict"
+
 # The receipt is a single compact JSON object with exactly these fields
 # in exactly this order, followed by a trailing newline. Every value is
 # a string; the digests and the tag are 64 lowercase hex characters and
@@ -645,6 +721,34 @@ def _receipt_tag(key: str, fields: dict[str, str]) -> str:
     return mac.hexdigest()
 
 
+# Domain-separation label for the stored receipt-key fingerprint. It is
+# distinct from every receipt-tag preimage (length-prefixed business
+# fields), so a fingerprint can never be mistaken for -- or collide with
+# -- a value produced by the receipt authentication construction.
+_RECEIPT_KEY_FP_LABEL = b"forgetting-evidence/receipt-key-generation/v1"
+
+
+def _key_fingerprint(key: str) -> str:
+    """Return the irreversible, domain-separated fingerprint of a key.
+
+    The fingerprint is a keyed HMAC-SHA256 over a fixed label. It is
+    one-way: the database stores only this hex string, never the key, so
+    the file at rest can neither authenticate a receipt nor be replayed
+    as the caller's secret. It is used solely to tell generations and
+    presented keys apart and to bind a rotation's retired key to the
+    generation it replaces; it is never logged or placed in an
+    exception.
+    """
+    return hmac.new(
+        key.encode("utf-8"), _RECEIPT_KEY_FP_LABEL, hashlib.sha256
+    ).hexdigest()
+
+
+def _receipt_key_conflict() -> ReceiptKeyConflict:
+    """Build the single, detail-free rotation conflict error."""
+    return ReceiptKeyConflict(_RECEIPT_KEY_CONFLICT_MESSAGE)
+
+
 def _render_receipt(fields: dict[str, str]) -> str:
     """Render the canonical receipt text: compact JSON, fixed field
     order, exactly one trailing newline."""
@@ -724,6 +828,8 @@ class RequestStore:
                 conn.execute(_BATCH_TABLE)
                 conn.execute(_BATCH_ITEM_TABLE)
                 conn.execute(_RECEIPT_TABLE)
+                conn.execute(_KEY_GENERATION_TABLE)
+                conn.execute(_KEY_STATE_TABLE)
                 self._migrate_schema(conn)
             except sqlite3.Error:
                 raise _storage_failure() from None
@@ -2579,12 +2685,12 @@ class RequestStore:
         identically.
         """
         # Validate everything before touching the database: no rejected
-        # call may perform a write. Unlike the acceptance/status
-        # entries, a malformed request id here is caller error
-        # (ValueError); only a well-formed id that names no visible
-        # request collapses to RequestNotFound.
+        # call may perform a write. A malformed request id is treated
+        # exactly like an unknown one (RequestNotFound) so validation can
+        # never probe which ids exist; only the tenant and the key are
+        # caller-error ValueErrors.
         tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
-        request_id = _require_nonempty_str(request_id, "request_id")
+        request_id = _require_identifier(request_id)
         key = _require_nonempty_str(key, "key")
 
         with self._write_lock:
@@ -2599,7 +2705,7 @@ class RequestStore:
                         conn, tenant_id, request_id, key
                     )
                     conn.execute("COMMIT")
-                except (RequestNotFound, ReceiptUnavailable):
+                except (RequestNotFound, ReceiptUnavailable, ReceiptKeyConflict):
                     self._rollback_quietly(conn)
                     raise
                 except OSError:
@@ -2715,6 +2821,15 @@ class RequestStore:
             # deletion, so no deletion receipt may be issued.
             raise ReceiptUnavailable(_RECEIPT_UNAVAILABLE_MESSAGE)
 
+        # Resolve the active receipt key before minting a new receipt.
+        # The first key a tenant presents is registered as generation 1;
+        # from then on only the current generation's key may issue a new
+        # receipt. A retired key is rejected here even though it still
+        # verifies every receipt it historically issued. Registration
+        # commits in this same transaction, so it can never be visible
+        # without the receipt it authorised (nor vice versa).
+        self._ensure_active_receipt_key_locked(conn, tenant_id, key)
+
         fields: dict[str, str] = {
             "tenant_id": tenant_id,
             "request_id": request_id,
@@ -2817,6 +2932,300 @@ class RequestStore:
                 }
             )
         return attempts
+
+    # -- receipt key rotation -------------------------------------------
+
+    def rotate_receipt_key(
+        self,
+        tenant_id: str,
+        retired_key: str,
+        new_key: str,
+    ) -> dict[str, object]:
+        """Rotate the tenant's receipt key to a new generation.
+
+        Storage-layer only; never routed over HTTP. The retirement of
+        ``retired_key`` and the enabling of ``new_key`` commit in one
+        atomic transaction; on success the result is exactly
+        ``generation`` (the now-active generation, a positive int) and
+        ``rotated_at`` (a UTC RFC3339 string).
+
+        * The first receipt key a tenant ever presents is registered as
+          generation 1 at first receipt generation. With no active
+          generation yet, the first rotation registers generations 1 and
+          2 together, where the retired key becomes generation 1 and the
+          new key becomes the active generation 2.
+        * Once an active generation exists, ``retired_key`` must be that
+          active generation's key and ``new_key`` must differ from it;
+          the new key becomes the next generation and is the only key
+          that may issue new receipts. Every retired generation is
+          retained (as a fingerprint only) and still verifies the
+          receipts it historically issued.
+        * Repeating the identical rotation is idempotent and returns the
+          first generation and rotation time. Repeating a rotation whose
+          combination has since been superseded, presenting a key other
+          than the current one as retired, or racing a concurrent
+          rotation with a different enabling key all raise
+          :class:`ReceiptKeyConflict` and leave the active generation
+          unchanged.
+
+        After rotation only the active key may generate new receipts; a
+        retired key is rejected at generation time but the receipts it
+        issued still verify under it, and the new key does not
+        authenticate those old receipts. The key material itself is
+        never stored -- only an irreversible fingerprint, the generation
+        and the time. Generations, times and receipts all survive a
+        store rebuild or service restart, and an unfinished rotation can
+        never appear as in effect.
+
+        An empty or non-string *tenant_id*, *retired_key* or *new_key*,
+        or identical retired and new keys, raises :class:`ValueError`
+        without writing; every storage fault raises the fixed-text
+        :class:`OSError`.
+        """
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        retired_key = _require_nonempty_str(retired_key, "retired_key")
+        new_key = _require_nonempty_str(new_key, "new_key")
+        if retired_key == new_key:
+            # A rotation must advance to a distinct key; identical
+            # material is caller error, not an idempotent replay.
+            raise ValueError("retired_key and new_key must differ")
+
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                except sqlite3.Error:
+                    raise _storage_failure() from None
+                try:
+                    record = self._rotate_receipt_key_locked(
+                        conn, tenant_id, retired_key, new_key
+                    )
+                    conn.execute("COMMIT")
+                except ReceiptKeyConflict:
+                    self._rollback_quietly(conn)
+                    raise
+                except sqlite3.Error:
+                    self._rollback_quietly(conn)
+                    raise _storage_failure() from None
+            finally:
+                self._release(conn)
+        # Log only the stable outcome and generation: no tenant and no
+        # key material ever reaches the log.
+        _log.info(
+            "receipt key rotated generation=%s",
+            record["generation"],
+        )
+        return record
+
+    def _rotate_receipt_key_locked(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        retired_key: str,
+        new_key: str,
+    ) -> dict[str, object]:
+        """Apply (or idempotently replay) a rotation inside a write txn."""
+        retired_fp = _key_fingerprint(retired_key)
+        new_fp = _key_fingerprint(new_key)
+        generations = self._load_key_generations_locked(conn, tenant_id)
+        active = self._load_active_generation_locked(conn, tenant_id, generations)
+
+        if active is None:
+            # First rotation for the tenant: register the retired key as
+            # generation 1 and the new key as the active generation 2 in
+            # this one transaction. The identical call is idempotent.
+            if generations:
+                # History without an active pointer is out-of-band
+                # corruption; never publish a generation on top of it.
+                raise _storage_failure()
+            rotated_at = _utc_now_rfc3339()
+            self._insert_generation_row_locked(
+                conn, tenant_id, 1, retired_fp, rotated_at
+            )
+            self._insert_generation_row_locked(
+                conn, tenant_id, 2, new_fp, rotated_at
+            )
+            conn.execute(
+                "INSERT INTO receipt_key_state (tenant_id, active_generation) "
+                "VALUES (?, 2)",
+                (tenant_id,),
+            )
+            return {"generation": 2, "rotated_at": rotated_at}
+
+        active_generation, active_fp, active_rotated_at = active
+        # ``_load_active_generation_locked`` already guarantees the state
+        # pointer names a well-formed, in-history generation.
+
+        # Idempotent replay: the exact retired -> enabling pair that
+        # established the active generation returns its first result.
+        if active_generation >= 2 and active_fp == new_fp:
+            predecessor = generations.get(active_generation - 1)
+            if predecessor is not None and predecessor[0] == retired_fp:
+                return {
+                    "generation": active_generation,
+                    "rotated_at": active_rotated_at,
+                }
+            # Same active key but the retired half does not match the
+            # recorded predecessor: a reused, already-superseded
+            # combination, not the rotation that took effect.
+            raise _receipt_key_conflict()
+
+        # A new enabling key may only succeed when the retired key is the
+        # current active key. Any other material -- a retired old key, an
+        # unknown key, or a key from a different (reused) combination --
+        # loses without advancing the generation. This same comparison is
+        # the race loser's path once BEGIN IMMEDIATE serialises two
+        # concurrent rotations.
+        if retired_fp != active_fp:
+            raise _receipt_key_conflict()
+
+        # Reject reusing any still-retained key (old or active) as the
+        # new key; the active-fingerprint case is the idempotent branch
+        # above, this catches an older generation.
+        if any(fp == new_fp for fp, _at in generations.values()):
+            raise _receipt_key_conflict()
+
+        next_generation = active_generation + 1
+        rotated_at = _utc_now_rfc3339()
+        self._insert_generation_row_locked(
+            conn, tenant_id, next_generation, new_fp, rotated_at
+        )
+        cursor = conn.execute(
+            "UPDATE receipt_key_state SET active_generation = ? "
+            "WHERE tenant_id = ? AND active_generation = ?",
+            (next_generation, tenant_id, active_generation),
+        )
+        if cursor.rowcount != 1:
+            # The pointer advanced between the read and the write despite
+            # the write lock: a concurrent rotation won this race.
+            raise _receipt_key_conflict()
+        return {"generation": next_generation, "rotated_at": rotated_at}
+
+    def _load_key_generations_locked(
+        self, conn: sqlite3.Connection, tenant_id: str
+    ) -> dict[int, tuple[str, str]]:
+        """Return ``{generation: (fingerprint, rotated_at)}`` for a tenant.
+
+        Strictly validates every row; a malformed generation, timestamp
+        or fingerprint is storage corruption and raises the fixed-text
+        :class:`OSError`.
+        """
+        rows = conn.execute(
+            "SELECT generation, key_fingerprint, rotated_at "
+            "FROM receipt_key_generations WHERE tenant_id = ? "
+            "ORDER BY generation",
+            (tenant_id,),
+        ).fetchall()
+        generations: dict[int, tuple[str, str]] = {}
+        for index, row in enumerate(rows, start=1):
+            generation, fingerprint, rotated_at = row
+            if (
+                not isinstance(generation, int)
+                or isinstance(generation, bool)
+                or generation != index
+                or not _is_chain_hash(fingerprint)
+                or not isinstance(rotated_at, str)
+                or not rotated_at
+            ):
+                raise _storage_failure()
+            generations[generation] = (fingerprint, rotated_at)
+        return generations
+
+    def _load_active_generation_locked(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        generations: dict[int, tuple[str, str]] | None = None,
+    ) -> tuple[int, str, str] | None:
+        """Return ``(generation, fingerprint, rotated_at)`` of the active key.
+
+        Returns ``None`` when the tenant has no active generation yet. A
+        state pointer naming a missing or malformed generation is
+        corruption and raises the fixed-text :class:`OSError`.
+        """
+        if generations is None:
+            generations = self._load_key_generations_locked(conn, tenant_id)
+        row = conn.execute(
+            "SELECT active_generation FROM receipt_key_state WHERE tenant_id = ?",
+            (tenant_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        active_generation = row[0]
+        if (
+            not isinstance(active_generation, int)
+            or isinstance(active_generation, bool)
+            or active_generation < 1
+            or active_generation not in generations
+        ):
+            raise _storage_failure()
+        fingerprint, rotated_at = generations[active_generation]
+        return active_generation, fingerprint, rotated_at
+
+    @staticmethod
+    def _insert_generation_row_locked(
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        generation: int,
+        fingerprint: str,
+        rotated_at: str,
+    ) -> None:
+        """Insert one append-only generation row inside the open txn.
+
+        A duplicate ``(tenant, generation)`` is an unexpected write race
+        given the write lock; surface it as a storage fault rather than
+        silently replacing history.
+        """
+        try:
+            conn.execute(
+                "INSERT INTO receipt_key_generations ("
+                "tenant_id, generation, key_fingerprint, rotated_at"
+                ") VALUES (?, ?, ?, ?)",
+                (tenant_id, generation, fingerprint, rotated_at),
+            )
+        except sqlite3.IntegrityError:
+            raise _storage_failure() from None
+
+    def _ensure_active_receipt_key_locked(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        key: str,
+    ) -> None:
+        """Enforce the active key for a new receipt, registering gen 1.
+
+        Inside an open write transaction: with no active generation the
+        presented key is registered as generation 1 (the first key the
+        tenant presented at first receipt generation) and the state
+        pointer is set in the same transaction; otherwise the presented
+        key's fingerprint must equal the active generation's, else the
+        retired/unknown key is refused with :class:`ReceiptKeyConflict`.
+        Corrupt key state raises the fixed-text :class:`OSError`.
+        """
+        fingerprint = _key_fingerprint(key)
+        generations = self._load_key_generations_locked(conn, tenant_id)
+        active = self._load_active_generation_locked(conn, tenant_id, generations)
+        if active is None:
+            if generations:
+                # History without a pointer is corruption.
+                raise _storage_failure()
+            registered_at = _utc_now_rfc3339()
+            self._insert_generation_row_locked(
+                conn, tenant_id, 1, fingerprint, registered_at
+            )
+            conn.execute(
+                "INSERT INTO receipt_key_state (tenant_id, active_generation) "
+                "VALUES (?, 1)",
+                (tenant_id,),
+            )
+            return
+        _active_generation, active_fp, _active_rotated_at = active
+        if fingerprint != active_fp:
+            # A retired or unknown key may not mint a new receipt, even
+            # though it still verifies the receipts it historically
+            # issued.
+            raise _receipt_key_conflict()
 
     def verify_receipt(self, receipt_text: str, key: str) -> bool:
         """Authenticate a presented deletion receipt text.
