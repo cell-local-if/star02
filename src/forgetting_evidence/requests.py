@@ -352,10 +352,15 @@ def _decode_cursor(value: object) -> tuple[str, int]:
         raise ValueError("cursor is not valid") from None
     if not isinstance(payload, dict) or set(payload) != {"v", "b", "n"}:
         raise ValueError("cursor is not valid")
+    version = payload["v"]
     batch_id = payload["b"]
     position = payload["n"]
     if (
-        payload["v"] != 1
+        # bool is a subclass of int and 1.0 == 1: only the exact integer
+        # version 1 names the known cursor format.
+        not isinstance(version, int)
+        or isinstance(version, bool)
+        or version != 1
         or not isinstance(batch_id, str)
         or not batch_id
         or not isinstance(position, int)
@@ -420,7 +425,9 @@ def _normalize_scopes(scopes: object) -> list[str]:
         items = list(scopes)  # type: ignore[arg-type]
     except TypeError as exc:
         raise ValueError("scopes must be a non-empty sequence of distinct strings") from exc
-    if not items or not all(isinstance(item, str) for item in items):
+    # Every element must be a non-empty string: an empty element is as
+    # invalid as a non-string one, and both are rejected before storage.
+    if not items or not all(isinstance(item, str) and item for item in items):
         raise ValueError("scopes must be a non-empty sequence of distinct strings")
     if len(set(items)) != len(items):
         raise ValueError("scopes must be a non-empty sequence of distinct strings")

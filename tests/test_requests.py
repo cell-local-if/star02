@@ -115,6 +115,8 @@ class RequestStoreTests(unittest.TestCase):
             (),
             ["email", "email"],
             ["email", 7],
+            [""],
+            ["email", ""],
             "email",
             b"email",
             {"email": 1},

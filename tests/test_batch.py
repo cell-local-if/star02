@@ -513,6 +513,8 @@ class BatchValidationTests(_StoreCase):
             "rc1." + base64.urlsafe_b64encode(b"not-json").decode("ascii"),
             "rc1." + base64.urlsafe_b64encode(b"[]").decode("ascii"),
             "rc1." + base64.urlsafe_b64encode(b'{"v":2,"b":"x","n":0}').decode("ascii"),
+            "rc1." + base64.urlsafe_b64encode(b'{"v":1.0,"b":"x","n":0}').decode("ascii"),
+            "rc1." + base64.urlsafe_b64encode(b'{"v":true,"b":"x","n":0}').decode("ascii"),
             "rc1." + base64.urlsafe_b64encode(b'{"v":1,"b":"","n":0}').decode("ascii"),
             "rc1." + base64.urlsafe_b64encode(b'{"v":1,"b":7,"n":0}').decode("ascii"),
             "rc1." + base64.urlsafe_b64encode(b'{"v":1,"b":"x","n":-1}').decode("ascii"),
