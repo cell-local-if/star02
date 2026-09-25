@@ -144,6 +144,28 @@ never repairing, backfilling, recomputing or overwriting anything.
 Old (un-anchored) databases, corrupt anchors, split heads and
 interrupted commits verify as ``False``.
 
+The anchor secret is itself rotatable by generation, storage-layer
+only. :meth:`RequestStore.rotate_anchor_key` atomically retires the
+currently active secret and promotes its successor, returning the new
+generation and its UTC effective time; the first rotation establishes
+generations 1 and 2 together. Each committed anchor records the
+generation that sealed it: new anchors use the active generation and
+existing anchors keep their birth generation forever. Only irreversible
+secret fingerprints, generations and times are persisted -- the secret
+material stays with the caller, who supplies past secrets after a
+rebuild through the optional ``anchor_history_secrets`` generation map
+(validated as positive-int generations of non-empty strings and never
+written anywhere). Repeating the rotation that produced the active
+generation returns its first generation and time; a competing promotion
+based on the same generation loses as :class:`AnchorKeyConflict`, while
+a non-active retiring secret, an already-registered successor and
+empty/equal/non-string arguments are :class:`ValueError`. A rebuilt
+store handed the current secret and the matching history verifies old
+and active anchors alike; a missing historical generation verifies
+``False`` with reason ``anchor_key_missing``, while a wrong secret, a
+tampered generation association or a forged anchor verifies ``False``
+with reason ``anchor_auth_failed``.
+
 Caller errors are always :class:`ValueError` (invalid parameters) or the
 module's own domain exceptions; every database failure -- an unwritable
 path, an uncreatable or corrupt file, an I/O or read/write error -- is
@@ -177,6 +199,7 @@ __all__ = [
     "ClaimConflict",
     "ReceiptUnavailable",
     "ReceiptKeyConflict",
+    "AnchorKeyConflict",
 ]
 
 _log = logging.getLogger(__name__)
@@ -224,6 +247,17 @@ class ReceiptKeyConflict(Exception):
     rotation, or a concurrent rotation committed a different successor
     first. The fixed message never identifies which condition applied
     and no generation is ever changed.
+    """
+
+
+class AnchorKeyConflict(Exception):
+    """Raised when an anchor-key rotation cannot take effect as asked.
+
+    The presented retired secret is not the current active anchor
+    secret, the presented rotation pair was already superseded by a
+    later rotation, or a concurrent rotation committed a different
+    successor first. The fixed message never identifies which
+    condition applied and no generation is ever changed.
     """
 
 
@@ -387,13 +421,17 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_receipt_keys_tenant_fingerprint
 
 # External cross-restart trust anchors, one row per anchored status
 # event. ``commit_seq`` is the file-wide sealing order (1, 2, 3, ...) so
-# the global head can be replayed deterministically; ``anchor_hmac`` is
-# the HMAC-SHA256 of the event's business fields, its database chain
-# hash and the preceding anchor, keyed with the caller-held anchor
-# secret. Neither value can be derived from anything stored in the file
-# without that secret. Rows are inserted in the same transaction as the
-# events they anchor and never updated or deleted by the store, so an
-# event can never exist without its anchor or vice versa.
+# the global head can be replayed deterministically; ``anchor_generation``
+# is the anchor-key generation in force when the event was sealed (new
+# anchors use the active generation and existing anchors are never
+# rewritten, so a row keeps the generation it was born with);
+# ``anchor_hmac`` is the HMAC-SHA256 of the event's business fields, its
+# database chain hash and the preceding anchor, keyed with that
+# generation's caller-held secret. Neither value can be derived from
+# anything stored in the file without that secret. Rows are inserted in
+# the same transaction as the events they anchor and never updated or
+# deleted by the store, so an event can never exist without its anchor
+# or vice versa.
 _ANCHOR_TABLE = """
 CREATE TABLE IF NOT EXISTS audit_anchors (
     commit_seq  INTEGER NOT NULL,
@@ -401,6 +439,7 @@ CREATE TABLE IF NOT EXISTS audit_anchors (
     request_id  TEXT NOT NULL,
     seq         INTEGER NOT NULL,
     event_hash  TEXT NOT NULL,
+    anchor_generation INTEGER NOT NULL,
     anchor_hmac TEXT NOT NULL,
     PRIMARY KEY (tenant_id, request_id, seq)
 );
@@ -427,6 +466,44 @@ CREATE TABLE IF NOT EXISTS audit_anchor_meta (
     head_hmac  TEXT NOT NULL
 );
 """
+
+# Anchor-key generations, one row per anchor secret ever in force, in
+# generation order. As with receipt keys only an irreversible salt-free
+# SHA-256 fingerprint, the generation and the UTC effective time are
+# persisted -- the secret material itself stays with the caller and
+# never enters this table, a return value, an exception or a log. The
+# highest generation is the active anchor secret: new anchors are sealed
+# with it alone, while every older generation stays on record solely so
+# anchors sealed before a rotation still authenticate. Rows are
+# inserted once (the first anchor bootstraps generation 1 atomically;
+# each rotation inserts exactly one successor) and never updated or
+# deleted. The table is empty only for a database that never carried an
+# anchor.
+_ANCHOR_KEY_TABLE = """
+CREATE TABLE IF NOT EXISTS anchor_key_generations (
+    generation   INTEGER PRIMARY KEY,
+    key_fingerprint TEXT NOT NULL,
+    effective_at TEXT NOT NULL
+);
+"""
+
+# Each fingerprint names exactly one anchor-key generation: rotating
+# back to a retired secret, or registering a secret already on record,
+# must be rejected as a key conflict rather than silently aliasing two
+# generations.
+_ANCHOR_KEY_FINGERPRINT_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_anchor_keys_fingerprint
+    ON anchor_key_generations(key_fingerprint);
+"""
+
+# Column probes used to add the per-anchor key generation to files
+# created before anchor-key rotation existed. The upgrade is purely
+# additive (one NOT NULL column backfilled to generation 1, the only
+# generation such a file can hold) and never overwrites anchor evidence.
+_ANCHOR_GENERATION_COLUMN = (
+    "SELECT 1 FROM pragma_table_info('audit_anchors') "
+    "WHERE name = 'anchor_generation'"
+)
 
 # Column probes used to upgrade database files created before chain
 # hashes existed. The upgrade is purely additive (nullable columns plus a
@@ -591,6 +668,55 @@ def _require_nonempty_str(value: object, field: str) -> str:
     return value
 
 
+def _anchor_key_fingerprint(secret: str) -> str:
+    """Return the irreversible, salt-free fingerprint of an anchor secret.
+
+    Only this SHA-256 digest is ever persisted; the secret stays with
+    the caller. A distinct, purpose-labelled construction keeps anchor
+    fingerprints from being interchangeable with receipt-key
+    fingerprints even when the two secrets share text.
+    """
+    return hashlib.sha256(
+        b"forgetting-evidence:anchor-key:" + secret.encode("utf-8")
+    ).hexdigest()
+
+
+def _normalize_anchor_history(
+    anchor_history_secrets: object,
+) -> dict[int, str] | None:
+    """Validate the optional ``generation -> secret`` history mapping.
+
+    The history is caller-held configuration: it must be a mapping of
+    positive, non-boolean integer generations to non-empty strings. A
+    non-mapping container, a non-positive or non-integer generation or
+    a non-string secret is caller error (:class:`ValueError`) before the
+    database is ever opened, so a rejected construction performs no
+    writes. The mapping is copied into an internal dict -- the caller's
+    object is never retained or mutated -- and no secret value is
+    persisted.
+    """
+    if anchor_history_secrets is None:
+        return None
+    if isinstance(anchor_history_secrets, Mapping):
+        history: dict[int, str] = {}
+        for generation, secret in anchor_history_secrets.items():
+            if (
+                not isinstance(generation, int)
+                or isinstance(generation, bool)
+                or generation < 1
+            ):
+                raise ValueError(
+                    "anchor_history_secrets generations must be positive integers"
+                )
+            if not isinstance(secret, str) or not secret:
+                raise ValueError(
+                    "anchor_history_secrets secrets must be non-empty strings"
+                )
+            history[generation] = secret
+        return history
+    raise ValueError("anchor_history_secrets must be a mapping of generations to secrets")
+
+
 def _require_identifier(value: object) -> str:
     """Validate a request id, mapping every malformed value to not-found.
 
@@ -708,6 +834,7 @@ _ANCHOR_GLOBAL_GENESIS = hashlib.sha256(
 # request, credential, SQL text or path -- and diagnosis never repairs,
 # backfills, recomputes or overwrites anything.
 _ANCHOR_REASON_SECRET_MISSING = "anchor_secret_missing"
+_ANCHOR_REASON_KEY_MISSING = "anchor_key_missing"
 _ANCHOR_REASON_UNANCHORED = "unanchored_database"
 _ANCHOR_REASON_STATE_SPLIT = "anchor_state_split"
 _ANCHOR_REASON_META_CORRUPT = "anchor_meta_corrupt"
@@ -722,6 +849,16 @@ _ANCHOR_REASON_AUTH_FAILED = "anchor_auth_failed"
 _ANCHOR_REASON_SEQUENCE_GAP = "anchor_sequence_gap"
 _ANCHOR_REASON_GLOBAL_HEAD = "anchor_head_mismatch"
 _ANCHOR_REASON_CORRUPT_ROW = "anchor_row_corrupt"
+
+# Fixed, detail-free text for every rejected anchor-key rotation. It
+# never says which secret or generation was involved, so the outcome can
+# never be used to probe which anchor secrets are registered.
+_ANCHOR_KEY_CONFLICT_MESSAGE = "anchor key conflict"
+# Single, detail-free text for every caller-error rotation argument
+# (a non-active retiring secret, an already-registered successor, an
+# empty/non-string value or identical secrets). It never reveals which
+# generations exist.
+_ANCHOR_KEY_ROTATION_INVALID = "anchor key rotation is not valid"
 
 
 def _anchor_mac(
@@ -908,16 +1045,28 @@ def _render_receipt(fields: dict[str, str]) -> str:
 def _parse_receipt_text(text: object) -> dict[str, str]:
     """Parse and strictly validate a presented receipt text.
 
-    Every malformed value -- non-string, unparsable JSON, a missing or
-    extra field, a non-string value, a malformed timestamp or a digest
-    or tag that is not 64 lowercase hex characters -- raises
-    :class:`ValueError` identically, so the format can never be probed
-    through distinguishable failures.
+    Every malformed value -- non-string, a missing or repeated trailing
+    newline, unparsable JSON, a missing or extra field, a non-string
+    value, a malformed timestamp or a digest or tag that is not 64
+    lowercase hex characters -- raises :class:`ValueError` identically,
+    so the format can never be probed through distinguishable failures.
+    The canonical receipt is compact JSON followed by *exactly one*
+    trailing newline: a copy without that newline or with an extra one
+    is malformed input, not a well-formed receipt that merely fails
+    authentication, so it is rejected here rather than returned as
+    ``False``.
     """
     if not isinstance(text, str) or not text:
         raise ValueError("receipt must be a non-empty string")
+    # The trailing newline is part of the receipt format: it must be
+    # present exactly once. A missing newline (an incomplete copy) or a
+    # repeated newline both fail parsing, while a body that merely
+    # differs in spacing -- still carrying its single trailing newline
+    # -- parses and is decided byte-for-byte at verification.
+    if not text.endswith("\n") or text.endswith("\n\n"):
+        raise ValueError("receipt is not valid")
     try:
-        parsed = json.loads(text)
+        parsed = json.loads(text[:-1])
     except (ValueError, RecursionError):
         raise ValueError("receipt is not valid") from None
     if not isinstance(parsed, dict) or set(parsed) != set(_RECEIPT_FIELDS):
@@ -944,6 +1093,7 @@ class RequestStore:
         self,
         db_path: str | os.PathLike[str],
         anchor_secret: str | None = None,
+        anchor_history_secrets: Mapping[int, str] | None = None,
     ):
         # Validate the path before touching the filesystem: an empty or
         # non-string path is caller error (ValueError), never a storage
@@ -963,6 +1113,16 @@ class RequestStore:
             if not isinstance(anchor_secret, str) or not anchor_secret:
                 raise ValueError("anchor_secret must be a non-empty string")
         self._anchor_secret: str | None = anchor_secret
+        # Past anchor-key generations, keyed by generation, supplied by a
+        # caller that keeps the secrets outside the database. The active
+        # secret always comes from ``anchor_secret``; this mapping only
+        # provides retired generations so anchors sealed before a
+        # rotation keep authenticating after a rebuild. It is validated
+        # and copied before the database is opened, lives only in
+        # memory, and no value in it is ever persisted.
+        self._anchor_history: dict[int, str] | None = _normalize_anchor_history(
+            anchor_history_secrets
+        )
         # In-process serialization; the unique index additionally guards
         # other processes sharing the same database file.
         self._write_lock = threading.Lock()
@@ -996,7 +1156,10 @@ class RequestStore:
                 conn.execute(_ANCHOR_TABLE)
                 conn.execute(_ANCHOR_COMMIT_SEQ_INDEX)
                 conn.execute(_ANCHOR_META_TABLE)
+                conn.execute(_ANCHOR_KEY_TABLE)
+                conn.execute(_ANCHOR_KEY_FINGERPRINT_INDEX)
                 self._migrate_schema(conn)
+                self._migrate_anchor_generation(conn)
             except sqlite3.Error:
                 raise _storage_failure() from None
         finally:
@@ -1056,6 +1219,38 @@ class RequestStore:
                     "ORDER BY e.seq DESC LIMIT 1 "
                     ") WHERE chain_hash IS NULL"
                 )
+                conn.execute("COMMIT")
+            except sqlite3.Error:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise _storage_failure() from None
+
+    def _migrate_anchor_generation(self, conn: sqlite3.Connection) -> None:
+        """Add the per-anchor key generation to an older anchored file.
+
+        The upgrade is additive and runs at most once inside a write
+        transaction: a database whose ``audit_anchors`` rows predate
+        key rotation gains a NOT NULL ``anchor_generation`` column
+        backfilled to 1 -- the only generation such a file can hold.
+        Anchor values, the global head and every event are left
+        untouched; the generation-1 fingerprint row is bootstrapped
+        lazily (at the first post-migration write or rotation), so the
+        migration itself needs no secret material.
+        """
+        if conn.execute(_ANCHOR_GENERATION_COLUMN).fetchone():
+            return
+        with self._write_lock:
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                if not conn.execute(_ANCHOR_GENERATION_COLUMN).fetchone():
+                    # DEFAULT 1 backfills every historical anchor in one
+                    # step; new code always supplies the column explicitly.
+                    conn.execute(
+                        "ALTER TABLE audit_anchors "
+                        "ADD COLUMN anchor_generation INTEGER NOT NULL DEFAULT 1"
+                    )
                 conn.execute("COMMIT")
             except sqlite3.Error:
                 try:
@@ -2874,6 +3069,40 @@ class RequestStore:
 
     # -- external trust anchors ---------------------------------------
 
+    @staticmethod
+    def _load_anchor_key_generations_locked(
+        conn: sqlite3.Connection,
+    ) -> list[tuple[int, str, str]]:
+        """Return the anchor-key generations as strict, validated rows.
+
+        Rows are ``(generation, fingerprint, effective_at)`` in
+        generation order. Generations start at 1 and are gap-free, each
+        fingerprint is 64 lowercase hex characters and each effective
+        time a UTC RFC3339 string; anything else is out-of-band
+        corruption and raises the fixed-text :class:`OSError`, never a
+        half-read generation set. An empty list means no anchor secret
+        has ever been registered (a database that never carried an
+        anchor, or one freshly migrated from a pre-rotation file).
+        """
+        rows = conn.execute(
+            "SELECT generation, key_fingerprint, effective_at "
+            "FROM anchor_key_generations ORDER BY generation"
+        ).fetchall()
+        generations: list[tuple[int, str, str]] = []
+        for index, row in enumerate(rows, start=1):
+            generation, fingerprint, effective_at = row
+            if (
+                not isinstance(generation, int)
+                or isinstance(generation, bool)
+                or generation != index
+                or not _is_chain_hash(fingerprint)
+                or not isinstance(effective_at, str)
+                or not _RFC3339_RE.match(effective_at)
+            ):
+                raise _storage_failure()
+            generations.append((generation, fingerprint, effective_at))
+        return generations
+
     def _fail_anchor_commit_locked(self, conn: sqlite3.Connection):
         """Abort an anchor write and raise the single storage error.
 
@@ -2894,18 +3123,20 @@ class RequestStore:
         """Authenticate the committed anchor state before extending it.
 
         A write under an external secret is only allowed on a database
-        whose committed evidence is already whole under *that* secret.
-        The read-only full assessment is replayed inside the write
-        transaction -- per-request chains, every external anchor's
-        authentication and the file-wide global head -- so a store
-        configured with a wrong secret, or an already tampered,
+        whose committed evidence is already whole under the secrets this
+        store holds -- the active :attr:`_anchor_secret` for the current
+        generation plus every generation named in
+        :attr:`_anchor_history`. The read-only full assessment is
+        replayed inside the write transaction -- per-request chains,
+        every external anchor's authentication under its own generation
+        and the file-wide global head -- so a store configured with a
+        wrong or incomplete secret set, or an already tampered,
         interrupted or legacy-un-anchored file, can never append an
         event or a fresh anchor. A genuinely empty file vacuously
         passes and bootstraps. The no-secret historical path is gated
         later by :meth:`_settle_anchor_locked`.
         """
-        secret = self._anchor_secret
-        if secret is None:
+        if self._anchor_secret is None and not self._anchor_history:
             return
         try:
             meta_rows = conn.execute(
@@ -2917,12 +3148,17 @@ class RequestStore:
             ).fetchall()
             anchor_rows = conn.execute(
                 "SELECT commit_seq, tenant_id, request_id, seq, event_hash, "
-                "anchor_hmac FROM audit_anchors ORDER BY commit_seq"
+                "anchor_generation, anchor_hmac FROM audit_anchors "
+                "ORDER BY commit_seq"
             ).fetchall()
             request_rows = conn.execute(
                 "SELECT tenant_id, request_id, status, chain_hash FROM requests"
             ).fetchall()
+            key_rows = self._load_anchor_key_generations_locked(conn)
         except sqlite3.Error:
+            self._fail_anchor_commit_locked(conn)
+            return
+        except OSError:
             self._fail_anchor_commit_locked(conn)
             return
         reasons = self._evaluate_chain_rows(
@@ -2930,10 +3166,44 @@ class RequestStore:
             tuple(event_rows),
             tuple(anchor_rows),
             tuple(request_rows),
-            secret,
+            tuple(key_rows),
+            self._anchor_secret,
+            self._anchor_history,
         )
         if reasons:
             self._fail_anchor_commit_locked(conn)
+
+    @staticmethod
+    def _anchor_generation_secrets(
+        key_rows: tuple,
+        active_secret: str | None,
+        history: dict[int, str] | None,
+    ) -> dict[int, str]:
+        """Resolve the secrets held for each persisted anchor generation.
+
+        The active generation is served from ``active_secret`` (it must
+        match the persisted fingerprint for anchors to authenticate);
+        every older generation is served from the caller-supplied
+        ``history`` mapping. A pre-rotation file whose generation table
+        is still empty implicitly names generation 1. The returned map
+        contains only generations this store actually holds a secret
+        for -- absent generations are reported as ``anchor_key_missing``
+        by the evaluator rather than guessed.
+        """
+        secrets: dict[int, str] = {}
+        if history:
+            for generation, secret in history.items():
+                secrets[generation] = secret
+        if key_rows:
+            active_generation = key_rows[-1][0]
+        else:
+            active_generation = 1
+        if active_secret is not None:
+            # The configured active secret always wins for the active
+            # generation, so a rotation followed by a rebuild with the
+            # new secret resolves to it rather than a stale history value.
+            secrets[active_generation] = active_secret
+        return secrets
 
     def _settle_anchor_locked(
         self,
@@ -2956,6 +3226,14 @@ class RequestStore:
         refused rather than having its past retroactively "anchored" by
         recomputation -- anchors can only cover events committed under a
         secret from the genesis on.
+
+        The new anchor is sealed under the active anchor-key generation
+        and records that generation; anchors already committed keep the
+        generation they were born with and are never rewritten. The
+        first anchor bootstraps generation 1 atomically (both for a
+        fresh file and for a file migrated from the pre-rotation
+        on-disk shape, whose historical anchors are implicitly
+        generation 1).
         """
         secret = self._anchor_secret
         try:
@@ -2993,6 +3271,9 @@ class RequestStore:
             request_predecessor = _ANCHOR_GENESIS_PREDECESSOR
             head_predecessor = _ANCHOR_GLOBAL_GENESIS
             commit_seq = 1
+            active_generation = self._bootstrap_anchor_generation_locked(
+                conn, secret, occurred_at
+            )
         else:
             # An anchored database must be internally whole before it is
             # extended: one valid head and exactly one anchor per
@@ -3004,6 +3285,9 @@ class RequestStore:
                 or event_count != anchor_count + 1
             ):
                 self._fail_anchor_commit_locked(conn)
+            active_generation = self._require_active_anchor_generation_locked(
+                conn, secret
+            )
             head_predecessor = meta_row[0]
             commit_seq = anchor_count + 1
             try:
@@ -3041,14 +3325,16 @@ class RequestStore:
         try:
             conn.execute(
                 "INSERT INTO audit_anchors ("
-                "commit_seq, tenant_id, request_id, seq, event_hash, anchor_hmac"
-                ") VALUES (?, ?, ?, ?, ?, ?)",
+                "commit_seq, tenant_id, request_id, seq, event_hash, "
+                "anchor_generation, anchor_hmac"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
                     commit_seq,
                     tenant_id,
                     request_id,
                     seq,
                     event_hash,
+                    active_generation,
                     anchor,
                 ),
             )
@@ -3060,6 +3346,76 @@ class RequestStore:
             )
         except sqlite3.Error:
             self._fail_anchor_commit_locked(conn)
+
+    def _bootstrap_anchor_generation_locked(
+        self,
+        conn: sqlite3.Connection,
+        secret: str,
+        effective_at: str,
+    ) -> int:
+        """Register the implicit active generation for a first anchor.
+
+        A pre-rotation file carries no generation rows; the first
+        anchor seals generation 1. When a rotation already bootstrapped
+        generations 1 and 2 ahead of any anchor, the active generation
+        is honoured unchanged and nothing is inserted. Returns the
+        generation under which the new anchor must be sealed. A
+        fingerprint or sequence that does not line up with the secret
+        is out-of-band corruption and rolls the write back as the
+        fixed-text storage error.
+        """
+        generations = self._load_anchor_key_generations_locked(conn)
+        fingerprint = _anchor_key_fingerprint(secret)
+        if not generations:
+            conn.execute(
+                "INSERT INTO anchor_key_generations ("
+                "generation, key_fingerprint, effective_at"
+                ") VALUES (1, ?, ?)",
+                (fingerprint, effective_at),
+            )
+            return 1
+        active_generation, active_fingerprint, _effective_at = generations[-1]
+        if not hmac.compare_digest(active_fingerprint, fingerprint):
+            # The configured secret is not the registered active
+            # generation; the write gate's own assessment must already
+            # have refused this, so reaching here is a broken invariant.
+            self._fail_anchor_commit_locked(conn)
+        return active_generation
+
+    def _require_active_anchor_generation_locked(
+        self,
+        conn: sqlite3.Connection,
+        secret: str,
+    ) -> int:
+        """Return the active generation when *secret* matches its row.
+
+        Invoked inside the write transaction that extends an already
+        anchored file. A migrated file (anchors present, generation
+        table still empty) is lazily brought under generation 1 here,
+        in the same transaction as the new anchor, so no write ever
+        happens without a persisted generation to name. Any mismatch or
+        corruption rolls the whole write back as the fixed-text storage
+        error rather than sealing under the wrong secret.
+        """
+        generations = self._load_anchor_key_generations_locked(conn)
+        fingerprint = _anchor_key_fingerprint(secret)
+        if not generations:
+            # Anchors exist (all implicitly generation 1) but the
+            # generation table predates them: register generation 1 for
+            # the secret the historical anchors authenticate under. The
+            # write gate above has already verified that chain.
+            effective_at = _utc_now_rfc3339()
+            conn.execute(
+                "INSERT INTO anchor_key_generations ("
+                "generation, key_fingerprint, effective_at"
+                ") VALUES (1, ?, ?)",
+                (fingerprint, effective_at),
+            )
+            return 1
+        active_generation, active_fingerprint, _effective_at = generations[-1]
+        if not hmac.compare_digest(active_fingerprint, fingerprint):
+            self._fail_anchor_commit_locked(conn)
+        return active_generation
 
     def verify_chain(
         self,
@@ -3177,11 +3533,13 @@ class RequestStore:
                 ).fetchall()
                 anchor_rows = conn.execute(
                     "SELECT commit_seq, tenant_id, request_id, seq, event_hash, "
-                    "anchor_hmac FROM audit_anchors ORDER BY commit_seq"
+                    "anchor_generation, anchor_hmac FROM audit_anchors "
+                    "ORDER BY commit_seq"
                 ).fetchall()
                 request_rows = conn.execute(
                     "SELECT tenant_id, request_id, status, chain_hash FROM requests"
                 ).fetchall()
+                key_rows = self._load_anchor_key_generations_locked(conn)
             except RequestNotFound:
                 raise
             except sqlite3.Error:
@@ -3193,7 +3551,9 @@ class RequestStore:
             tuple(event_rows),
             tuple(anchor_rows),
             tuple(request_rows),
+            tuple(key_rows),
             self._anchor_secret,
+            self._anchor_history,
         )
 
     @staticmethod
@@ -3202,14 +3562,36 @@ class RequestStore:
         event_rows: tuple,
         anchor_rows: tuple,
         request_rows: tuple,
-        secret: str | None,
+        key_rows: tuple,
+        active_secret: str | None,
+        history: dict[int, str] | None,
     ) -> list[str]:
         """Pure, read-only evaluation of the persisted chain state.
 
         Kept free of any connection so the logic is deterministic and
         side-effect free: it only compares and recomputes, never writes.
+
+        Each anchor authenticates under the secret of the generation it
+        records; generations are resolved from the persisted key rows
+        against the store's active secret and caller-held history. A
+        generation the store holds no secret for is reported once as
+        ``anchor_key_missing`` and its anchors are not guessed; a
+        present-but-wrong secret, a tampered association or a forged
+        anchor is reported as ``anchor_auth_failed`` -- the two are
+        kept distinct so a missing local credential is never mistaken
+        for a forged chain.
         """
         reasons: set[str] = set()
+
+        # Resolve which persisted generations this store holds secrets
+        # for. A pre-rotation file (anchors present, empty key table)
+        # implicitly names generation 1.
+        persisted_generations = {row[0] for row in key_rows}
+        effective_generations = persisted_generations or ({1} if anchor_rows else set())
+        secrets = RequestStore._anchor_generation_secrets(
+            key_rows, active_secret, history
+        )
+        holds_any_secret = active_secret is not None or bool(history)
 
         # -- singleton meta head -------------------------------------
         stored_head: str | None = None
@@ -3263,8 +3645,12 @@ class RequestStore:
             events[key] = row
 
         anchors: dict[tuple[str, str, int], tuple] = {}
+        # Every generation actually referenced by an anchor must be one
+        # the key table knows (or the implicit generation 1 of a
+        # pre-rotation file); a dangling generation is corruption.
+        referenced_generations: set[int] = set()
         for row in anchor_rows:
-            commit_seq, tenant_id, request_id, seq, event_hash, anchor_hmac = row
+            commit_seq, tenant_id, request_id, seq, event_hash, anchor_generation, anchor_hmac = row
             key = (tenant_id, request_id, seq)
             if (
                 not isinstance(commit_seq, int)
@@ -3276,13 +3662,41 @@ class RequestStore:
                 or not request_id
                 or not isinstance(seq, int)
                 or isinstance(seq, bool)
+                or not isinstance(anchor_generation, int)
+                or isinstance(anchor_generation, bool)
+                or anchor_generation < 1
                 or not _is_chain_hash(event_hash)
                 or not _is_chain_hash(anchor_hmac)
             ):
                 reasons.add(_ANCHOR_REASON_CORRUPT_ROW)
+            if isinstance(anchor_generation, int) and not isinstance(
+                anchor_generation, bool
+            ):
+                referenced_generations.add(anchor_generation)
             if key in anchors:
                 reasons.add(_ANCHOR_REASON_CORRUPT_ROW)
             anchors[key] = row
+
+        # A generation named on an anchor that the key table never
+        # registered is a forged or split association, never a missing
+        # local credential.
+        dangling_generations = referenced_generations - effective_generations
+        if dangling_generations:
+            reasons.add(_ANCHOR_REASON_AUTH_FAILED)
+
+        # Generations the chain legitimately names but this store was
+        # handed no secret for. Reported once; their anchors cannot be
+        # authenticated but the cause is a missing local secret, not a
+        # forgery. A store holding no secret at all is covered by the
+        # single ``anchor_secret_missing`` reason below and must not
+        # additionally report each generation as missing.
+        missing_generations = {
+            generation
+            for generation in referenced_generations
+            if generation in effective_generations and generation not in secrets
+        }
+        if missing_generations and holds_any_secret:
+            reasons.add(_ANCHOR_REASON_KEY_MISSING)
 
         # One-to-one keys binding: every event anchored, every anchor an
         # event, same tenant/request/sequence. A legacy database with no
@@ -3346,7 +3760,15 @@ class RequestStore:
 
                 anchor_row = anchors.get((tenant_id, request_id, expected_seq))
                 if anchor_row is not None:
-                    _cs, at, ar, aseq, event_hash, anchor_hmac = anchor_row
+                    (
+                        _cs,
+                        at,
+                        ar,
+                        aseq,
+                        event_hash,
+                        anchor_generation,
+                        anchor_hmac,
+                    ) = anchor_row
                     if (at, ar, aseq) != (tenant_id, request_id, expected_seq):
                         reasons.add(_ANCHOR_REASON_ASSOCIATION)
                     if event_hash != chain_hash:
@@ -3354,14 +3776,21 @@ class RequestStore:
                         # persisted here: a cross-request/cross-tenant
                         # substitution cannot silently rebind.
                         reasons.add(_ANCHOR_REASON_ASSOCIATION)
+                    generation_secret = (
+                        secrets.get(anchor_generation)
+                        if isinstance(anchor_generation, int)
+                        and not isinstance(anchor_generation, bool)
+                        else None
+                    )
                     if (
-                        secret is not None
+                        generation_secret is not None
                         and well_typed
                         and _is_chain_hash(chain_hash)
                         and _is_chain_hash(anchor_hmac)
+                        and anchor_generation in effective_generations
                     ):
                         expected_anchor = _anchor_mac(
-                            secret,
+                            generation_secret,
                             tenant_id,
                             request_id,
                             expected_seq,
@@ -3410,37 +3839,359 @@ class RequestStore:
             )
             if [row[0] for row in ordered] != list(range(1, len(anchor_rows) + 1)):
                 reasons.add(_ANCHOR_REASON_SEQUENCE_GAP)
-            elif secret is not None and stored_head is not None:
+            elif stored_head is not None:
+                # The head chains every anchor in commit order; each link
+                # is keyed with that anchor's own generation secret. A
+                # single link whose generation is held by no secret is
+                # reported as anchor_key_missing (above); the head is
+                # then simply not replayed to success.
                 head = _ANCHOR_GLOBAL_GENESIS
                 replay_ok = True
                 for row in ordered:
-                    commit_seq, tenant_id, request_id, seq, _event_hash, anchor_hmac = (
-                        row
+                    (
+                        commit_seq,
+                        tenant_id,
+                        request_id,
+                        seq,
+                        _event_hash,
+                        anchor_generation,
+                        anchor_hmac,
+                    ) = row
+                    generation_secret = (
+                        secrets.get(anchor_generation)
+                        if isinstance(anchor_generation, int)
+                        and not isinstance(anchor_generation, bool)
+                        else None
                     )
                     if not (
                         isinstance(tenant_id, str)
                         and isinstance(request_id, str)
                         and isinstance(seq, int)
                         and not isinstance(seq, bool)
+                        and isinstance(anchor_generation, int)
+                        and not isinstance(anchor_generation, bool)
                         and _is_chain_hash(anchor_hmac)
+                        and generation_secret is not None
+                        and anchor_generation in effective_generations
                     ):
-                        # A malformed sealing row is already flagged; the
-                        # head cannot authenticate off garbage preimages.
+                        # A malformed sealing row or a generation held by
+                        # no local secret: the head cannot be replayed to
+                        # match; the specific cause already carries its
+                        # own reason code.
                         replay_ok = False
                         break
                     head = _anchor_head_mac(
-                        secret, head, anchor_hmac, tenant_id, request_id, seq
+                        generation_secret,
+                        head,
+                        anchor_hmac,
+                        tenant_id,
+                        request_id,
+                        seq,
                     )
                 if replay_ok and not hmac.compare_digest(head, stored_head):
                     reasons.add(_ANCHOR_REASON_GLOBAL_HEAD)
 
-        if secret is None and anchor_rows:
+        if not holds_any_secret and anchor_rows:
             # An anchored file assessed by a store that holds no secret
-            # cannot be authenticated: never call an unverifiable chain
-            # trusted, however internally consistent it looks.
+            # at all cannot be authenticated: never call an unverifiable
+            # chain trusted, however internally consistent it looks.
             reasons.add(_ANCHOR_REASON_SECRET_MISSING)
 
         return sorted(reasons)
+
+    # -- anchor-key rotation -------------------------------------------
+
+    def rotate_anchor_key(
+        self,
+        retired_secret: str,
+        new_secret: str,
+    ) -> dict[str, object]:
+        """Atomically rotate the external anchor secret's generation.
+
+        Storage-layer only; never routed over HTTP. *retired_secret* is
+        the currently active anchor secret and *new_secret* its
+        successor. On success exactly one new generation becomes active
+        and the result carries ``generation`` (a positive int) and
+        ``effective_at`` (the UTC RFC3339 rotation time). Only
+        irreversible fingerprints, generations and times are persisted;
+        the secret material never enters the database, a return value,
+        an exception or a log.
+
+        Anchors already committed keep verifying under the generation
+        they were sealed with (the caller supplies those retired
+        secrets through ``anchor_history_secrets`` after a rebuild),
+        while every new anchor is sealed under the active generation;
+        existing anchors are never rewritten.
+
+        * With no generation registered yet (an empty file, or a
+          pre-rotation file whose first anchor has not been written)
+          the first rotation establishes generations 1 and 2 in one
+          atomic commit and returns generation 2.
+        * Repeating the rotation that produced the active generation is
+          idempotent and returns that first generation and time; the
+          same pair submitted concurrently converges on that one
+          result.
+        * Promoting the active generation with a fresh successor
+          succeeds exactly once. Every competing promotion based on the
+          same generation loses: after serialization its retiring secret
+          is the immediate predecessor and its successor is unrecorded,
+          and it raises :class:`AnchorKeyConflict` with generations
+          unchanged -- the same fixed outcome whether the calls truly
+          ran concurrently or a sequential caller raced the committed
+          successor.
+        * Every other rejected combination is caller error
+          (:class:`ValueError`) and commits nothing: a retiring secret
+          older than the immediate predecessor or never registered
+          (i.e. non-active and not the generation just superseded), a
+          successor secret already on record, empty/non-string
+          arguments or identical secrets.
+
+        On success this instance is immediately re-keyed in memory
+        (the new secret becomes active and the retired one joins its
+        history) so subsequent writes seal the new generation without a
+        rebuild; a rebuilt instance must be handed the current secret
+        plus the matching history to verify both old and new anchors.
+        Every storage fault is the fixed-text :class:`OSError`.
+        """
+        retired_secret = _require_nonempty_str(retired_secret, "retired_secret")
+        new_secret = _require_nonempty_str(new_secret, "new_secret")
+        if retired_secret == new_secret:
+            raise ValueError(_ANCHOR_KEY_ROTATION_INVALID)
+
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                except sqlite3.Error:
+                    raise _storage_failure() from None
+                try:
+                    result = self._apply_anchor_rotation_locked(
+                        conn, retired_secret, new_secret
+                    )
+                    conn.execute("COMMIT")
+                except (ValueError, AnchorKeyConflict):
+                    self._rollback_quietly(conn)
+                    raise
+                except OSError:
+                    self._rollback_quietly(conn)
+                    raise
+                except sqlite3.Error:
+                    self._rollback_quietly(conn)
+                    raise _storage_failure() from None
+            finally:
+                self._release(conn)
+            # Bring this instance's in-memory keying in line with the
+            # committed generation so subsequent writes seal under the
+            # new active secret and old anchors still authenticate.
+            self._adopt_anchor_generation(
+                result["generation"], retired_secret, new_secret
+            )
+        # Only the generation number is logged -- never a fingerprint
+        # or any secret material.
+        _log.info("anchor key rotated generation=%s", result["generation"])
+        return result
+
+    def _adopt_anchor_generation(
+        self,
+        active_generation: object,
+        retired_secret: str,
+        new_secret: str,
+    ) -> None:
+        """Update in-memory secrets after a committed rotation."""
+        if (
+            not isinstance(active_generation, int)
+            or isinstance(active_generation, bool)
+            or active_generation < 2
+        ):
+            # Defensive: every rotation returns a generation >= 2.
+            raise _storage_failure()
+        if self._anchor_history is None:
+            self._anchor_history = {}
+        self._anchor_history[active_generation - 1] = retired_secret
+        self._anchor_secret = new_secret
+
+    def _authenticate_legacy_anchors_locked(
+        self,
+        conn: sqlite3.Connection,
+        secret: str,
+    ) -> None:
+        """Authenticate an already-anchored, pre-generation file.
+
+        A file created before anchor-key rotation was introduced carries
+        anchors (all implicitly generation 1) but no generation rows. The
+        first rotation on such a file names the secret those historical
+        anchors were sealed with as the retiring secret; it may only be
+        registered as generation 1 after the whole committed chain --
+        per-request anchors and the file-wide head -- authenticates
+        under it. A clean chain under a *different* secret is a
+        detail-free caller error (:class:`ValueError`, the retiring
+        secret is not the secret in force); a structurally corrupt file
+        is the fixed-text :class:`OSError`.
+        """
+        try:
+            meta_rows = conn.execute(
+                "SELECT head_hmac FROM audit_anchor_meta"
+            ).fetchall()
+            event_rows = conn.execute(
+                "SELECT tenant_id, request_id, seq, status, occurred_at, "
+                "chain_hash FROM status_events ORDER BY tenant_id, request_id, seq"
+            ).fetchall()
+            anchor_rows = conn.execute(
+                "SELECT commit_seq, tenant_id, request_id, seq, event_hash, "
+                "anchor_generation, anchor_hmac FROM audit_anchors "
+                "ORDER BY commit_seq"
+            ).fetchall()
+            request_rows = conn.execute(
+                "SELECT tenant_id, request_id, status, chain_hash FROM requests"
+            ).fetchall()
+        except sqlite3.Error:
+            raise _storage_failure() from None
+        reasons = self._evaluate_chain_rows(
+            tuple(meta_rows),
+            tuple(event_rows),
+            tuple(anchor_rows),
+            tuple(request_rows),
+            (),
+            secret,
+            None,
+        )
+        if not reasons:
+            return
+        # A clean historical chain sealed under a different secret fails
+        # exactly the two secret-keyed checks; the database links (which
+        # use no secret) still recompute. The presented retiring secret
+        # is simply not the secret in force -- caller error, like any
+        # non-active retiring secret. Anything else means the persisted
+        # evidence itself is corrupt rather than miskeyed.
+        secret_only = {
+            _ANCHOR_REASON_AUTH_FAILED,
+            _ANCHOR_REASON_GLOBAL_HEAD,
+        }
+        if set(reasons) <= secret_only:
+            raise ValueError(_ANCHOR_KEY_ROTATION_INVALID)
+        raise _storage_failure()
+
+    def _apply_anchor_rotation_locked(
+        self,
+        conn: sqlite3.Connection,
+        retired_secret: str,
+        new_secret: str,
+    ) -> dict[str, object]:
+        """Apply one anchor-key rotation inside an open write txn.
+
+        The classification is decided once, inside the single
+        transaction that holds the authoritative generation state, so
+        the outcome never depends on read/write timing and the same
+        inputs always reach the same result:
+
+        * the exact pair that already produced the active generation
+          replays its first generation and time (idempotent);
+        * the immediately preceding active secret named as the
+          retiring secret with a successor not yet on record is the
+          shape of a rotation that lost to a first writer -- whether
+          the two calls were truly concurrent or a sequential caller
+          raced the committed successor -- and raises
+          :class:`AnchorKeyConflict`;
+        * a retiring secret that is neither the active generation nor
+          its immediate predecessor (an older or never-registered
+          secret), and a successor already on record, are caller
+          errors (:class:`ValueError`).
+        """
+        generations = self._load_anchor_key_generations_locked(conn)
+        retired_fp = _anchor_key_fingerprint(retired_secret)
+        new_fp = _anchor_key_fingerprint(new_secret)
+
+        if not generations:
+            # No generation rows yet. If anchors already exist (a file
+            # migrated from the pre-rotation on-disk shape) the retiring
+            # secret must actually authenticate those generation-1
+            # anchors before it is registered; a genuinely empty file is
+            # bootstrapped without that check.
+            try:
+                anchor_count = conn.execute(
+                    "SELECT count(*) FROM audit_anchors"
+                ).fetchone()[0]
+            except sqlite3.Error:
+                raise _storage_failure() from None
+            if anchor_count:
+                self._authenticate_legacy_anchors_locked(conn, retired_secret)
+            # The first rotation establishes generation 1 (the retiring
+            # secret) and generation 2 (the new secret) in this one
+            # atomic commit; a concurrent first rotation collides on the
+            # fixed slots and is handled as a lost race below.
+            effective_at = _utc_now_rfc3339()
+            try:
+                conn.execute(
+                    "INSERT INTO anchor_key_generations ("
+                    "generation, key_fingerprint, effective_at"
+                    ") VALUES (1, ?, ?), (2, ?, ?)",
+                    (retired_fp, effective_at, new_fp, effective_at),
+                )
+            except sqlite3.IntegrityError:
+                # Another first rotation committed concurrently.
+                raise AnchorKeyConflict(
+                    _ANCHOR_KEY_CONFLICT_MESSAGE
+                ) from None
+            return {"generation": 2, "effective_at": effective_at}
+
+        active_generation, active_fp, active_effective_at = generations[-1]
+
+        # Idempotent replay: the exact pair that produced the active
+        # generation returns the first generation and time.
+        if len(generations) >= 2:
+            predecessor_fp = generations[-2][1]
+            if hmac.compare_digest(
+                predecessor_fp, retired_fp
+            ) and hmac.compare_digest(active_fp, new_fp):
+                return {
+                    "generation": active_generation,
+                    "effective_at": active_effective_at,
+                }
+
+        # A successor already on record is caller error (rotating back
+        # to a retired secret, or re-registering the active one).
+        if any(
+            hmac.compare_digest(fingerprint, new_fp)
+            for _gen, fingerprint, _at in generations
+        ):
+            raise ValueError(_ANCHOR_KEY_ROTATION_INVALID)
+
+        if hmac.compare_digest(retired_fp, active_fp):
+            # Retiring the active generation with a fresh successor:
+            # promote it. The fixed next-generation slot can only be
+            # taken by one transaction; a concurrent promoter with a
+            # different successor loses here.
+            effective_at = _utc_now_rfc3339()
+            try:
+                conn.execute(
+                    "INSERT INTO anchor_key_generations ("
+                    "generation, key_fingerprint, effective_at"
+                    ") VALUES (?, ?, ?)",
+                    (active_generation + 1, new_fp, effective_at),
+                )
+            except sqlite3.IntegrityError:
+                raise AnchorKeyConflict(
+                    _ANCHOR_KEY_CONFLICT_MESSAGE
+                ) from None
+            return {
+                "generation": active_generation + 1,
+                "effective_at": effective_at,
+            }
+
+        # Retiring secret is not the active generation. When it is the
+        # immediate predecessor with a fresh successor, the request is
+        # indistinguishable (after serialization) from a rotation that
+        # ran concurrently with the promotion that just won -- the
+        # competing first writer -- so it answers the conflict rather
+        # than caller error. An older or unknown retiring secret is a
+        # plain caller error.
+        if (
+            len(generations) >= 2
+            and hmac.compare_digest(generations[-2][1], retired_fp)
+        ):
+            raise AnchorKeyConflict(_ANCHOR_KEY_CONFLICT_MESSAGE)
+        raise ValueError(_ANCHOR_KEY_ROTATION_INVALID)
 
     # -- deletion receipts ---------------------------------------------
 

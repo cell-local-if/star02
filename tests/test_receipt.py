@@ -232,9 +232,14 @@ class ReceiptTests(unittest.TestCase):
         store, accepted = self._completed()
         text = store.generate_receipt("tenant-a", accepted["request_id"], KEY)
         self.assertTrue(store.verify_receipt(text, KEY))
-        # Verification is a complete match: the trailing newline is part
-        # of the receipt text, so an incomplete copy does not match.
-        self.assertFalse(store.verify_receipt(text.rstrip("\n"), KEY))
+        # The trailing newline is part of the receipt's format: an
+        # incomplete copy missing it is malformed input and raises,
+        # rather than authenticating as a well-formed-but-different text.
+        with self.assertRaises(ValueError):
+            store.verify_receipt(text.rstrip("\n"), KEY)
+        # An extra newline is equally malformed.
+        with self.assertRaises(ValueError):
+            store.verify_receipt(text + "\n", KEY)
         # Repeated verification is stable.
         self.assertTrue(store.verify_receipt(text, KEY))
 
@@ -248,15 +253,20 @@ class ReceiptTests(unittest.TestCase):
         text = store.generate_receipt("tenant-a", accepted["request_id"], KEY)
         parsed = json.loads(text)
         # Same fields and an authentic tag, but not the stored bytes:
-        # pretty-printed, re-spaced, duplicate newline or with a BOM.
+        # pretty-printed or re-spaced. These keep the single trailing
+        # newline, so they parse but are not the persisted bytes and
+        # verify False (never repaired).
         variants = [
             json.dumps(parsed, ensure_ascii=False, indent=2) + "\n",
             json.dumps(parsed, ensure_ascii=False) + "\n",  # default spaces
-            text + "\n",
         ]
         for variant in variants:
             with self.subTest(variant=variant[:20]):
                 self.assertFalse(store.verify_receipt(variant, KEY))
+        # A repeated trailing newline is malformed input, not a
+        # well-formed receipt that merely differs in bytes.
+        with self.assertRaises(ValueError):
+            store.verify_receipt(text + "\n", KEY)
 
     def test_verify_field_substitutions_are_false(self):
         store, accepted = self._completed()
