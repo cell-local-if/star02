@@ -420,7 +420,10 @@ def _normalize_scopes(scopes: object) -> list[str]:
         items = list(scopes)  # type: ignore[arg-type]
     except TypeError as exc:
         raise ValueError("scopes must be a non-empty sequence of distinct strings") from exc
-    if not items or not all(isinstance(item, str) for item in items):
+    if (
+        not items
+        or not all(isinstance(item, str) and item for item in items)
+    ):
         raise ValueError("scopes must be a non-empty sequence of distinct strings")
     if len(set(items)) != len(items):
         raise ValueError("scopes must be a non-empty sequence of distinct strings")

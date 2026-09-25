@@ -115,6 +115,10 @@ class RequestStoreTests(unittest.TestCase):
             (),
             ["email", "email"],
             ["email", 7],
+            [None],
+            [""],
+            ["", ""],
+            ["email", ""],
             "email",
             b"email",
             {"email": 1},
@@ -127,6 +131,37 @@ class RequestStoreTests(unittest.TestCase):
                     store.submit("tenant-a", "subject-1", scopes, "key-1")
         with sqlite3.connect(self.db_path) as conn:
             self.assertEqual(conn.execute("SELECT count(*) FROM requests").fetchone()[0], 0)
+
+    def test_empty_scope_element_keeps_first_acceptance_unchanged(self):
+        store = RequestStore(self.db_path)
+        first = store.submit(
+            "tenant-a", "subject-1", ["email"], "key-1"
+        )
+        # A later call carrying an empty scope element must be rejected
+        # before any write: no second request/event and the frozen first
+        # receipt is returned verbatim by a subsequent valid replay.
+        for bad in ([""], ["email", ""], ["", "billing"]):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    store.submit("tenant-a", "subject-1", bad, "key-1")
+        with sqlite3.connect(self.db_path) as conn:
+            self.assertEqual(
+                conn.execute("SELECT count(*) FROM requests").fetchone()[0], 1
+            )
+            self.assertEqual(
+                conn.execute(
+                    "SELECT scopes_json FROM requests WHERE request_id = ?",
+                    (first["request_id"],),
+                ).fetchone()[0],
+                '["email"]',
+            )
+            self.assertEqual(
+                conn.execute("SELECT count(*) FROM status_events").fetchone()[0], 1
+            )
+        self.assertEqual(store.get("tenant-a", first["request_id"]), first)
+        self.assertEqual(
+            store.submit("tenant-a", "subject-1", ["email"], "key-1"), first
+        )
 
     def test_persistence_survives_store_rebuild(self):
         first_store = RequestStore(self.db_path)

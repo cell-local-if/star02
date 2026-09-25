@@ -115,7 +115,7 @@ class AuditTimelineTests(unittest.TestCase):
 
     def test_failed_submit_validation_appends_no_event(self):
         store = RequestStore(self.db_path)
-        for bad_scopes in ([], ["email", "email"], 123, None):
+        for bad_scopes in ([], ["email", "email"], 123, None, [""], ["email", ""]):
             with self.assertRaises(ValueError):
                 store.submit("tenant-a", "subject-1", bad_scopes, "key-x")
         with sqlite3.connect(self.db_path) as conn:
