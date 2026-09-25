@@ -158,6 +158,23 @@ fixed ``anchor_key_missing`` diagnosis rather than trusting the chain.
 Only generation numbers, effective times and irreversible fingerprints
 are persisted; the historical secrets always stay with the caller.
 
+Read-only batch inspection closes the audit capability, storage-layer
+only like the rest of the orchestration and never routed over HTTP:
+:meth:`RequestStore.audit_inspection` sweeps a tenant's requests in
+stable acceptance order (first acceptance time, then request id) in
+resumable, persistent batches. The first call creates a durable batch
+whose keyset position survives restarts; presenting the issued cursor
+resumes that batch from its committed position without re-reporting
+settled items. Each item carries only the request id, a boolean
+verified flag and a stable reason code (empty when verified): the
+request's own event chain, chain head, status, event/anchor binding
+and anchor authentication are assessed together with the file-wide
+seal (meta head, secret generations, commit order and the replayed
+global head). The sweep is strictly read-only for every audit, anchor
+and key record -- it never repairs, backfills, recomputes or
+overwrites them; only the inspection bookkeeping tables are written,
+each item and the cursor position committing in one transaction.
+
 Caller errors are always :class:`ValueError` (invalid parameters) or the
 module's own domain exceptions; every database failure -- an unwritable
 path, an uncreatable or corrupt file, an I/O or read/write error -- is
@@ -363,6 +380,39 @@ CREATE TABLE IF NOT EXISTS reconcile_batch_items (
 );
 """
 
+# Persistent audit-inspection batches. Same resumable keyset shape as
+# the reconcile batches, but for the read-only integrity sweep: the
+# batch row and its committed position survive restarts, so presenting
+# the same cursor again resumes the sweep from its durable position
+# instead of restarting it. The inspection never writes to any audit,
+# anchor or key table -- only to these two bookkeeping tables.
+_INSPECTION_BATCH_TABLE = """
+CREATE TABLE IF NOT EXISTS inspection_batches (
+    batch_id            TEXT PRIMARY KEY,
+    tenant_id           TEXT NOT NULL,
+    position_created_at TEXT,
+    position_request_id TEXT,
+    finished            INTEGER NOT NULL DEFAULT 0
+);
+"""
+
+# Per-item inspection outcomes, one row per scanned request. Each row is
+# written in the same transaction as the batch position advance, so a
+# crash can never leave a scanned request without its bookkeeping (or
+# vice versa) and a cursor retry never re-reports a settled item.
+# ``verified`` is 1/0 and ``reason`` the stable reason code reported for
+# the item (empty when the request's chain verified).
+_INSPECTION_BATCH_ITEM_TABLE = """
+CREATE TABLE IF NOT EXISTS inspection_batch_items (
+    batch_id    TEXT NOT NULL,
+    seq         INTEGER NOT NULL,
+    request_id  TEXT NOT NULL,
+    verified    INTEGER NOT NULL,
+    reason      TEXT NOT NULL,
+    PRIMARY KEY (batch_id, seq)
+);
+"""
+
 # Issued deletion receipts, at most one per request. ``receipt_json``
 # holds the exact canonical text returned to the first caller (compact
 # JSON plus the trailing newline), so a regeneration, a rebuilt instance
@@ -556,6 +606,11 @@ _MAX_BATCH_LIMIT = 1000
 # wrong prefix, bad padding, foreign JSON, unknown or cross-tenant batch --
 # is an invalid cursor and raises ValueError without touching storage.
 _CURSOR_PREFIX = "rc1."
+# Audit-inspection cursors share the reconcile cursor envelope but carry
+# their own version prefix, so a reconcile cursor presented to the
+# inspection entry point (or vice versa) is an unknown format and is
+# rejected as caller error before storage is touched.
+_INSPECTION_CURSOR_PREFIX = "ai1."
 _B64URL_CHARS = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 )
@@ -570,16 +625,16 @@ def _require_batch_limit(value: object) -> int:
     return value
 
 
-def _encode_cursor(batch_id: str, position: int) -> str:
+def _encode_cursor(batch_id: str, position: int, prefix: str = _CURSOR_PREFIX) -> str:
     """Render the opaque cursor for a batch at a given item count."""
     payload = json.dumps(
         {"v": 1, "b": batch_id, "n": position},
         separators=(",", ":"),
     ).encode("utf-8")
-    return _CURSOR_PREFIX + base64.urlsafe_b64encode(payload).decode("ascii")
+    return prefix + base64.urlsafe_b64encode(payload).decode("ascii")
 
 
-def _decode_cursor(value: object) -> tuple[str, int]:
+def _decode_cursor(value: object, prefix: str = _CURSOR_PREFIX) -> tuple[str, int]:
     """Parse and strictly validate an opaque cursor.
 
     Every malformed value -- non-string, empty, wrong prefix, bad
@@ -587,9 +642,9 @@ def _decode_cursor(value: object) -> tuple[str, int]:
     identically, so the cursor format can never be probed through
     distinguishable failures.
     """
-    if not isinstance(value, str) or not value.startswith(_CURSOR_PREFIX):
+    if not isinstance(value, str) or not value.startswith(prefix):
         raise ValueError("cursor is not valid")
-    body = value[len(_CURSOR_PREFIX) :]
+    body = value[len(prefix) :]
     if (
         not body
         or len(body) % 4 != 0
@@ -1092,6 +1147,8 @@ class RequestStore:
                 conn.execute(_CLAIM_CANDIDATE_INDEX)
                 conn.execute(_BATCH_TABLE)
                 conn.execute(_BATCH_ITEM_TABLE)
+                conn.execute(_INSPECTION_BATCH_TABLE)
+                conn.execute(_INSPECTION_BATCH_ITEM_TABLE)
                 conn.execute(_RECEIPT_TABLE)
                 conn.execute(_RECEIPT_KEY_TABLE)
                 conn.execute(_RECEIPT_KEY_FINGERPRINT_INDEX)
@@ -2842,6 +2899,777 @@ class RequestStore:
         if cursor.rowcount != 1:
             raise _storage_failure()
 
+    # -- read-only audit inspection ------------------------------------
+
+    def audit_inspection(
+        self,
+        tenant_id: str,
+        cursor: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, object]:
+        """Inspect a tenant's settled audit chains in resumable batches.
+
+        Storage-layer only; never routed over HTTP. With ``cursor``
+        omitted a new persistent batch sweeps the tenant's requests in
+        stable acceptance order (``created_at`` then ``request_id``);
+        with a cursor the batch it names is resumed from its durably
+        committed position, so a retry after an interruption or a
+        service restart continues instead of restarting, and the same
+        cursor always keeps the same batch identifier. Each call
+        inspects at most ``limit`` requests (default 100, at most 1000)
+        and returns exactly ``batch_id``, ``next_cursor`` (``None`` once
+        the sweep is finished), ``finished`` and ``items`` -- one
+        ``{"request_id", "verified", "reason"}`` entry per scanned
+        request, in scan order. ``verified`` is a boolean and
+        ``reason`` the stable, detail-free reason code the request's
+        chain failed with (the empty string when it verified).
+
+        Each request is assessed against its settled audit evidence
+        exactly like the read-only full-chain verification: the event
+        order and database link hashes, the request row's chain head
+        and current status, the one-to-one event/anchor binding, every
+        anchor's authentication under its own sealing generation, and
+        the file-wide seal (the singleton meta head, the secret
+        generation records, the gap-free global commit order and the
+        replayed global anchor head). A healthy request verifies with
+        an empty reason; deleted, altered, inserted or reordered
+        events, cross-request or cross-tenant substitutions, a tampered
+        chain head, anchor or global head, a missing historical secret,
+        a broken generation association, a forged chain, an un-anchored
+        legacy database and an interrupted commit all report
+        ``verified`` false with a stable reason code.
+
+        The sweep is strictly read-only for every audit, anchor and key
+        record: it never repairs, backfills, recomputes or overwrites
+        them. Only the inspection bookkeeping tables are written -- the
+        batch row, one item row per scanned request and the cursor
+        position, each item committing in its own transaction together
+        with the position advance, so a failed call never returns
+        half-settled results and a committed item is never re-reported.
+
+        A non-string/empty *tenant_id*, a limit outside 1..1000 (or a
+        non-integer or boolean), and any malformed, unknown or
+        cross-tenant *cursor* raise :class:`ValueError` without
+        writing. Corrupt persisted batch state and every storage fault
+        raise the fixed-text :class:`OSError`.
+        """
+        # Validate everything before touching the database: no rejected
+        # call may perform a write.
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        if limit is None:
+            limit = _DEFAULT_BATCH_LIMIT
+        limit = _require_batch_limit(limit)
+        cursor_batch: tuple[str, int] | None = None
+        if cursor is not None:
+            cursor_batch = _decode_cursor(cursor, _INSPECTION_CURSOR_PREFIX)
+
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                # First transaction resolves the batch: a fresh batch row
+                # is inserted when no cursor was given; a cursor names the
+                # persisted batch to resume. An unknown/cross-tenant cursor
+                # is rejected here before anything is written.
+                batch_id, _pos, _rid, finished, _start_count = (
+                    self._batch_transaction(
+                        conn,
+                        lambda: self._load_or_init_inspection_locked(
+                            conn, tenant_id, cursor_batch
+                        ),
+                    )
+                )
+                items: list[dict[str, object]] = []
+                # Each scanned request is assessed and recorded in its OWN
+                # transaction: the item row and the cursor position commit
+                # together. The next iteration re-reads the persisted
+                # position, so an item already settled by an earlier commit
+                # or a concurrent call is never re-reported.
+                while not finished and len(items) < limit:
+                    kind, payload = self._batch_transaction(
+                        conn,
+                        lambda: self._process_one_inspection_item_locked(
+                            conn, tenant_id, batch_id
+                        ),
+                    )
+                    if kind == "finished":
+                        finished = True
+                        break
+                    items.append(payload)
+                # Resolve the authoritative outcome in one final short
+                # transaction: whether the sweep is finished AND the durable
+                # settled-item count are both read from the database rather
+                # than from this call's in-memory tally, so the issued
+                # cursor names a position that matches what is durably
+                # committed (another store instance may share the file).
+                finished, durable_count = self._batch_transaction(
+                    conn,
+                    lambda: self._finalize_inspection_if_end_locked(
+                        conn, tenant_id, batch_id
+                    ),
+                )
+            finally:
+                self._release(conn)
+        # The cursor only identifies the persisted batch; its item count is
+        # the database-authoritative settled count read in the final
+        # transaction.
+        next_cursor = (
+            None
+            if finished
+            else _encode_cursor(batch_id, durable_count, _INSPECTION_CURSOR_PREFIX)
+        )
+        # Log only counts and the stable outcome: no tenant, subject,
+        # credential or SQL text ever reaches the log.
+        _log.info(
+            "audit inspection settled items=%s finished=%s",
+            len(items),
+            finished,
+        )
+        return {
+            "batch_id": batch_id,
+            "next_cursor": next_cursor,
+            "finished": finished,
+            "items": items,
+        }
+
+    def _load_or_init_inspection_locked(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        cursor_batch: tuple[str, int] | None,
+    ) -> tuple[str, str | None, str | None, bool, int]:
+        """Resolve the inspection batch for this call in an open write txn.
+
+        Returns ``(batch_id, position_created_at, position_request_id,
+        finished, item_count)``. Without a cursor a fresh batch row is
+        inserted; with a cursor the persisted batch is resumed from its
+        committed position -- the cursor's own position field is only a
+        format detail, the database is authoritative. An unknown or
+        cross-tenant batch id is an invalid cursor and raises
+        :class:`ValueError`; corrupt persisted state raises the
+        fixed-text :class:`OSError`.
+        """
+        if cursor_batch is None:
+            batch_id = str(uuid.uuid4())
+            conn.execute(
+                "INSERT INTO inspection_batches ("
+                "batch_id, tenant_id, position_created_at, "
+                "position_request_id, finished"
+                ") VALUES (?, ?, NULL, NULL, 0)",
+                (batch_id, tenant_id),
+            )
+            return batch_id, None, None, False, 0
+        batch_id, _issued_position = cursor_batch
+        # Confirm ownership before reading state: an unknown or
+        # cross-tenant batch id is an invalid cursor, indistinguishable
+        # from one that never existed.
+        owner = conn.execute(
+            "SELECT 1 FROM inspection_batches WHERE batch_id = ? AND tenant_id = ?",
+            (batch_id, tenant_id),
+        ).fetchone()
+        if owner is None:
+            raise ValueError("cursor is not valid")
+        pos_created, pos_rid, finished, item_count = (
+            self._read_inspection_state_locked(conn, batch_id)
+        )
+        return batch_id, pos_created, pos_rid, finished, item_count
+
+    def _read_inspection_state_locked(
+        self, conn: sqlite3.Connection, batch_id: str
+    ) -> tuple[str | None, str | None, bool, int]:
+        """Read and strictly validate an inspection batch's position."""
+        row = conn.execute(
+            "SELECT position_created_at, position_request_id, finished, "
+            "(SELECT count(*) FROM inspection_batch_items i "
+            " WHERE i.batch_id = b.batch_id) "
+            "FROM inspection_batches b WHERE b.batch_id = ?",
+            (batch_id,),
+        ).fetchone()
+        if row is None:
+            # The batch this transaction is driving vanished out of band.
+            raise _storage_failure()
+        pos_created, pos_rid, finished, item_count = row
+        if (
+            finished not in (0, 1)
+            or not isinstance(item_count, int)
+            or isinstance(item_count, bool)
+        ):
+            raise _storage_failure()
+        if (pos_created is None) != (pos_rid is None):
+            # The keyset position is written atomically; a split pair is
+            # out-of-band corruption, never a resumable state.
+            raise _storage_failure()
+        if pos_created is not None and (
+            not isinstance(pos_created, str)
+            or not pos_created
+            or not isinstance(pos_rid, str)
+            or not pos_rid
+        ):
+            raise _storage_failure()
+        return pos_created, pos_rid, bool(finished), item_count
+
+    def _process_one_inspection_item_locked(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        batch_id: str,
+    ) -> tuple[str, object]:
+        """Inspect the next request in scan order inside an open write txn.
+
+        Re-reads the batch's persisted position every call, so the
+        result is independent of any in-memory position. Returns
+        ``("finished", None)`` once the sweep end is reached, or
+        ``("item", {"request_id", "verified", "reason"})`` after
+        assessing one request and recording its item. The request's
+        audit evidence is only read: the assessment never repairs,
+        backfills, recomputes or overwrites any audit, anchor or key
+        record -- the item row and the batch position are the only
+        writes, and they commit together.
+        """
+        pos_created, pos_rid, finished, item_count = (
+            self._read_inspection_state_locked(conn, batch_id)
+        )
+        if finished:
+            return "finished", None
+        row = self._next_inspection_candidate(conn, tenant_id, pos_created, pos_rid)
+        if row is None:
+            self._finish_inspection_locked(conn, batch_id)
+            return "finished", None
+        request_id, created_at = row
+        item = self._inspect_request_locked(conn, tenant_id, request_id)
+        # The item row and the cursor position land in this one
+        # transaction; the sequence derives from the persisted count so
+        # a resumed batch never reuses a number.
+        conn.execute(
+            "INSERT INTO inspection_batch_items ("
+            "batch_id, seq, request_id, verified, reason"
+            ") VALUES (?, ?, ?, ?, ?)",
+            (
+                batch_id,
+                item_count + 1,
+                request_id,
+                1 if item["verified"] else 0,
+                item["reason"],
+            ),
+        )
+        self._advance_inspection_locked(conn, batch_id, created_at, request_id)
+        return "item", item
+
+    def _finalize_inspection_if_end_locked(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        batch_id: str,
+    ) -> tuple[bool, int]:
+        """Finish a limit-stopped inspection iff no candidate remains.
+
+        Always returns the authoritative ``(finished, item_count)`` read
+        from the persisted batch inside this write transaction, so the
+        caller can issue a cursor whose position matches the durable
+        tally rather than its own per-call snapshot.
+        """
+        pos_created, pos_rid, finished, item_count = (
+            self._read_inspection_state_locked(conn, batch_id)
+        )
+        if finished:
+            return True, item_count
+        if self._next_inspection_candidate(conn, tenant_id, pos_created, pos_rid) is None:
+            self._finish_inspection_locked(conn, batch_id)
+            return True, item_count
+        return False, item_count
+
+    @staticmethod
+    def _next_inspection_candidate(
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        pos_created: str | None,
+        pos_rid: str | None,
+    ) -> tuple[str, str] | None:
+        """Oldest request strictly after the keyset position.
+
+        Every request of the tenant is swept, whatever its status: the
+        inspection covers the settled audit chain each acceptance
+        started. The (created_at, request_id) ordering is the same
+        stable order the claim and reconcile scans use, so the sweep is
+        stable across calls, restarts and concurrent submissions.
+        """
+        if pos_created is None:
+            return conn.execute(
+                "SELECT request_id, created_at FROM requests "
+                "WHERE tenant_id = ? "
+                "ORDER BY created_at ASC, request_id ASC LIMIT 1",
+                (tenant_id,),
+            ).fetchone()
+        return conn.execute(
+            "SELECT request_id, created_at FROM requests "
+            "WHERE tenant_id = ? AND (created_at, request_id) > (?, ?) "
+            "ORDER BY created_at ASC, request_id ASC LIMIT 1",
+            (tenant_id, pos_created, pos_rid),
+        ).fetchone()
+
+    @staticmethod
+    def _advance_inspection_locked(
+        conn: sqlite3.Connection,
+        batch_id: str,
+        pos_created: str,
+        pos_rid: str,
+    ) -> None:
+        """Move the inspection batch's durable keyset position forward."""
+        cursor = conn.execute(
+            "UPDATE inspection_batches "
+            "SET position_created_at = ?, position_request_id = ? "
+            "WHERE batch_id = ?",
+            (pos_created, pos_rid, batch_id),
+        )
+        if cursor.rowcount != 1:
+            # The batch row this transaction itself resolved vanished;
+            # that is storage corruption, never a caller error.
+            raise _storage_failure()
+
+    @staticmethod
+    def _finish_inspection_locked(conn: sqlite3.Connection, batch_id: str) -> None:
+        """Mark the inspection batch durably finished in the open txn."""
+        cursor = conn.execute(
+            "UPDATE inspection_batches SET finished = 1 WHERE batch_id = ?",
+            (batch_id,),
+        )
+        if cursor.rowcount != 1:
+            raise _storage_failure()
+
+    def _inspect_request_locked(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        request_id: str,
+    ) -> dict[str, object]:
+        """Assess one request's settled chain inside the open transaction.
+
+        Reads the same persisted evidence the full-chain assessment
+        uses, then evaluates the request's own chain together with the
+        file-wide seal that also binds it. Purely read-only: nothing is
+        written, repaired, recomputed-into-place or overwritten.
+        """
+        meta_rows = conn.execute(
+            "SELECT head_hmac FROM audit_anchor_meta"
+        ).fetchall()
+        event_rows = conn.execute(
+            "SELECT tenant_id, request_id, seq, status, occurred_at, "
+            "chain_hash FROM status_events ORDER BY tenant_id, request_id, seq"
+        ).fetchall()
+        anchor_rows = conn.execute(
+            "SELECT commit_seq, tenant_id, request_id, seq, event_hash, "
+            "anchor_hmac, key_generation FROM audit_anchors ORDER BY commit_seq"
+        ).fetchall()
+        request_rows = conn.execute(
+            "SELECT tenant_id, request_id, status, chain_hash FROM requests"
+        ).fetchall()
+        generation_rows = conn.execute(
+            "SELECT generation, key_fingerprint, effective_at "
+            "FROM anchor_key_generations ORDER BY generation"
+        ).fetchall()
+        reasons = self._evaluate_inspection_rows(
+            tuple(meta_rows),
+            tuple(event_rows),
+            tuple(anchor_rows),
+            tuple(request_rows),
+            tuple(generation_rows),
+            self._anchor_secret,
+            self._anchor_history_secrets,
+            (tenant_id, request_id),
+        )
+        return {
+            "request_id": request_id,
+            "verified": not reasons,
+            "reason": reasons[0] if reasons else "",
+        }
+
+    @staticmethod
+    def _evaluate_inspection_rows(
+        meta_rows: tuple,
+        event_rows: tuple,
+        anchor_rows: tuple,
+        request_rows: tuple,
+        generation_rows: tuple,
+        secret: str | None,
+        history_secrets: Mapping[int, str],
+        scope: tuple[str, str],
+    ) -> list[str]:
+        """Pure, read-only per-request evaluation of the persisted chain.
+
+        Kept free of any connection so the logic is deterministic and
+        side-effect free: it only compares and recomputes, never writes.
+        Returns the sorted stable reason codes that make the scoped
+        request's settled audit chain untrusted -- an empty list means
+        the request verifies. Two layers are assessed:
+
+        * the request's own evidence: event order and database link
+          hashes, the request row's chain head and current status, the
+          one-to-one event/anchor binding and every anchor's
+          authentication under the secret of the generation recorded on
+          its own row;
+        * the file-wide seal the request cannot be trusted without: the
+          singleton meta head, the secret-generation records, the
+          gap-free global commit order, the replayed global anchor head
+          and file-wide split or orphaned evidence.
+        """
+        scope_tenant, scope_request = scope
+        global_reasons: set[str] = set()
+        scoped_reasons: set[str] = set()
+
+        # -- singleton meta head (file-wide) -------------------------
+        stored_head: str | None = None
+        if len(meta_rows) > 1:
+            global_reasons.add(_ANCHOR_REASON_META_CORRUPT)
+        elif meta_rows:
+            stored_head = meta_rows[0][0]
+            if not _is_chain_hash(stored_head):
+                global_reasons.add(_ANCHOR_REASON_META_CORRUPT)
+                stored_head = None
+
+        # -- secret generations (file-wide) --------------------------
+        # One gap-free row per generation that has ever sealed anchors,
+        # starting at 1, each with a well-formed fingerprint and an
+        # effective time; legacy anchors carry NULL and are attributed
+        # to generation 1.
+        generation_fingerprints: dict[int, str] = {}
+        generation_corrupt = False
+        for index, grow in enumerate(generation_rows, start=1):
+            generation, fingerprint, effective_at = grow
+            if (
+                not isinstance(generation, int)
+                or isinstance(generation, bool)
+                or generation != index
+                or not _is_chain_hash(fingerprint)
+                or not isinstance(effective_at, str)
+                or not _RFC3339_RE.match(effective_at)
+            ):
+                generation_corrupt = True
+            if isinstance(generation, int) and not isinstance(generation, bool):
+                generation_fingerprints[generation] = fingerprint
+        if anchor_rows and generation_corrupt:
+            global_reasons.add(_ANCHOR_REASON_CORRUPT_ROW)
+        if generation_rows and not anchor_rows:
+            # Secret generations without a single anchor are only valid
+            # as the bootstrap-rotation shape (exactly generations 1 and
+            # 2 sharing one effective time).
+            bootstrap_shape = (
+                not generation_corrupt
+                and [g for g, _f, _t in generation_rows] == [1, 2]
+                and generation_rows[0][2] == generation_rows[1][2]
+            )
+            if not bootstrap_shape:
+                global_reasons.add(_ANCHOR_REASON_CORRUPT_ROW)
+
+        # -- event/anchor population invariants (file-wide) ----------
+        # A database with events but no anchor rows is the historical
+        # un-anchored shape: old content is never judged trusted.
+        legacy_unanchored = bool(event_rows) and not anchor_rows
+        if legacy_unanchored:
+            global_reasons.add(_ANCHOR_REASON_UNANCHORED)
+        if anchor_rows and not event_rows:
+            global_reasons.add(_ANCHOR_REASON_STATE_SPLIT)
+        if anchor_rows and stored_head is None:
+            # Sealed anchors without a global head: an interrupted
+            # commit or out-of-band deletion.
+            global_reasons.add(_ANCHOR_REASON_META_CORRUPT)
+
+        # -- index the rows ------------------------------------------
+        # A malformed evidence row anywhere corrupts the file every
+        # request's seal is replayed against, so it is a file-wide
+        # reason rather than a per-request one.
+        events: dict[tuple, tuple] = {}
+        for row in event_rows:
+            tenant_id, request_id, seq, status, occurred_at, chain_hash = row
+            key = (tenant_id, request_id, seq)
+            if (
+                not isinstance(tenant_id, str)
+                or not tenant_id
+                or not isinstance(request_id, str)
+                or not request_id
+                or not isinstance(seq, int)
+                or isinstance(seq, bool)
+                or not isinstance(status, str)
+                or not status
+                or not isinstance(occurred_at, str)
+                or not occurred_at
+                or not _is_chain_hash(chain_hash)
+            ):
+                global_reasons.add(_ANCHOR_REASON_CORRUPT_ROW)
+            if key in events:
+                global_reasons.add(_ANCHOR_REASON_CORRUPT_ROW)
+            events[key] = row
+
+        anchors: dict[tuple, tuple] = {}
+        for row in anchor_rows:
+            (
+                commit_seq,
+                tenant_id,
+                request_id,
+                seq,
+                event_hash,
+                anchor_hmac,
+                key_generation,
+            ) = row
+            key = (tenant_id, request_id, seq)
+            if (
+                not isinstance(commit_seq, int)
+                or isinstance(commit_seq, bool)
+                or commit_seq < 1
+                or not isinstance(tenant_id, str)
+                or not tenant_id
+                or not isinstance(request_id, str)
+                or not request_id
+                or not isinstance(seq, int)
+                or isinstance(seq, bool)
+                or not _is_chain_hash(event_hash)
+                or not _is_chain_hash(anchor_hmac)
+                # NULL is the legacy attribution (generation 1); any
+                # present value must be a positive integer.
+                or not (
+                    key_generation is None
+                    or (
+                        isinstance(key_generation, int)
+                        and not isinstance(key_generation, bool)
+                        and key_generation >= 1
+                    )
+                )
+            ):
+                global_reasons.add(_ANCHOR_REASON_CORRUPT_ROW)
+            if key in anchors:
+                global_reasons.add(_ANCHOR_REASON_CORRUPT_ROW)
+            anchors[key] = row
+
+        requests_by_key = {
+            (tenant_id, request_id): (status, chain_hash)
+            for tenant_id, request_id, status, chain_hash in request_rows
+        }
+
+        # Evidence naming a request row that no longer exists is
+        # file-wide corruption: no scanned item can be trusted to be
+        # the whole story while stray rows circulate.
+        for tenant_id, request_id, _seq in list(events) + list(anchors):
+            if (tenant_id, request_id) not in requests_by_key:
+                global_reasons.add(_ANCHOR_REASON_ASSOCIATION)
+
+        # -- the scoped request's own chain --------------------------
+        scope_key = (scope_tenant, scope_request)
+        scoped_event_keys = {
+            key for key in events if (key[0], key[1]) == scope_key
+        }
+        scoped_anchor_keys = {
+            key for key in anchors if (key[0], key[1]) == scope_key
+        }
+        # One-to-one binding: every event anchored, every anchor an
+        # event. A legacy database with no anchors at all is already
+        # reported as the single unanchored reason and must not cascade.
+        if not legacy_unanchored and scoped_event_keys - scoped_anchor_keys:
+            scoped_reasons.add(_ANCHOR_REASON_EVENT_UNANCHORED)
+        if scoped_anchor_keys - scoped_event_keys:
+            scoped_reasons.add(_ANCHOR_REASON_ANCHOR_ORPHAN)
+
+        rows = [events[key] for key in scoped_event_keys]
+        # A tampered seq must not raise out of the sort; such a row is
+        # already flagged and sorts deterministically to the front.
+        rows.sort(
+            key=lambda row: (
+                not isinstance(row[2], int) or isinstance(row[2], bool),
+                row[2]
+                if isinstance(row[2], int) and not isinstance(row[2], bool)
+                else -1,
+            )
+        )
+        predecessor = _GENESIS_PREDECESSOR
+        anchor_predecessor = _ANCHOR_GENESIS_PREDECESSOR
+        if not rows:
+            # A request row without a single event can only come from
+            # out-of-band deletion: the acceptance event is written in
+            # the same transaction as the request.
+            scoped_reasons.add(_ANCHOR_REASON_EVENT_ORDER)
+        for expected_seq, row in enumerate(rows):
+            _t, _r, seq, status, occurred_at, chain_hash = row
+            well_typed = (
+                isinstance(seq, int)
+                and not isinstance(seq, bool)
+                and isinstance(status, str)
+                and isinstance(occurred_at, str)
+            )
+            if (
+                isinstance(seq, int)
+                and not isinstance(seq, bool)
+                and seq != expected_seq
+            ):
+                # Deleted, inserted or renumbered event.
+                scoped_reasons.add(_ANCHOR_REASON_EVENT_ORDER)
+            if well_typed:
+                recomputed = _chain_hash(
+                    scope_tenant,
+                    scope_request,
+                    expected_seq,
+                    status,
+                    occurred_at,
+                    predecessor,
+                )
+                if not hmac.compare_digest(recomputed, chain_hash):
+                    scoped_reasons.add(_ANCHOR_REASON_CHAIN_MISMATCH)
+            predecessor = chain_hash if isinstance(chain_hash, str) else ""
+
+            anchor_row = anchors.get((scope_tenant, scope_request, expected_seq))
+            if anchor_row is not None:
+                (
+                    _cs,
+                    at,
+                    ar,
+                    aseq,
+                    event_hash,
+                    anchor_hmac,
+                    anchor_generation,
+                ) = anchor_row
+                if (at, ar, aseq) != (scope_tenant, scope_request, expected_seq):
+                    scoped_reasons.add(_ANCHOR_REASON_ASSOCIATION)
+                if event_hash != chain_hash:
+                    # The anchor seals a different event than the one
+                    # persisted here: a cross-request/cross-tenant
+                    # substitution cannot silently rebind.
+                    scoped_reasons.add(_ANCHOR_REASON_ASSOCIATION)
+                if (
+                    secret is not None
+                    and well_typed
+                    and _is_chain_hash(chain_hash)
+                    and _is_chain_hash(anchor_hmac)
+                ):
+                    sealing_secret, secret_status = (
+                        RequestStore._resolve_anchor_generation_secret(
+                            anchor_generation,
+                            generation_fingerprints,
+                            secret,
+                            history_secrets,
+                        )
+                    )
+                    if secret_status == "missing":
+                        # The store was not handed this anchor's
+                        # historical generation: it can neither
+                        # authenticate nor forge this anchor.
+                        scoped_reasons.add(_ANCHOR_REASON_KEY_MISSING)
+                    elif secret_status in ("association", "wrong"):
+                        # A forged generation association, or a handed
+                        # secret that does not match the generation's
+                        # persisted fingerprint, can never authenticate.
+                        scoped_reasons.add(_ANCHOR_REASON_AUTH_FAILED)
+                    else:
+                        expected_anchor = _anchor_mac(
+                            sealing_secret,
+                            scope_tenant,
+                            scope_request,
+                            expected_seq,
+                            status,
+                            occurred_at,
+                            chain_hash,
+                            anchor_predecessor,
+                        )
+                        if not hmac.compare_digest(expected_anchor, anchor_hmac):
+                            scoped_reasons.add(_ANCHOR_REASON_AUTH_FAILED)
+                anchor_predecessor = (
+                    anchor_hmac if isinstance(anchor_hmac, str) else ""
+                )
+
+        request_row = requests_by_key.get(scope_key)
+        if request_row is None:
+            # Unreachable through the scan (the row was just read), but
+            # an out-of-band delete between transactions is corruption.
+            scoped_reasons.add(_ANCHOR_REASON_ASSOCIATION)
+        else:
+            current_status, anchored_head = request_row
+            if not _is_chain_hash(anchored_head):
+                scoped_reasons.add(_ANCHOR_REASON_HEAD_MISMATCH)
+            elif not hmac.compare_digest(anchored_head, predecessor):
+                scoped_reasons.add(_ANCHOR_REASON_HEAD_MISMATCH)
+            if rows:
+                final_status = rows[-1][3]
+                if (
+                    not isinstance(current_status, str)
+                    or not isinstance(final_status, str)
+                    or current_status != final_status
+                ):
+                    scoped_reasons.add(_ANCHOR_REASON_STATUS_MISMATCH)
+
+        # -- global seal: gap-free commit order and the head ---------
+        if anchor_rows:
+            ordered = sorted(
+                (
+                    row
+                    for row in anchor_rows
+                    if isinstance(row[0], int) and not isinstance(row[0], bool)
+                ),
+                key=lambda row: row[0],
+            )
+            if [row[0] for row in ordered] != list(range(1, len(anchor_rows) + 1)):
+                global_reasons.add(_ANCHOR_REASON_SEQUENCE_GAP)
+            elif secret is not None and stored_head is not None:
+                head = _ANCHOR_GLOBAL_GENESIS
+                replay_ok = True
+                replay_block_reason: str | None = None
+                for row in ordered:
+                    (
+                        _commit_seq,
+                        tenant_id,
+                        request_id,
+                        seq,
+                        _event_hash,
+                        anchor_hmac,
+                        anchor_generation,
+                    ) = row
+                    if not (
+                        isinstance(tenant_id, str)
+                        and isinstance(request_id, str)
+                        and isinstance(seq, int)
+                        and not isinstance(seq, bool)
+                        and _is_chain_hash(anchor_hmac)
+                    ):
+                        # A malformed sealing row is already flagged; the
+                        # head cannot authenticate off garbage preimages.
+                        replay_ok = False
+                        break
+                    sealing_secret, secret_status = (
+                        RequestStore._resolve_anchor_generation_secret(
+                            anchor_generation,
+                            generation_fingerprints,
+                            secret,
+                            history_secrets,
+                        )
+                    )
+                    if secret_status != "ok":
+                        # The head replay needs every row's actual
+                        # sealing secret; without it the file-wide seal
+                        # cannot be checked and no request may be judged
+                        # trusted on an unverifiable seal.
+                        replay_ok = False
+                        replay_block_reason = (
+                            _ANCHOR_REASON_KEY_MISSING
+                            if secret_status == "missing"
+                            else _ANCHOR_REASON_AUTH_FAILED
+                        )
+                        break
+                    head = _anchor_head_mac(
+                        sealing_secret,
+                        head,
+                        anchor_hmac,
+                        tenant_id,
+                        request_id,
+                        seq,
+                    )
+                if replay_ok:
+                    if not hmac.compare_digest(head, stored_head):
+                        global_reasons.add(_ANCHOR_REASON_GLOBAL_HEAD)
+                elif replay_block_reason is not None:
+                    global_reasons.add(replay_block_reason)
+
+        if secret is None and anchor_rows:
+            # An anchored file assessed by a store that holds no secret
+            # cannot be authenticated: never call an unverifiable chain
+            # trusted, however internally consistent it looks.
+            global_reasons.add(_ANCHOR_REASON_SECRET_MISSING)
+
+        return sorted(global_reasons | scoped_reasons)
+
     def audit(
         self,
         tenant_id: str,
@@ -3654,46 +4482,10 @@ class RequestStore:
                 reasons.add(_ANCHOR_REASON_CORRUPT_ROW)
             anchors[key] = row
 
-        active_generation = max(generation_fingerprints, default=None)
-
         def resolve_generation_secret(key_generation: object):
-            """Resolve the secret an anchor was sealed under.
-
-            Returns ``(secret, status)`` where status is ``"ok"``,
-            ``"missing"`` (the generation's secret was not handed to
-            this store), ``"wrong"`` (the handed secret does not match
-            the generation's persisted fingerprint) or
-            ``"association"`` (the anchor names no known generation).
-            A NULL attribution on a file whose generations table is
-            empty is the pre-rotation legacy shape: its one secret is
-            the configured secret and authenticates directly, exactly
-            like a historical receipt verifying on its tag alone.
-            """
-            if key_generation is None and not generation_fingerprints:
-                if secret is None:
-                    return None, "missing"
-                return secret, "ok"
-            generation = 1 if key_generation is None else key_generation
-            if (
-                not isinstance(generation, int)
-                or isinstance(generation, bool)
-                or generation < 1
-                or generation not in generation_fingerprints
-            ):
-                return None, "association"
-            candidate: str | None
-            if secret is not None and generation == active_generation:
-                candidate = secret
-            else:
-                candidate = history_secrets.get(generation)
-            if candidate is None:
-                return None, "missing"
-            if not hmac.compare_digest(
-                _anchor_key_fingerprint(candidate),
-                generation_fingerprints[generation],
-            ):
-                return None, "wrong"
-            return candidate, "ok"
+            return RequestStore._resolve_anchor_generation_secret(
+                key_generation, generation_fingerprints, secret, history_secrets
+            )
 
         # One-to-one keys binding: every event anchored, every anchor an
         # event, same tenant/request/sequence. A legacy database with no
@@ -3903,6 +4695,53 @@ class RequestStore:
             reasons.add(_ANCHOR_REASON_SECRET_MISSING)
 
         return sorted(reasons)
+
+    @staticmethod
+    def _resolve_anchor_generation_secret(
+        key_generation: object,
+        generation_fingerprints: dict[int, str],
+        secret: str | None,
+        history_secrets: Mapping[int, str],
+    ):
+        """Resolve the secret an anchor was sealed under.
+
+        Returns ``(secret, status)`` where status is ``"ok"``,
+        ``"missing"`` (the generation's secret was not handed to this
+        store), ``"wrong"`` (the handed secret does not match the
+        generation's persisted fingerprint) or ``"association"`` (the
+        anchor names no known generation). A NULL attribution on a file
+        whose generations table is empty is the pre-rotation legacy
+        shape: its one secret is the configured secret and authenticates
+        directly, exactly like a historical receipt verifying on its tag
+        alone.
+        """
+        if key_generation is None and not generation_fingerprints:
+            if secret is None:
+                return None, "missing"
+            return secret, "ok"
+        generation = 1 if key_generation is None else key_generation
+        if (
+            not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or generation < 1
+            or generation not in generation_fingerprints
+        ):
+            return None, "association"
+        candidate: str | None
+        if secret is not None and generation == max(
+            generation_fingerprints, default=None
+        ):
+            candidate = secret
+        else:
+            candidate = history_secrets.get(generation)
+        if candidate is None:
+            return None, "missing"
+        if not hmac.compare_digest(
+            _anchor_key_fingerprint(candidate),
+            generation_fingerprints[generation],
+        ):
+            return None, "wrong"
+        return candidate, "ok"
 
     # -- anchor key rotation -------------------------------------------
 
