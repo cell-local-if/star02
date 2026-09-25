@@ -158,6 +158,25 @@ fixed ``anchor_key_missing`` diagnosis rather than trusting the chain.
 Only generation numbers, effective times and irreversible fingerprints
 are persisted; the historical secrets always stay with the caller.
 
+Batch audit inspection complements the per-call verification with a
+resumable, strictly read-only sweep:
+:meth:`RequestStore.audit_inspection` scans a tenant's requests in
+stable acceptance order (first acceptance time, then request id),
+verifies the settled audit chain of each and returns a batch
+identifier, an opaque next cursor, a finished flag and one
+``{"request_id", "verified", "reasons"}`` entry per scanned request.
+The first call (no cursor) creates a persistent batch whose position
+survives restarts; presenting the same cursor resumes that batch from
+its durably committed position and never re-reports a settled item.
+The sweep only reads and verifies: it never repairs, backfills,
+recomputes or overwrites any audit, anchor or key record, and a
+request whose chain cannot be trusted is reported with the same fixed
+reason codes as :meth:`diagnose_chain` -- an un-anchored legacy
+database, a missing historical secret, a forged chain and an
+interrupted commit are never judged trusted. Only the batch
+bookkeeping (batch row, per-item outcomes and the cursor position) is
+ever persisted by an inspection.
+
 Caller errors are always :class:`ValueError` (invalid parameters) or the
 module's own domain exceptions; every database failure -- an unwritable
 path, an uncreatable or corrupt file, an I/O or read/write error -- is
@@ -363,6 +382,42 @@ CREATE TABLE IF NOT EXISTS reconcile_batch_items (
 );
 """
 
+# Persistent audit-inspection batches. The same resumable-batch pattern
+# as reconcile_batches, but for the strictly read-only integrity sweep:
+# the first call (no cursor) creates the batch, the same cursor resumes
+# it from its durably committed position, and the position survives
+# restarts. ``position_created_at`` / ``position_request_id`` hold the
+# keyset position (the last scanned row); both NULL means "before the
+# first row". ``finished`` is 1 once the sweep has seen every row that
+# existed when it ran out of candidates.
+_INSPECTION_BATCH_TABLE = """
+CREATE TABLE IF NOT EXISTS inspection_batches (
+    batch_id            TEXT PRIMARY KEY,
+    tenant_id           TEXT NOT NULL,
+    position_created_at TEXT,
+    position_request_id TEXT,
+    finished            INTEGER NOT NULL DEFAULT 0
+);
+"""
+
+# Per-item outcomes of an inspection batch, one row per scanned request.
+# The verification outcome (the verified flag and the stable reason
+# codes) is written in the same transaction as the batch position
+# update, so a crash can never leave a scanned request without its
+# bookkeeping (or vice versa) and a retry of the same cursor never
+# rewrites a settled row. The audit chain itself is never written by an
+# inspection: these rows are the only persistence the sweep performs.
+_INSPECTION_BATCH_ITEM_TABLE = """
+CREATE TABLE IF NOT EXISTS inspection_batch_items (
+    batch_id     TEXT NOT NULL,
+    seq          INTEGER NOT NULL,
+    request_id   TEXT NOT NULL,
+    verified     INTEGER NOT NULL,
+    reasons_json TEXT NOT NULL,
+    PRIMARY KEY (batch_id, seq)
+);
+"""
+
 # Issued deletion receipts, at most one per request. ``receipt_json``
 # holds the exact canonical text returned to the first caller (compact
 # JSON plus the trailing newline), so a regeneration, a rebuilt instance
@@ -556,6 +611,11 @@ _MAX_BATCH_LIMIT = 1000
 # wrong prefix, bad padding, foreign JSON, unknown or cross-tenant batch --
 # is an invalid cursor and raises ValueError without touching storage.
 _CURSOR_PREFIX = "rc1."
+# The audit-inspection sweep uses the same opaque cursor envelope but a
+# distinct version prefix, so a cursor issued by one capability can
+# never be replayed as the other's: each names only its own persisted
+# batches, and anything else is an invalid cursor (ValueError).
+_INSPECTION_CURSOR_PREFIX = "ai1."
 _B64URL_CHARS = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 )
@@ -570,16 +630,16 @@ def _require_batch_limit(value: object) -> int:
     return value
 
 
-def _encode_cursor(batch_id: str, position: int) -> str:
+def _encode_cursor(batch_id: str, position: int, prefix: str = _CURSOR_PREFIX) -> str:
     """Render the opaque cursor for a batch at a given item count."""
     payload = json.dumps(
         {"v": 1, "b": batch_id, "n": position},
         separators=(",", ":"),
     ).encode("utf-8")
-    return _CURSOR_PREFIX + base64.urlsafe_b64encode(payload).decode("ascii")
+    return prefix + base64.urlsafe_b64encode(payload).decode("ascii")
 
 
-def _decode_cursor(value: object) -> tuple[str, int]:
+def _decode_cursor(value: object, prefix: str = _CURSOR_PREFIX) -> tuple[str, int]:
     """Parse and strictly validate an opaque cursor.
 
     Every malformed value -- non-string, empty, wrong prefix, bad
@@ -587,9 +647,9 @@ def _decode_cursor(value: object) -> tuple[str, int]:
     identically, so the cursor format can never be probed through
     distinguishable failures.
     """
-    if not isinstance(value, str) or not value.startswith(_CURSOR_PREFIX):
+    if not isinstance(value, str) or not value.startswith(prefix):
         raise ValueError("cursor is not valid")
-    body = value[len(_CURSOR_PREFIX) :]
+    body = value[len(prefix) :]
     if (
         not body
         or len(body) % 4 != 0
@@ -1092,6 +1152,8 @@ class RequestStore:
                 conn.execute(_CLAIM_CANDIDATE_INDEX)
                 conn.execute(_BATCH_TABLE)
                 conn.execute(_BATCH_ITEM_TABLE)
+                conn.execute(_INSPECTION_BATCH_TABLE)
+                conn.execute(_INSPECTION_BATCH_ITEM_TABLE)
                 conn.execute(_RECEIPT_TABLE)
                 conn.execute(_RECEIPT_KEY_TABLE)
                 conn.execute(_RECEIPT_KEY_FINGERPRINT_INDEX)
@@ -2842,6 +2904,355 @@ class RequestStore:
         if cursor.rowcount != 1:
             raise _storage_failure()
 
+    # -- batch audit inspection ------------------------------------------
+
+    def audit_inspection(
+        self,
+        tenant_id: str,
+        cursor: str | None = None,
+        limit: int | None = None,
+    ) -> dict[str, object]:
+        """Verify a tenant's settled audit chains in resumable batches.
+
+        Storage-layer only; never routed over HTTP. With ``cursor``
+        omitted a new persistent batch sweeps the tenant's requests in
+        stable acceptance order (``created_at`` then ``request_id``);
+        with a cursor the batch it names is resumed from its durably
+        committed position, so a retry after an interruption continues
+        instead of restarting, the same cursor always keeps the same
+        batch identifier and a settled item is never reported twice.
+        Each call inspects at most ``limit`` requests (default 100, at
+        most 1000) and returns exactly ``batch_id``, ``next_cursor``
+        (``None`` once the sweep is finished), ``finished`` and
+        ``items`` -- one ``{"request_id", "verified", "reasons"}``
+        entry per scanned request, in scan order. ``verified`` is a
+        boolean and ``reasons`` a sorted list of the same stable,
+        detail-free reason codes :meth:`diagnose_chain` reports; a
+        trusted chain yields ``True`` with an empty list.
+
+        The sweep is strictly read-only with respect to the evidence:
+        it reads and verifies the settled audit chain -- the events,
+        the request chain heads, the external anchors and the global
+        head -- and never repairs, backfills, recomputes or overwrites
+        any audit, anchor or key record. Event deletion, modification,
+        insertion or reordering, a cross-request or cross-tenant
+        substitution, a corrupt anchor or global head, a missing
+        historical secret, a broken generation association, a forged
+        chain, an un-anchored legacy database and an interrupted
+        commit all yield ``False`` items carrying the stable reason
+        codes; they are never judged trusted. Only the batch
+        bookkeeping (the batch row, the per-item outcomes and the
+        cursor position) is persisted, each item committing in its own
+        transaction together with the position update, so a failed call
+        leaves no half-settled item and a committed item is never
+        rewritten by a retry.
+
+        A non-string/empty *tenant_id*, a limit outside 1..1000 (or a
+        non-integer), and any malformed, unknown or cross-tenant
+        *cursor* raise :class:`ValueError` without writing. Corrupt
+        persisted batch state and every storage fault -- including a
+        failed batch commit -- raise the fixed-text :class:`OSError`
+        and no half-settled result is ever returned.
+        """
+        # Validate everything before touching the database: no rejected
+        # call may perform a write.
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        if limit is None:
+            limit = _DEFAULT_BATCH_LIMIT
+        limit = _require_batch_limit(limit)
+        cursor_batch: tuple[str, int] | None = None
+        if cursor is not None:
+            cursor_batch = _decode_cursor(cursor, _INSPECTION_CURSOR_PREFIX)
+
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                # First transaction resolves the batch: a fresh batch row
+                # is inserted when no cursor was given; a cursor names the
+                # persisted batch to resume. An unknown/cross-tenant cursor
+                # is rejected here before anything is written.
+                batch_id, _pos, _rid, finished, _start_count = (
+                    self._batch_transaction(
+                        conn,
+                        lambda: self._load_or_init_inspection_batch_locked(
+                            conn, tenant_id, cursor_batch
+                        ),
+                    )
+                )
+                items: list[dict[str, object]] = []
+                # Each scanned request is settled in its OWN transaction:
+                # its verification outcome row and the cursor position
+                # commit together. The next iteration re-reads the
+                # persisted position, so an item already settled by an
+                # earlier commit or a concurrent call is never rewritten
+                # or reported twice.
+                while not finished and len(items) < limit:
+                    kind, payload = self._batch_transaction(
+                        conn,
+                        lambda: self._process_one_inspection_item_locked(
+                            conn, tenant_id, batch_id
+                        ),
+                    )
+                    if kind == "finished":
+                        finished = True
+                        break
+                    items.append(payload)
+                # Resolve the authoritative outcome in one final short
+                # transaction, exactly like reconcile_batch: whether the
+                # sweep is finished AND the durable settled-item count are
+                # both read from the database rather than from this call's
+                # in-memory tally, so the cursor's position matches what
+                # is durably committed even when other store instances
+                # settled disjoint items for the same batch concurrently.
+                finished, durable_count = self._batch_transaction(
+                    conn,
+                    lambda: self._finalize_inspection_if_end_locked(
+                        conn, tenant_id, batch_id
+                    ),
+                )
+            finally:
+                self._release(conn)
+        # The cursor only identifies the persisted batch; its item count
+        # is the database-authoritative settled count read in the final
+        # transaction.
+        next_cursor = (
+            None
+            if finished
+            else _encode_cursor(batch_id, durable_count, _INSPECTION_CURSOR_PREFIX)
+        )
+        # Log only counts and the stable outcome: no tenant, subject,
+        # credential or SQL text ever reaches the log.
+        _log.info(
+            "audit inspection settled items=%s finished=%s",
+            len(items),
+            finished,
+        )
+        return {
+            "batch_id": batch_id,
+            "next_cursor": next_cursor,
+            "finished": finished,
+            "items": items,
+        }
+
+    def _process_one_inspection_item_locked(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        batch_id: str,
+    ) -> tuple[str, object]:
+        """Verify the next request in scan order inside an open txn.
+
+        Re-reads the batch's persisted position every call, so the
+        result is independent of any in-memory position. Returns
+        ``("finished", None)`` once the sweep end is reached, or
+        ``("item", {"request_id", "verified", "reasons"})`` after
+        assessing the next request's settled chain and recording its
+        outcome row.
+        """
+        pos_created, pos_rid, finished, item_count = (
+            self._read_inspection_batch_state_locked(conn, batch_id)
+        )
+        if finished:
+            return "finished", None
+        row = self._next_inspection_candidate(conn, tenant_id, pos_created, pos_rid)
+        if row is None:
+            self._finish_inspection_batch_locked(conn, batch_id)
+            return "finished", None
+        request_id, created_at = row
+        # Read-only verification of the settled chain for exactly this
+        # request: the same whole-file assessment diagnose_chain runs,
+        # so the global head still seals every tenant and a substitution
+        # anywhere in the file is visible. Nothing is repaired,
+        # backfilled, recomputed or overwritten.
+        reasons = self._assess_chain_locked(conn, (tenant_id, request_id))
+        verified = not reasons
+        # The outcome row and the cursor position land in this one
+        # transaction; the sequence derives from the persisted count so
+        # a resumed batch never reuses a number.
+        conn.execute(
+            "INSERT INTO inspection_batch_items ("
+            "batch_id, seq, request_id, verified, reasons_json"
+            ") VALUES (?, ?, ?, ?, ?)",
+            (
+                batch_id,
+                item_count + 1,
+                request_id,
+                1 if verified else 0,
+                json.dumps(reasons, separators=(",", ":")),
+            ),
+        )
+        self._advance_inspection_batch_locked(conn, batch_id, created_at, request_id)
+        return "item", {
+            "request_id": request_id,
+            "verified": verified,
+            "reasons": reasons,
+        }
+
+    def _finalize_inspection_if_end_locked(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        batch_id: str,
+    ) -> tuple[bool, int]:
+        """Finish a limit-stopped inspection batch iff no candidate remains.
+
+        Always returns the authoritative ``(finished, item_count)`` read
+        from the persisted batch inside this write transaction, exactly
+        like the reconcile finalizer: the count reflects every settled
+        item -- including items committed for the same batch by another
+        store instance/process -- so the caller can issue a cursor whose
+        position matches the durable tally.
+        """
+        pos_created, pos_rid, finished, item_count = (
+            self._read_inspection_batch_state_locked(conn, batch_id)
+        )
+        if finished:
+            return True, item_count
+        if (
+            self._next_inspection_candidate(conn, tenant_id, pos_created, pos_rid)
+            is None
+        ):
+            self._finish_inspection_batch_locked(conn, batch_id)
+            return True, item_count
+        return False, item_count
+
+    def _read_inspection_batch_state_locked(
+        self, conn: sqlite3.Connection, batch_id: str
+    ) -> tuple[str | None, str | None, bool, int]:
+        """Read and strictly validate an inspection batch's position."""
+        row = conn.execute(
+            "SELECT position_created_at, position_request_id, finished, "
+            "(SELECT count(*) FROM inspection_batch_items i "
+            " WHERE i.batch_id = b.batch_id) "
+            "FROM inspection_batches b WHERE b.batch_id = ?",
+            (batch_id,),
+        ).fetchone()
+        if row is None:
+            # The batch this transaction is driving vanished out of band.
+            raise _storage_failure()
+        pos_created, pos_rid, finished, item_count = row
+        if (
+            finished not in (0, 1)
+            or not isinstance(item_count, int)
+            or isinstance(item_count, bool)
+        ):
+            raise _storage_failure()
+        if (pos_created is None) != (pos_rid is None):
+            # The keyset position is written atomically; a split pair is
+            # out-of-band corruption, never a resumable state.
+            raise _storage_failure()
+        if pos_created is not None and (
+            not isinstance(pos_created, str)
+            or not pos_created
+            or not isinstance(pos_rid, str)
+            or not pos_rid
+        ):
+            raise _storage_failure()
+        return pos_created, pos_rid, bool(finished), item_count
+
+    def _load_or_init_inspection_batch_locked(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        cursor_batch: tuple[str, int] | None,
+    ) -> tuple[str, str | None, str | None, bool, int]:
+        """Resolve the inspection batch for this call inside an open txn.
+
+        Returns ``(batch_id, position_created_at, position_request_id,
+        finished, item_count)``. Without a cursor a fresh batch row is
+        inserted; with a cursor the persisted batch is resumed from its
+        committed position -- the cursor's own position field is only a
+        format detail, the database is authoritative. An unknown or
+        cross-tenant batch id is an invalid cursor and raises
+        :class:`ValueError`; corrupt persisted state raises the
+        fixed-text :class:`OSError`.
+        """
+        if cursor_batch is None:
+            batch_id = str(uuid.uuid4())
+            conn.execute(
+                "INSERT INTO inspection_batches ("
+                "batch_id, tenant_id, position_created_at, "
+                "position_request_id, finished"
+                ") VALUES (?, ?, NULL, NULL, 0)",
+                (batch_id, tenant_id),
+            )
+            return batch_id, None, None, False, 0
+        batch_id, _issued_position = cursor_batch
+        # Confirm ownership before reading state: an unknown or
+        # cross-tenant batch id is an invalid cursor, indistinguishable
+        # from one that never existed.
+        owner = conn.execute(
+            "SELECT 1 FROM inspection_batches WHERE batch_id = ? AND tenant_id = ?",
+            (batch_id, tenant_id),
+        ).fetchone()
+        if owner is None:
+            raise ValueError("cursor is not valid")
+        pos_created, pos_rid, finished, item_count = (
+            self._read_inspection_batch_state_locked(conn, batch_id)
+        )
+        return batch_id, pos_created, pos_rid, finished, item_count
+
+    @staticmethod
+    def _next_inspection_candidate(
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        pos_created: str | None,
+        pos_rid: str | None,
+    ) -> tuple[str, str] | None:
+        """Oldest request strictly after the keyset position.
+
+        Every request of the tenant is swept in stable (created_at,
+        request_id) acceptance order, regardless of its status: each
+        accepted request owns at least its genesis event, so each has a
+        settled chain to verify. The ordering matches the claim
+        candidate index, so the scan is stable across calls, restarts
+        and concurrent submissions.
+        """
+        if pos_created is None:
+            return conn.execute(
+                "SELECT request_id, created_at FROM requests "
+                "WHERE tenant_id = ? "
+                "ORDER BY created_at ASC, request_id ASC LIMIT 1",
+                (tenant_id,),
+            ).fetchone()
+        return conn.execute(
+            "SELECT request_id, created_at FROM requests "
+            "WHERE tenant_id = ? AND (created_at, request_id) > (?, ?) "
+            "ORDER BY created_at ASC, request_id ASC LIMIT 1",
+            (tenant_id, pos_created, pos_rid),
+        ).fetchone()
+
+    @staticmethod
+    def _advance_inspection_batch_locked(
+        conn: sqlite3.Connection,
+        batch_id: str,
+        pos_created: str,
+        pos_rid: str,
+    ) -> None:
+        """Move the inspection batch's durable keyset position forward."""
+        cursor = conn.execute(
+            "UPDATE inspection_batches "
+            "SET position_created_at = ?, position_request_id = ? "
+            "WHERE batch_id = ?",
+            (pos_created, pos_rid, batch_id),
+        )
+        if cursor.rowcount != 1:
+            # The batch row this transaction itself resolved vanished;
+            # that is storage corruption, never a caller error.
+            raise _storage_failure()
+
+    @staticmethod
+    def _finish_inspection_batch_locked(
+        conn: sqlite3.Connection, batch_id: str
+    ) -> None:
+        """Mark the inspection batch durably finished in the open txn."""
+        cursor = conn.execute(
+            "UPDATE inspection_batches SET finished = 1 WHERE batch_id = ?",
+            (batch_id,),
+        )
+        if cursor.rowcount != 1:
+            raise _storage_failure()
+
     def audit(
         self,
         tenant_id: str,
@@ -3448,39 +3859,51 @@ class RequestStore:
         """Run the read-only whole-file assessment and return reasons."""
         conn = self._connect()
         try:
-            try:
-                if scope is not None:
-                    owner = conn.execute(
-                        "SELECT 1 FROM requests WHERE tenant_id = ? AND request_id = ?",
-                        scope,
-                    ).fetchone()
-                    if owner is None:
-                        raise RequestNotFound("request not found")
-                meta_rows = conn.execute(
-                    "SELECT head_hmac FROM audit_anchor_meta"
-                ).fetchall()
-                event_rows = conn.execute(
-                    "SELECT tenant_id, request_id, seq, status, occurred_at, "
-                    "chain_hash FROM status_events "
-                    "ORDER BY tenant_id, request_id, seq"
-                ).fetchall()
-                anchor_rows = conn.execute(
-                    "SELECT commit_seq, tenant_id, request_id, seq, event_hash, "
-                    "anchor_hmac, key_generation FROM audit_anchors ORDER BY commit_seq"
-                ).fetchall()
-                request_rows = conn.execute(
-                    "SELECT tenant_id, request_id, status, chain_hash FROM requests"
-                ).fetchall()
-                generation_rows = conn.execute(
-                    "SELECT generation, key_fingerprint, effective_at "
-                    "FROM anchor_key_generations ORDER BY generation"
-                ).fetchall()
-            except RequestNotFound:
-                raise
-            except sqlite3.Error:
-                raise _storage_failure() from None
+            return self._assess_chain_locked(conn, scope)
         finally:
             self._release(conn)
+
+    def _assess_chain_locked(
+        self, conn: sqlite3.Connection, scope: tuple[str, str] | None
+    ) -> list[str]:
+        """Assess the persisted chain on an already-acquired connection.
+
+        Purely read-only: it only SELECTs and evaluates, so a caller may
+        run it inside its own transaction -- the batch audit inspection
+        verifies each scanned request this way, on the same connection
+        the item's bookkeeping commits through.
+        """
+        try:
+            if scope is not None:
+                owner = conn.execute(
+                    "SELECT 1 FROM requests WHERE tenant_id = ? AND request_id = ?",
+                    scope,
+                ).fetchone()
+                if owner is None:
+                    raise RequestNotFound("request not found")
+            meta_rows = conn.execute(
+                "SELECT head_hmac FROM audit_anchor_meta"
+            ).fetchall()
+            event_rows = conn.execute(
+                "SELECT tenant_id, request_id, seq, status, occurred_at, "
+                "chain_hash FROM status_events "
+                "ORDER BY tenant_id, request_id, seq"
+            ).fetchall()
+            anchor_rows = conn.execute(
+                "SELECT commit_seq, tenant_id, request_id, seq, event_hash, "
+                "anchor_hmac, key_generation FROM audit_anchors ORDER BY commit_seq"
+            ).fetchall()
+            request_rows = conn.execute(
+                "SELECT tenant_id, request_id, status, chain_hash FROM requests"
+            ).fetchall()
+            generation_rows = conn.execute(
+                "SELECT generation, key_fingerprint, effective_at "
+                "FROM anchor_key_generations ORDER BY generation"
+            ).fetchall()
+        except RequestNotFound:
+            raise
+        except sqlite3.Error:
+            raise _storage_failure() from None
         return self._evaluate_chain_rows(
             tuple(meta_rows),
             tuple(event_rows),

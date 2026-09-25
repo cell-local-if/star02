@@ -23,7 +23,8 @@ lookup (:meth:`RequestStore.get_status`), the execution orchestration
 :meth:`RequestStore.rotate_receipt_key`) and the anchor capability
 (:meth:`RequestStore.verify_chain`,
 :meth:`RequestStore.diagnose_chain`,
-:meth:`RequestStore.rotate_anchor_key`) exist only on the storage
+:meth:`RequestStore.rotate_anchor_key`,
+:meth:`RequestStore.audit_inspection`) exist only on the storage
 layer and are deliberately not exposed over HTTP: this service still
 opens only request acceptance and the acceptance-receipt lookup.
 
@@ -169,6 +170,12 @@ class DeferredRequestStore:
         # Read-only recovery diagnosis is storage-layer only; never
         # routed over HTTP and never repairs anything.
         return self._ready().diagnose_chain(tenant_id, request_id)
+
+    def audit_inspection(self, tenant_id, cursor=None, limit=None):
+        # The read-only batch audit inspection is storage-layer only;
+        # like the rest of the audit capability it is never routed over
+        # HTTP and never repairs anything.
+        return self._ready().audit_inspection(tenant_id, cursor, limit)
 
 
 def _normalize_request_id(value: str) -> str:
