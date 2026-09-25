@@ -20,7 +20,10 @@ lookup (:meth:`RequestStore.get_status`), the execution orchestration
 :meth:`RequestStore.reconcile_batch`) and the deletion receipts
 (:meth:`RequestStore.generate_receipt`,
 :meth:`RequestStore.verify_receipt`,
-:meth:`RequestStore.rotate_receipt_key`) exist only on the storage
+:meth:`RequestStore.rotate_receipt_key`) and the anchor capability
+(:meth:`RequestStore.verify_chain`,
+:meth:`RequestStore.diagnose_chain`,
+:meth:`RequestStore.rotate_anchor_key`) exist only on the storage
 layer and are deliberately not exposed over HTTP: this service still
 opens only request acceptance and the acceptance-receipt lookup.
 

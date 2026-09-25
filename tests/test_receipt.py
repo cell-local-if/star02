@@ -232,9 +232,13 @@ class ReceiptTests(unittest.TestCase):
         store, accepted = self._completed()
         text = store.generate_receipt("tenant-a", accepted["request_id"], KEY)
         self.assertTrue(store.verify_receipt(text, KEY))
-        # Verification is a complete match: the trailing newline is part
-        # of the receipt text, so an incomplete copy does not match.
-        self.assertFalse(store.verify_receipt(text.rstrip("\n"), KEY))
+        # The trailing newline is part of the receipt format: a missing
+        # or duplicated newline is a malformed presentation (ValueError),
+        # not an authentication mismatch.
+        with self.assertRaises(ValueError):
+            store.verify_receipt(text.rstrip("\n"), KEY)
+        with self.assertRaises(ValueError):
+            store.verify_receipt(text + "\n", KEY)
         # Repeated verification is stable.
         self.assertTrue(store.verify_receipt(text, KEY))
 
@@ -248,15 +252,19 @@ class ReceiptTests(unittest.TestCase):
         text = store.generate_receipt("tenant-a", accepted["request_id"], KEY)
         parsed = json.loads(text)
         # Same fields and an authentic tag, but not the stored bytes:
-        # pretty-printed, re-spaced, duplicate newline or with a BOM.
+        # pretty-printed or re-spaced copies are well-formed yet fail
+        # authentication as False.
         variants = [
             json.dumps(parsed, ensure_ascii=False, indent=2) + "\n",
             json.dumps(parsed, ensure_ascii=False) + "\n",  # default spaces
-            text + "\n",
         ]
         for variant in variants:
             with self.subTest(variant=variant[:20]):
                 self.assertFalse(store.verify_receipt(variant, KEY))
+        # A duplicated trailing newline is a format error, not a
+        # well-formed-but-unauthentic copy.
+        with self.assertRaises(ValueError):
+            store.verify_receipt(text + "\n", KEY)
 
     def test_verify_field_substitutions_are_false(self):
         store, accepted = self._completed()
