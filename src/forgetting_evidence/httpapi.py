@@ -13,13 +13,15 @@ The service exposes exactly two business endpoints:
   when the request's status subsequently advances.
 
 Status advancement (:meth:`RequestStore.transition`), current-status
-lookup (:meth:`RequestStore.get_status`) and the execution orchestration
+lookup (:meth:`RequestStore.get_status`), the execution orchestration
 (:meth:`RequestStore.claim_next`, :meth:`RequestStore.finish_claim`,
 :meth:`RequestStore.get_execution_log`,
 :meth:`RequestStore.reconcile_execution`,
-:meth:`RequestStore.reconcile_batch`) exist only on the storage layer
-and are deliberately not exposed over HTTP: this service still opens
-only request acceptance and the acceptance-receipt lookup.
+:meth:`RequestStore.reconcile_batch`) and the verifiable deletion
+receipts (:meth:`RequestStore.generate_receipt`,
+:meth:`RequestStore.verify_receipt`) exist only on the storage layer and
+are deliberately not exposed over HTTP: this service still opens only
+request acceptance and the acceptance-receipt lookup.
 
 Success responses are a single line of JSON with exactly
 ``request_id``, ``status`` and ``created_at`` (in that order) followed by
@@ -153,6 +155,17 @@ class DeferredRequestStore:
         # Batched, resumable reconciliation is storage-layer only; like the
         # rest of the execution orchestration it is never routed over HTTP.
         return self._ready().reconcile_batch(tenant_id, cursor, limit)
+
+    def generate_receipt(self, tenant_id, request_id, key):
+        # Deletion receipts are storage-layer only; the HTTP surface keeps
+        # exactly its two original endpoints, so this is a faithful proxy
+        # and never a route. The caller-held key passes straight through.
+        return self._ready().generate_receipt(tenant_id, request_id, key)
+
+    def verify_receipt(self, text, key):
+        # Read-only receipt verification is storage-layer only and never
+        # routed over HTTP; proxied so the wrapper matches the store.
+        return self._ready().verify_receipt(text, key)
 
 
 def _normalize_request_id(value: str) -> str:

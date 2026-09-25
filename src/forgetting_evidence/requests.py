@@ -52,6 +52,21 @@ Execution orchestration lives on the same store, storage-layer only:
   without creating an attempt, receipt or status event, and each item's
   state, attempts, lease, batch row and cursor commit in one transaction.
 
+Externally verifiable deletion receipts:
+
+* :meth:`RequestStore.generate_receipt` issues the signed deletion
+  receipt for a request that has reached ``completed`` with its winning
+  attempt recorded, binding tenant, request id, first acceptance time,
+  final completion time, a scope commitment and a completion commitment
+  (the earliest completed attempt). The first document is persisted in
+  one atomic transaction and every repeat is byte-identical, including
+  after concurrency, rebuilds and restarts; it is never recomputed or
+  overwritten. The caller-held key authenticates the HMAC tag and never
+  enters the database, receipt, exception text or logs.
+* :meth:`RequestStore.verify_receipt` parses a presented receipt, checks
+  its tag under the caller-held key and cross-checks the persisted
+  binding, returning a plain boolean. It is strictly read-only.
+
 The lease boundary enforced by :meth:`claim_next` is deliberately
 narrower than "every processing request whose latest timestamp is old":
 a processing request is reclaimable after expiry only when its attempts
@@ -97,12 +112,23 @@ import uuid
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 
+from .receipts import (
+    ReceiptUnavailable,
+    build_receipt,
+    completion_commitment,
+    expected_tag,
+    parse_receipt,
+    scope_commitment,
+    validate_key,
+)
+
 __all__ = [
     "RequestStore",
     "IdempotencyConflict",
     "RequestNotFound",
     "InvalidStatusTransition",
     "ClaimConflict",
+    "ReceiptUnavailable",
 ]
 
 _log = logging.getLogger(__name__)
@@ -239,6 +265,30 @@ CREATE TABLE IF NOT EXISTS reconcile_batch_items (
     request_id  TEXT NOT NULL,
     status      TEXT NOT NULL,
     PRIMARY KEY (batch_id, seq)
+);
+"""
+
+# Verifiable deletion receipts, one row at most per request. The row is
+# inserted once, inside a single transaction, the moment a settled
+# completion is first attested and is never updated, deleted or
+# recomputed; the receipt document is therefore byte-stable across
+# reissues, rebuilds and restarts. No caller-held key material is ever
+# stored: ``receipt_bytes`` carries the signed document, and the plain
+# business columns let verification cross-check the persisted state
+# without re-deriving the document. The winning attempt is frozen by
+# (attempt_number, result, completed_at) at first issue, so a later
+# duplicate terminal row can never change what the first receipt says.
+_RECEIPT_TABLE = """
+CREATE TABLE IF NOT EXISTS deletion_receipts (
+    tenant_id       TEXT NOT NULL,
+    request_id      TEXT NOT NULL,
+    accepted_at     TEXT NOT NULL,
+    completed_at    TEXT NOT NULL,
+    attempt_number  INTEGER NOT NULL,
+    result          TEXT NOT NULL,
+    receipt_bytes   BLOB NOT NULL,
+    issued_at       TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, request_id)
 );
 """
 
@@ -543,6 +593,7 @@ class RequestStore:
                 conn.execute(_CLAIM_CANDIDATE_INDEX)
                 conn.execute(_BATCH_TABLE)
                 conn.execute(_BATCH_ITEM_TABLE)
+                conn.execute(_RECEIPT_TABLE)
                 self._migrate_schema(conn)
             except sqlite3.Error:
                 raise _storage_failure() from None
@@ -2361,3 +2412,351 @@ class RequestStore:
             # Identical outcome for unknown ids and cross-tenant lookups.
             raise RequestNotFound("request not found")
         return row[0], row[1], row[2]
+
+    # -- deletion receipts ---------------------------------------------
+
+    def generate_receipt(
+        self,
+        tenant_id: str,
+        request_id: str,
+        key: bytes,
+    ) -> bytes:
+        """Return the externally verifiable deletion receipt.
+
+        A receipt exists only for a request that has both reached the
+        ``completed`` terminal state and has its winning execution
+        attempt durably recorded; a request that is still accepted or
+        processing, or one that settled ``failed``, raises
+        :class:`ReceiptUnavailable` and gets no record. The receipt binds
+        the tenant, request id, first acceptance time, final completion
+        time, a scope commitment (digest of the canonical scope set,
+        never the scopes themselves) and a completion commitment over the
+        *earliest* completed attempt; later duplicate terminal attempts
+        never change it.
+
+        The first receipt issued for a request is persisted once,
+        atomically, and every later call -- concurrent or after a
+        rebuild/restart -- returns the identical first document byte for
+        byte; an existing receipt is never backfilled, recomputed or
+        overwritten and generation never alters the execution terminal
+        state or the audit timeline. The caller-held *key* (non-empty
+        bytes kept outside the database) only authenticates the document
+        and is never stored, logged or echoed in an exception.
+
+        A non-string/empty *tenant_id* or *request_id*, or a key that is
+        not non-empty bytes, raises :class:`ValueError` without touching
+        data. A request that is missing, foreign to the tenant or not yet
+        accepted raises :class:`RequestNotFound` identically. Corrupt
+        receipt or execution records and every storage fault raise the
+        fixed-text :class:`OSError`.
+        """
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        request_id = _require_identifier(request_id)
+        key = validate_key(key)
+
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                except sqlite3.Error:
+                    raise _storage_failure() from None
+                try:
+                    document = self._generate_receipt_locked(
+                        conn, tenant_id, request_id, key
+                    )
+                    conn.execute("COMMIT")
+                except (RequestNotFound, ReceiptUnavailable):
+                    self._rollback_quietly(conn)
+                    raise
+                except OSError:
+                    # Corruption helpers raise after rolling back; the
+                    # second rollback only guarantees the shared
+                    # connection has left the transaction.
+                    self._rollback_quietly(conn)
+                    raise
+                except sqlite3.Error:
+                    self._rollback_quietly(conn)
+                    raise _storage_failure() from None
+            finally:
+                self._release(conn)
+        # Log only the request id, never tenant, key material or content.
+        _log.info("deletion receipt issued request_id=%s", request_id)
+        return document
+
+    def _generate_receipt_locked(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        request_id: str,
+        key: bytes,
+    ) -> bytes:
+        """Issue or reuse the receipt inside an already-open write txn."""
+        # An existing receipt wins unconditionally: the first document is
+        # immutable, so a repeat issue never recomputes even when the
+        # caller presents a different key (the stored bytes are simply
+        # returned; verification under the new key fails as it must).
+        existing = conn.execute(
+            "SELECT receipt_bytes FROM deletion_receipts "
+            "WHERE tenant_id = ? AND request_id = ?",
+            (tenant_id, request_id),
+        ).fetchone()
+        if existing is not None:
+            return self._validated_stored_receipt(existing[0])
+
+        row = conn.execute(
+            "SELECT status, created_at, scopes_json FROM requests "
+            "WHERE tenant_id = ? AND request_id = ?",
+            (tenant_id, request_id),
+        ).fetchone()
+        if row is None:
+            # Missing id, foreign tenant and never-accepted share one
+            # outcome.
+            raise RequestNotFound("request not found")
+        status, accepted_at, scopes_json = row
+        if (
+            status not in _ALLOWED_TRANSITIONS
+            or not isinstance(accepted_at, str)
+            or not accepted_at
+            or not isinstance(scopes_json, str)
+            or not scopes_json
+        ):
+            # Out-of-band corruption on the request row: never derive a
+            # commitment from a bad read.
+            raise _storage_failure()
+        if status != _STATUS_COMPLETED:
+            # accepted/processing are not finished; failed is a terminal
+            # but not a deletion. Neither may carry a deletion receipt.
+            raise ReceiptUnavailable("deletion receipt is not available")
+
+        attempts = self._load_attempts_for_reconcile(
+            conn, tenant_id, request_id
+        )
+        terminals = [
+            (completed_at, attempt_number, result)
+            for attempt_number, result, completed_at, _expiry in attempts
+            if result is not None
+        ]
+        # A completed status only earns a receipt when a settled
+        # completion attempt exists to bind the completion commitment to.
+        # A terminal reached without an execution record (e.g. a manual
+        # status transition) is not yet a receipt-eligible deletion.
+        completed_terminals = [
+            item for item in terminals if item[2] == _STATUS_COMPLETED
+        ]
+        if not completed_terminals:
+            raise ReceiptUnavailable("deletion receipt is not available")
+        # Earliest completion by completion time, attempt number breaking
+        # a tie -- the same winner reconcile normalises duplicates by.
+        completed_at, attempt_number, result = min(
+            completed_terminals, key=lambda item: (item[0], item[1])
+        )
+        if (
+            not isinstance(attempt_number, int)
+            or isinstance(attempt_number, bool)
+            or attempt_number < 1
+            or not isinstance(completed_at, str)
+            or not completed_at
+        ):
+            raise _storage_failure()
+
+        scope_digest = scope_commitment(scopes_json)
+        try:
+            document = build_receipt(
+                tenant_id,
+                request_id,
+                accepted_at,
+                completed_at,
+                scope_digest,
+                attempt_number,
+                result,
+                key,
+            )
+        except ValueError:
+            # All arguments come from validated persisted rows, so a
+            # failure here (e.g. a completion that precedes acceptance)
+            # can only be out-of-band corruption: report the fixed
+            # storage error rather than a format ValueError.
+            raise _storage_failure() from None
+        # Persist the plain binding alongside the signed document so
+        # verification can cross-check the store state without the key
+        # and without re-deriving (and possibly drifting) the receipt.
+        # The primary key plus this write transaction make concurrent
+        # generators collapse onto one row; a duplicate insert means the
+        # other transaction's first receipt won, so return it rather than
+        # overwrite.
+        try:
+            conn.execute(
+                "INSERT INTO deletion_receipts ("
+                "tenant_id, request_id, accepted_at, completed_at, "
+                "attempt_number, result, receipt_bytes, issued_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    tenant_id,
+                    request_id,
+                    accepted_at,
+                    completed_at,
+                    attempt_number,
+                    result,
+                    document,
+                    _utc_now_rfc3339(),
+                ),
+            )
+        except sqlite3.IntegrityError:
+            winner = conn.execute(
+                "SELECT receipt_bytes FROM deletion_receipts "
+                "WHERE tenant_id = ? AND request_id = ?",
+                (tenant_id, request_id),
+            ).fetchone()
+            if winner is None:
+                raise _storage_failure()
+            return self._validated_stored_receipt(winner[0])
+        return document
+
+    @staticmethod
+    def _validated_stored_receipt(stored: object) -> bytes:
+        """Return a stored receipt blob only when it is well-formed.
+
+        A row whose document no longer parses as the receipt shape is
+        corruption: surface the fixed storage error instead of returning
+        half evidence, and never repair, recompute or overwrite it.
+        """
+        if not isinstance(stored, bytes) or not stored:
+            raise _storage_failure()
+        try:
+            parse_receipt(stored)
+        except ValueError:
+            raise _storage_failure() from None
+        return stored
+
+    def verify_receipt(self, text: object, key: object) -> bool:
+        """Verify an externally presented deletion receipt.
+
+        Parses the document strictly, checks the HMAC authentication tag
+        under the caller-held *key* in constant time, and finally
+        cross-checks every business binding (tenant, request, acceptance
+        and completion times, scope and completion commitments) against
+        the persisted request, winning attempt and stored receipt. A
+        fully matching receipt returns ``True``. Any substitution -- a
+        field, the tag, a timestamp, or the request/tenant association --
+        returns ``False``; so does a well-formed document whose tag does
+        not match, even when the request record exists: request existence
+        never substitutes for authentication.
+
+        Malformed input (non-document text, or a key that is not
+        non-empty bytes) raises :class:`ValueError`; storage faults raise
+        the fixed-text :class:`OSError`. Verification is strictly
+        read-only: it never writes, repairs or backfills anything.
+        """
+        parsed = parse_receipt(text)
+        key = validate_key(key)
+        # Constant-time tag comparison first: nothing about request
+        # existence can authenticate a document the key does not sign.
+        presented_tag = parsed["auth_tag"]
+        if not hmac.compare_digest(expected_tag(parsed, key), presented_tag):
+            return False
+        # Parsing already proved the presented bytes are exactly this
+        # canonical rendering, so it can be compared byte-for-byte with
+        # the first persisted receipt.
+        document = (
+            json.dumps(parsed, ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8"
+            )
+            + b"\n"
+        )
+
+        if self._mem_conn is not None:
+            with self._write_lock:
+                return self._verify_persisted(parsed, document)
+        return self._verify_persisted(parsed, document)
+
+    def _verify_persisted(
+        self, parsed: dict[str, object], document: bytes
+    ) -> bool:
+        """Cross-check an already-authenticated receipt against storage."""
+        tenant_id = parsed["tenant_id"]
+        request_id = parsed["request_id"]
+        conn = self._connect()
+        try:
+            try:
+                row = conn.execute(
+                    "SELECT created_at, scopes_json FROM requests "
+                    "WHERE tenant_id = ? AND request_id = ?",
+                    (tenant_id, request_id),
+                ).fetchone()
+                receipt_row = conn.execute(
+                    "SELECT accepted_at, completed_at, attempt_number, "
+                    "result, receipt_bytes FROM deletion_receipts "
+                    "WHERE tenant_id = ? AND request_id = ?",
+                    (tenant_id, request_id),
+                ).fetchone()
+                attempt_match = None
+                if receipt_row is not None:
+                    # The named winning attempt must still be the settled
+                    # execution record: same number, stable result
+                    # category and completion time.
+                    attempt_match = conn.execute(
+                        "SELECT 1 FROM claim_attempts "
+                        "WHERE tenant_id = ? AND request_id = ? "
+                        "AND attempt_number = ? AND result = ? "
+                        "AND completed_at = ?",
+                        (
+                            tenant_id,
+                            request_id,
+                            receipt_row[2],
+                            _STATUS_COMPLETED,
+                            receipt_row[1],
+                        ),
+                    ).fetchone()
+            except sqlite3.Error:
+                raise _storage_failure() from None
+        finally:
+            self._release(conn)
+        if row is None:
+            # Unknown or foreign request: the tag was valid for the
+            # claimed content, but the store holds no such deletion.
+            return False
+        created_at, scopes_json = row
+        if not isinstance(created_at, str) or not isinstance(scopes_json, str):
+            raise _storage_failure()
+        if created_at != parsed["accepted_at"]:
+            return False
+        if scope_commitment(scopes_json) != parsed["scope_commitment"]:
+            return False
+        if receipt_row is None:
+            # The request exists but no settled receipt was ever issued:
+            # a valid tag alone cannot manufacture one.
+            return False
+        stored_accepted, stored_completed, stored_number, stored_result, stored_blob = (
+            receipt_row
+        )
+        if (
+            not isinstance(stored_accepted, str)
+            or not isinstance(stored_completed, str)
+            or not isinstance(stored_number, int)
+            or isinstance(stored_number, bool)
+            or stored_result not in _TERMINAL_RESULTS
+        ):
+            raise _storage_failure()
+        # A stored document that no longer parses is corruption, not a
+        # mismatch: surface the fixed storage error and never repair it.
+        self._validated_stored_receipt(stored_blob)
+        if stored_result != _STATUS_COMPLETED or attempt_match is None:
+            return False
+        if (
+            stored_accepted != parsed["accepted_at"]
+            or stored_completed != parsed["completed_at"]
+        ):
+            return False
+        # The completion commitment must name exactly that winning
+        # attempt, and the document must be the first receipt persisted
+        # for the request, byte for byte.
+        if (
+            completion_commitment(
+                stored_number, _STATUS_COMPLETED, stored_completed
+            )
+            != parsed["completion_commitment"]
+        ):
+            return False
+        return stored_blob == document
+
