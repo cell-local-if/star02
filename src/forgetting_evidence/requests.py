@@ -196,6 +196,29 @@ record; a missing or cross-tenant batch raises
 :class:`ValueError`, and corrupt bookkeeping or any storage fault is
 the fixed-text :class:`OSError`, never a fabricated summary.
 
+:meth:`RequestStore.audit_inspection_metrics` is the read-only
+reason-aggregating companion, storage-layer only like the sweep and
+the summary. It takes just a tenant and a batch identifier and reads
+the existing bookkeeping in one consistent snapshot inside a single
+read-only transaction -- never advancing a cursor, creating a batch
+or writing any business or audit record. Each settled item
+contributes exactly once by its current record: verified items add to
+``verified``, unverified items to their reason code's count. The
+result is one compact JSON line (exactly one trailing newline)
+holding, in order, ``batch_id``, ``scanned``, ``verified``,
+``unverified``, ``reasons``, ``next_cursor`` and ``finished`` --
+``scanned`` the sum of the other two counts, ``reasons`` a list of
+``{"reason", "count"}`` entries merged by reason code, ordered by
+Unicode code point, each count a positive integer and empty reasons
+never listed (an empty aggregate is an empty array). The text never
+contains a float, a negative zero or a non-finite value, and no
+per-item results are included. The error contract matches the
+summary's: invalid arguments raise :class:`ValueError` without
+writing, a missing or cross-tenant batch raises
+:class:`AuditInspectionNotFound`, and corrupt bookkeeping or any
+storage fault is the fixed-text :class:`OSError`, never a fabricated
+metric.
+
 Caller errors are always :class:`ValueError` (invalid parameters) or the
 module's own domain exceptions; every database failure -- an unwritable
 path, an uncreatable or corrupt file, an I/O or read/write error -- is
@@ -3306,6 +3329,158 @@ class RequestStore:
             scanned,
             verified,
             finished,
+        )
+        return text
+
+    def audit_inspection_metrics(
+        self,
+        tenant_id: str,
+        batch_id: str,
+    ) -> str:
+        """Return read-only, reason-aggregated metrics of a batch.
+
+        Storage-layer only; never routed over HTTP. Like
+        :meth:`audit_inspection_summary` the caller supplies only the
+        tenant and the batch identifier issued by
+        :meth:`audit_inspection` (not a cursor): the metrics never
+        advance a cursor, never create a batch, never repair evidence
+        and never write any business or audit record. The whole
+        aggregate is assembled from one consistent snapshot taken
+        inside a single read-only transaction, so the result can never
+        show half-settled fields or torn values.
+
+        Every settled item of the batch contributes exactly once, by
+        its current record: a verified item adds to ``verified`` and an
+        unverified item adds to its reason code's count. The result is
+        one compact JSON object with exactly one trailing newline and
+        exactly these fields in order: ``batch_id``, ``scanned``,
+        ``verified``, ``unverified``, ``reasons``, ``next_cursor`` and
+        ``finished``. ``scanned`` equals ``verified`` plus
+        ``unverified``; ``reasons`` is a list of
+        ``{"reason", "count"}`` entries -- one per distinct non-empty
+        reason code, merged across items, ordered by Unicode code
+        point, each count a positive integer -- and is an empty array
+        when no unverified item carries a reason. The batch id and
+        cursor are strings or null and ``finished`` is a boolean; the
+        text never contains a float, a negative zero or a non-finite
+        number. No per-item results are included.
+
+        An empty or non-string *tenant_id* or *batch_id* raises
+        :class:`ValueError` without touching storage; a batch that is
+        missing or owned by another tenant raises
+        :class:`AuditInspectionNotFound` with one detail-free outcome,
+        so another tenant's batches can never be probed. A storage
+        outage, corrupt inspection bookkeeping or a read failure
+        raises the fixed-text :class:`OSError`, never a fabricated
+        metric.
+        """
+        # Validate before touching the database: a rejected call never
+        # reads or writes anything.
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        batch_id = _require_nonempty_str(batch_id, "batch_id")
+        if self._mem_conn is not None:
+            with self._write_lock:
+                return self._audit_inspection_metrics(tenant_id, batch_id)
+        return self._audit_inspection_metrics(tenant_id, batch_id)
+
+    def _audit_inspection_metrics(self, tenant_id: str, batch_id: str) -> str:
+        conn = self._connect()
+        try:
+            try:
+                # One explicit read-only transaction: the batch row, its
+                # position and every item record are read from a single
+                # consistent snapshot, never piecemeal across statements
+                # that a concurrent page advance could interleave.
+                conn.execute("BEGIN")
+                try:
+                    # Resolve ownership first: a missing batch and
+                    # another tenant's batch share one indistinguishable
+                    # outcome.
+                    owner = conn.execute(
+                        "SELECT 1 FROM inspection_batches "
+                        "WHERE batch_id = ? AND tenant_id = ?",
+                        (batch_id, tenant_id),
+                    ).fetchone()
+                    if owner is None:
+                        raise AuditInspectionNotFound(
+                            "audit inspection batch not found"
+                        )
+                    _pos_created, _pos_rid, finished, scanned = (
+                        self._read_inspection_state_locked(conn, batch_id)
+                    )
+                    rows = conn.execute(
+                        "SELECT verified, reason FROM inspection_batch_items "
+                        "WHERE batch_id = ?",
+                        (batch_id,),
+                    ).fetchall()
+                except BaseException:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
+                conn.execute("COMMIT")
+            except AuditInspectionNotFound:
+                raise
+            except sqlite3.Error:
+                raise _storage_failure() from None
+        finally:
+            self._release(conn)
+
+        # Every persisted item record must be the 0/1 flag and reason
+        # string the sweep writes; anything else is bookkeeping
+        # corruption, never a value to aggregate silently.
+        verified = 0
+        reason_counts: dict[str, int] = {}
+        for flag, reason in rows:
+            if (
+                not isinstance(flag, int)
+                or isinstance(flag, bool)
+                or flag not in (0, 1)
+                or not isinstance(reason, str)
+            ):
+                raise _storage_failure()
+            if flag:
+                verified += 1
+            elif reason:
+                # Only unverified items contribute to the reason
+                # statistics; an empty reason never enters the list.
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        unverified = len(rows) - verified
+        # The item table and the batch row's own position are committed
+        # together; a split tally is out-of-band damage.
+        if unverified < 0 or scanned != len(rows) or scanned != verified + unverified:
+            raise _storage_failure()
+
+        # Reason codes sort by Unicode code point (plain string order);
+        # equal reasons are already merged and every count is a
+        # positive integer by construction.
+        reasons = [
+            {"reason": reason, "count": reason_counts[reason]}
+            for reason in sorted(reason_counts)
+        ]
+        next_cursor = (
+            None
+            if finished
+            else _encode_cursor(batch_id, scanned, _INSPECTION_CURSOR_PREFIX)
+        )
+        metrics = {
+            "batch_id": batch_id,
+            "scanned": scanned,
+            "verified": verified,
+            "unverified": unverified,
+            "reasons": reasons,
+            "next_cursor": next_cursor,
+            "finished": finished,
+        }
+        text = json.dumps(metrics, ensure_ascii=False, separators=(",", ":")) + "\n"
+        # Log only counts and the stable outcome: no tenant, batch id,
+        # credential or SQL text ever reaches the log.
+        _log.info(
+            "audit inspection metrics read scanned=%s verified=%s reasons=%s",
+            scanned,
+            verified,
+            len(reasons),
         )
         return text
 
