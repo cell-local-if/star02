@@ -9,8 +9,9 @@ secret-missing databases, historical-secret rotation handling, cursor
 pagination and resume across rebuilds, atomic same-cursor concurrent
 continuation (one winning page, empty-item losers observing the
 winner's committed progress), the read-only audit_inspection_summary
-entry point, validation without writes, corruption semantics and the
-strict read-only guarantee for every audit, anchor and key record.
+and audit_inspection_metrics entry points, validation without writes,
+corruption semantics and the strict read-only guarantee for every
+audit, anchor and key record.
 These entry points are deliberately not exposed over HTTP.
 """
 
@@ -917,6 +918,226 @@ class InspectionSummaryTests(_StoreCase):
         self.assertTrue(parsed["next_cursor"])
         with self.assertRaises(AuditInspectionNotFound):
             self._summary(store, "tenant-a", result["next_cursor"])
+
+
+class InspectionMetricsTests(_StoreCase):
+    def _metrics(self, store, tenant_id, batch_id):
+        return store.audit_inspection_metrics(tenant_id, batch_id)
+
+    def _parse(self, text):
+        self.assertTrue(text.endswith("\n"))
+        self.assertFalse(text.endswith("\n\n"))
+        # Compact JSON: no whitespace outside strings, fields in order.
+        self.assertNotIn(" ", text)
+        parsed = json.loads(text)
+        self.assertEqual(
+            list(parsed),
+            ["batch_id", "scanned", "reasons", "next_cursor", "finished"],
+        )
+        return parsed
+
+    def test_metrics_of_finished_batch_all_verified(self):
+        store = self._store()
+        request_ids = self._submit_many(store, 3)
+        result = store.audit_inspection("tenant-a")
+        parsed = self._parse(self._metrics(store, "tenant-a", result["batch_id"]))
+        self.assertEqual(parsed["batch_id"], result["batch_id"])
+        self.assertEqual(parsed["scanned"], len(request_ids))
+        self.assertIsInstance(parsed["scanned"], int)
+        self.assertNotIsInstance(parsed["scanned"], bool)
+        self.assertGreaterEqual(parsed["scanned"], 0)
+        # Verified items carry the empty reason and never enter the list.
+        self.assertEqual(parsed["reasons"], [])
+        self.assertIsNone(parsed["next_cursor"])
+        self.assertIs(parsed["finished"], True)
+
+    def test_metrics_reason_counts_merged_sorted_and_counted_once(self):
+        store = self._store()
+        request_ids = self._submit_many(store, 4)
+        with self._raw() as raw:
+            # Two requests fail with the same reason, one with another.
+            raw.execute(
+                "UPDATE status_events SET status = 'failed' "
+                "WHERE request_id = ? AND seq = 0",
+                (request_ids[0],),
+            )
+            raw.execute(
+                "UPDATE status_events SET status = 'failed' "
+                "WHERE request_id = ? AND seq = 0",
+                (request_ids[2],),
+            )
+            raw.execute(
+                "UPDATE requests SET chain_hash = ? WHERE request_id = ?",
+                ("0" * 64, request_ids[1]),
+            )
+        result = store.audit_inspection("tenant-a")
+        parsed = self._parse(self._metrics(store, "tenant-a", result["batch_id"]))
+        self.assertEqual(parsed["scanned"], 4)
+        # Expected breakdown derived from the settled per-item results:
+        # duplicate reasons merge, each unverified item contributes once.
+        expected = {}
+        for item in result["items"]:
+            if item["verified"]:
+                self.assertEqual(item["reason"], "")
+                continue
+            expected[item["reason"]] = expected.get(item["reason"], 0) + 1
+        self.assertEqual(len(expected), 2)
+        self.assertEqual(
+            parsed["reasons"],
+            [
+                {"reason": reason, "count": expected[reason]}
+                for reason in sorted(expected)
+            ],
+        )
+        counts = {entry["reason"]: entry["count"] for entry in parsed["reasons"]}
+        self.assertEqual(counts.get("chain_head_mismatch"), 1)
+        self.assertEqual(sum(counts.values()), 3)
+        # Unicode code point order, no duplicate codes, positive counts.
+        codes = [entry["reason"] for entry in parsed["reasons"]]
+        self.assertEqual(codes, sorted(codes))
+        self.assertEqual(len(codes), len(set(codes)))
+        for entry in parsed["reasons"]:
+            self.assertEqual(list(entry), ["reason", "count"])
+            self.assertIsInstance(entry["reason"], str)
+            self.assertTrue(entry["reason"])
+            self.assertIsInstance(entry["count"], int)
+            self.assertNotIsInstance(entry["count"], bool)
+            self.assertGreaterEqual(entry["count"], 1)
+
+    def test_metrics_of_partial_batch_carries_resumable_cursor(self):
+        store = self._store()
+        self._submit_many(store, 4)
+        result = store.audit_inspection("tenant-a", limit=3)
+        parsed = self._parse(self._metrics(store, "tenant-a", result["batch_id"]))
+        self.assertEqual(parsed["scanned"], 3)
+        self.assertEqual(parsed["reasons"], [])
+        self.assertIs(parsed["finished"], False)
+        self.assertEqual(parsed["next_cursor"], result["next_cursor"])
+        # The metrics' cursor resumes the batch; the read advanced nothing.
+        tail = store.audit_inspection("tenant-a", cursor=parsed["next_cursor"])
+        self.assertEqual(len(tail["items"]), 1)
+        self.assertIs(tail["finished"], True)
+
+    def test_metrics_of_brand_new_empty_batch(self):
+        store = self._store()
+        result = store.audit_inspection("tenant-a")
+        parsed = self._parse(self._metrics(store, "tenant-a", result["batch_id"]))
+        self.assertEqual(parsed["scanned"], 0)
+        self.assertEqual(parsed["reasons"], [])
+        self.assertIsNone(parsed["next_cursor"])
+        self.assertIs(parsed["finished"], True)
+
+    def test_metrics_is_strictly_read_only(self):
+        store = self._store(secret="secret-1")
+        request_ids = self._submit_many(store, 3)
+        store.transition("tenant-a", request_ids[0], "processing")
+        store.rotate_anchor_key("secret-1", "secret-2")
+        result = store.audit_inspection("tenant-a", limit=2)
+        tables = (
+            "requests",
+            "status_events",
+            "audit_anchors",
+            "audit_anchor_meta",
+            "anchor_key_generations",
+            "claim_attempts",
+            "claim_tokens",
+            "deletion_receipts",
+            "receipt_keys",
+            "inspection_batches",
+            "inspection_batch_items",
+        )
+        before = {table: self._table_dump(table) for table in tables}
+        first = self._metrics(store, "tenant-a", result["batch_id"])
+        # Repeated reads return the same text and advance nothing.
+        second = self._metrics(store, "tenant-a", result["batch_id"])
+        self.assertEqual(first, second)
+        after = {table: self._table_dump(table) for table in tables}
+        self.assertEqual(before, after)
+        # The batch is still mid-sweep, exactly as the metrics reported.
+        unchanged = store.audit_inspection(
+            "tenant-a", cursor=result["next_cursor"]
+        )
+        self.assertEqual(len(unchanged["items"]), 1)
+
+    def test_metrics_invalid_arguments_raise_value_error_without_writing(self):
+        store = self._store()
+        result = store.audit_inspection("tenant-a")
+
+        def batch_count():
+            with self._raw() as raw:
+                return raw.execute("SELECT count(*) FROM inspection_batches").fetchone()[0]
+
+        before = batch_count()
+        for bad_tenant in ("", None, 5, True, ["tenant-a"]):
+            with self.assertRaises(ValueError):
+                store.audit_inspection_metrics(bad_tenant, result["batch_id"])
+        for bad_batch in ("", None, 7, False, {"id": "x"}):
+            with self.assertRaises(ValueError):
+                store.audit_inspection_metrics("tenant-a", bad_batch)
+        self.assertEqual(batch_count(), before)
+
+    def test_metrics_missing_batch_raises_not_found(self):
+        store = self._store()
+        self._submit_many(store, 1)
+        with self.assertRaises(AuditInspectionNotFound):
+            self._metrics(store, "tenant-a", "no-such-batch")
+
+    def test_metrics_cross_tenant_batch_raises_not_found(self):
+        store = self._store()
+        self._submit_many(store, 1, tenant="tenant-a")
+        result = store.audit_inspection("tenant-a")
+        # Missing and cross-tenant batches share one indistinguishable outcome.
+        with self.assertRaises(AuditInspectionNotFound):
+            self._metrics(store, "tenant-b", result["batch_id"])
+
+    def test_metrics_corrupt_bookkeeping_raises_storage_error(self):
+        statements = (
+            "UPDATE inspection_batch_items SET verified = 9 WHERE batch_id = ?",
+            "UPDATE inspection_batch_items SET reason = 'chain_hash_mismatch' "
+            "WHERE batch_id = ? AND verified = 1",
+            "UPDATE inspection_batch_items SET reason = '' "
+            "WHERE batch_id = ? AND verified = 0",
+        )
+        for index, statement in enumerate(statements):
+            with self.subTest(statement=statement):
+                # Each corruption gets its own fresh database file.
+                db_path = os.path.join(
+                    self._tmp.name, f"corrupt-{index}", "evidence.db"
+                )
+                store = RequestStore(db_path, anchor_secret="anchor-secret")
+                request_ids = self._submit_many(store, 2)
+                with sqlite3.connect(db_path) as raw:
+                    raw.execute(
+                        "UPDATE status_events SET status = 'failed' "
+                        "WHERE request_id = ? AND seq = 0",
+                        (request_ids[0],),
+                    )
+                result = store.audit_inspection("tenant-a")
+                with sqlite3.connect(db_path) as raw:
+                    raw.execute(statement, (result["batch_id"],))
+                with self.assertRaises(OSError) as caught:
+                    self._metrics(store, "tenant-a", result["batch_id"])
+                self.assertEqual(str(caught.exception), "request store is unavailable")
+
+    def test_metrics_missing_table_raises_storage_error(self):
+        store = self._store()
+        result = store.audit_inspection("tenant-a")
+        with self._raw() as raw:
+            raw.execute("DROP TABLE inspection_batches")
+        with self.assertRaises(OSError) as caught:
+            self._metrics(store, "tenant-a", result["batch_id"])
+        self.assertEqual(str(caught.exception), "request store is unavailable")
+
+    def test_metrics_accepts_batch_id_not_cursor(self):
+        # The raw batch id works; an encoded cursor is not a batch id and
+        # is simply a missing batch, never decoded.
+        store = self._store()
+        self._submit_many(store, 2)
+        result = store.audit_inspection("tenant-a", limit=1)
+        parsed = self._parse(self._metrics(store, "tenant-a", result["batch_id"]))
+        self.assertTrue(parsed["next_cursor"])
+        with self.assertRaises(AuditInspectionNotFound):
+            self._metrics(store, "tenant-a", result["next_cursor"])
 
 
 if __name__ == "__main__":
