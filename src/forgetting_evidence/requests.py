@@ -33,6 +33,16 @@ Execution orchestration lives on the same store, storage-layer only:
   live lease: the status change, its audit-chain event, the attempt
   result and the token release land in one transaction. Unknown, expired,
   released or foreign tokens raise :class:`ClaimConflict` unchanged.
+* :meth:`RequestStore.renew_lease` extends the current live lease held
+  by a claim token: the open attempt's UTC expiry moves to the commit
+  time plus the requested seconds and nothing else changes -- not the
+  status, the attempt sequence, the audit timeline, receipts or
+  inspection bookkeeping. It returns exactly the request id and the new
+  UTC RFC3339 expiry; consecutive renewals each compute a fresh expiry
+  from their own commit time, concurrent renewals of the same lease
+  commit a single new expiry that every competing caller observes, and
+  an unknown, expired, released or foreign token -- or a request
+  without a live lease -- raises :class:`ClaimConflict` unchanged.
 * :meth:`RequestStore.get_execution_log` returns the attempt history
   (sequence, claim and expiry times, terminal result and completion
   time) with only strings, integers and nulls -- never a worker or token.
@@ -2322,6 +2332,226 @@ class RequestStore:
             "status": result,
             "created_at": created_at,
         }
+
+    def renew_lease(
+        self,
+        tenant_id: str,
+        request_id: str,
+        claim_token: str,
+        lease_seconds: int,
+    ) -> dict[str, str]:
+        """Extend the live lease held by ``claim_token``.
+
+        The token must identify the request's current, unexpired,
+        unreleased lease for the same tenant. The renewal only moves the
+        open attempt's ``lease_expires_at`` to this transaction's commit
+        time plus ``lease_seconds`` and changes nothing else: the request
+        status, the attempt sequence, the audit timeline, receipts and
+        inspection bookkeeping are all untouched, and no new attempt or
+        credential is created. Success returns exactly ``request_id``
+        and the new UTC RFC3339 ``lease_expires_at``; consecutive
+        renewals each compute a fresh expiry from their own commit time,
+        while concurrent renewals of the same lease commit a single new
+        expiry and every competing caller observes that one committed
+        value. An unknown, expired, released or foreign credential -- or
+        a request that is not processing with a live lease -- raises
+        :class:`ClaimConflict` and changes nothing. A non-string or
+        empty tenant or an out-of-domain lease duration raises
+        :class:`ValueError`; an invalid, unknown or cross-tenant request
+        id raises :class:`RequestNotFound`, both checked before the
+        credential; every storage fault is the fixed-text
+        :class:`OSError`, never a half-formed expiry.
+        """
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        lease_seconds = _require_lease_seconds(lease_seconds)
+        request_id = _require_identifier(request_id)
+
+        # Advisory pre-read of the lease expiry BEFORE the serialized
+        # write section: genuinely concurrent renewals then validate
+        # against the same pre-state, so exactly one new expiry is
+        # committed and every competitor adopts it. Any failure here is
+        # ignored -- the write transaction re-validates authoritatively.
+        snapshot = self._snapshot_lease_expiry(tenant_id, request_id, claim_token)
+
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                except sqlite3.Error:
+                    raise _storage_failure() from None
+                try:
+                    renewed = self._renew_lease_locked(
+                        conn,
+                        tenant_id,
+                        request_id,
+                        claim_token,
+                        lease_seconds,
+                        snapshot,
+                    )
+                    conn.execute("COMMIT")
+                except (ClaimConflict, RequestNotFound):
+                    # Domain rejections carry no engine text; ensure the
+                    # shared in-memory connection leaves the transaction.
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
+                except OSError:
+                    # A fixed-text storage failure raised after the helper
+                    # rolled back; the second rollback only guarantees the
+                    # connection has left its transaction.
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
+                except sqlite3.Error:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise _storage_failure() from None
+            finally:
+                self._release(conn)
+        _log.info("lease renewed request_id=%s", request_id)
+        return renewed
+
+    def _snapshot_lease_expiry(
+        self, tenant_id: str, request_id: str, claim_token: str
+    ) -> str | None:
+        """Best-effort read of the token's current lease expiry.
+
+        Advisory only: it detects a competing renewal that committed
+        between this call's pre-read and its write transaction. Any
+        failure or unresolvable state yields ``None`` and the write
+        transaction re-validates everything from scratch.
+        """
+        if not isinstance(claim_token, str) or not claim_token:
+            return None
+        try:
+            if self._mem_conn is not None:
+                # The shared in-memory connection is only ever used under
+                # the write lock, so the pre-read serializes there too.
+                with self._write_lock:
+                    return self._read_live_lease_expiry(
+                        self._mem_conn, tenant_id, request_id, claim_token
+                    )
+            conn = self._connect()
+            try:
+                return self._read_live_lease_expiry(
+                    conn, tenant_id, request_id, claim_token
+                )
+            finally:
+                self._release(conn)
+        except (sqlite3.Error, OSError):
+            return None
+
+    @staticmethod
+    def _read_live_lease_expiry(
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        request_id: str,
+        claim_token: str,
+    ) -> str | None:
+        """Read the expiry of the open attempt the token owns, if any."""
+        presented = hashlib.sha256(claim_token.encode("utf-8")).hexdigest()
+        owner = conn.execute(
+            "SELECT tenant_id, request_id, attempt_number FROM claim_tokens "
+            "WHERE token_hash = ? LIMIT 1",
+            (presented,),
+        ).fetchone()
+        if owner is None or (owner[0], owner[1]) != (tenant_id, request_id):
+            return None
+        row = conn.execute(
+            "SELECT lease_expires_at FROM claim_attempts "
+            "WHERE tenant_id = ? AND request_id = ? AND attempt_number = ? "
+            "AND result IS NULL",
+            (tenant_id, request_id, owner[2]),
+        ).fetchone()
+        if row is None or not isinstance(row[0], str) or not row[0]:
+            return None
+        return row[0]
+
+    def _renew_lease_locked(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        request_id: str,
+        claim_token: str,
+        lease_seconds: int,
+        snapshot: str | None,
+    ) -> dict[str, str]:
+        # The request-id check outranks every credential check: unknown
+        # and cross-tenant ids are RequestNotFound whatever token is
+        # presented, so the credential can never probe existence.
+        row = conn.execute(
+            "SELECT status FROM requests WHERE tenant_id = ? AND request_id = ?",
+            (tenant_id, request_id),
+        ).fetchone()
+        if row is None:
+            raise RequestNotFound("request not found")
+        current_status = row[0]
+
+        # Every credential problem -- a token outside the non-empty-string
+        # domain, an unknown or released one, or one owned by other
+        # coordinates -- is the single detail-free ClaimConflict.
+        if not isinstance(claim_token, str) or not claim_token:
+            raise _claim_conflict()
+        presented = hashlib.sha256(claim_token.encode("utf-8")).hexdigest()
+        owner = conn.execute(
+            "SELECT tenant_id, request_id, attempt_number FROM claim_tokens "
+            "WHERE token_hash = ? LIMIT 1",
+            (presented,),
+        ).fetchone()
+        if owner is None or (owner[0], owner[1]) != (tenant_id, request_id):
+            raise _claim_conflict()
+        attempt_number = owner[2]
+
+        if current_status != _STATUS_PROCESSING:
+            # Only a processing request can hold a renewable lease; the
+            # fixed message never says which condition applied.
+            raise _claim_conflict()
+
+        latest = conn.execute(
+            "SELECT result, lease_expires_at FROM claim_attempts "
+            "WHERE tenant_id = ? AND request_id = ? AND attempt_number = ?",
+            (tenant_id, request_id, attempt_number),
+        ).fetchone()
+        if latest is None or latest[0] is not None:
+            raise _claim_conflict()
+        stored_expiry = latest[1]
+        if not isinstance(stored_expiry, str) or not stored_expiry:
+            # A lease row without its expiry is out-of-band corruption,
+            # never a renewable lease.
+            raise _storage_failure()
+        now_dt = datetime.now(timezone.utc)
+        if _format_rfc3339(now_dt) > stored_expiry:
+            # The lease has lapsed: a late renewal never resurrects it.
+            raise _claim_conflict()
+
+        if snapshot is not None and snapshot != stored_expiry:
+            # A competing renewal of this same lease committed first:
+            # exactly one new expiry exists and every competitor observes
+            # that committed value instead of extending the lease again.
+            return {
+                "request_id": request_id,
+                "lease_expires_at": stored_expiry,
+            }
+
+        # The new expiry is computed from this transaction's commit time,
+        # so consecutive renewals never reuse an old value.
+        new_expiry = _format_rfc3339(now_dt + timedelta(seconds=lease_seconds))
+        cursor = conn.execute(
+            "UPDATE claim_attempts SET lease_expires_at = ? "
+            "WHERE tenant_id = ? AND request_id = ? AND attempt_number = ? "
+            "AND result IS NULL AND lease_expires_at = ?",
+            (new_expiry, tenant_id, request_id, attempt_number, stored_expiry),
+        )
+        if cursor.rowcount != 1:
+            raise _storage_failure()
+        return {"request_id": request_id, "lease_expires_at": new_expiry}
 
     def get_execution_log(
         self,
