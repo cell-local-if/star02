@@ -18,7 +18,8 @@ lookup (:meth:`RequestStore.get_status`), the execution orchestration
 :meth:`RequestStore.renew_lease`,
 :meth:`RequestStore.get_execution_log`,
 :meth:`RequestStore.reconcile_execution`,
-:meth:`RequestStore.reconcile_batch`) and the deletion receipts
+:meth:`RequestStore.reconcile_batch`,
+:meth:`RequestStore.migrate_execution_leases`) and the deletion receipts
 (:meth:`RequestStore.generate_receipt`,
 :meth:`RequestStore.verify_receipt`,
 :meth:`RequestStore.rotate_receipt_key`) and the anchor capability
@@ -190,6 +191,12 @@ class DeferredRequestStore:
         # The read-only inspection summary is storage-layer only; never
         # routed over HTTP and never writes anything.
         return self._ready().audit_inspection_summary(tenant_id, batch_id)
+
+    def migrate_execution_leases(self, tenant_id, cursor=None, limit=None):
+        # The recoverable execution-lease migration is storage-layer
+        # only; like the rest of the execution orchestration it is never
+        # routed over HTTP and adds no endpoint.
+        return self._ready().migrate_execution_leases(tenant_id, cursor, limit)
 
 
 def _normalize_request_id(value: str) -> str:
