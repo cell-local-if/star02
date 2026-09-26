@@ -15,6 +15,7 @@ The service exposes exactly two business endpoints:
 Status advancement (:meth:`RequestStore.transition`), current-status
 lookup (:meth:`RequestStore.get_status`), the execution orchestration
 (:meth:`RequestStore.claim_next`, :meth:`RequestStore.finish_claim`,
+:meth:`RequestStore.renew_lease`,
 :meth:`RequestStore.get_execution_log`,
 :meth:`RequestStore.reconcile_execution`,
 :meth:`RequestStore.reconcile_batch`) and the deletion receipts
@@ -148,6 +149,13 @@ class DeferredRequestStore:
     def finish_claim(self, tenant_id, request_id, claim_token, result):
         return self._ready().finish_claim(
             tenant_id, request_id, claim_token, result
+        )
+
+    def renew_lease(self, tenant_id, request_id, claim_token, lease_seconds):
+        # Lease renewal is storage-layer only; like the rest of the
+        # execution orchestration it is never routed over HTTP.
+        return self._ready().renew_lease(
+            tenant_id, request_id, claim_token, lease_seconds
         )
 
     def get_execution_log(self, tenant_id, request_id):
