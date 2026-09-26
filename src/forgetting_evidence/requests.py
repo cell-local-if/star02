@@ -61,6 +61,22 @@ Execution orchestration lives on the same store, storage-layer only:
   batch identifier. ``accepted`` requests are skipped on the first scan
   without creating an attempt, receipt or status event, and each item's
   state, attempts, lease, batch row and cursor commit in one transaction.
+* :meth:`RequestStore.migrate_execution_leases` recovers legacy
+  execution-lease bookkeeping in the same resumable, tenant-scoped batch
+  shape. It sweeps the requests that carry legacy lease records in
+  stable acceptance order and completes only recoverable bookkeeping --
+  the legacy attempt rows with their original times and results, plus, at
+  most, the single still-live credential hash -- never changing a request
+  status, a timestamp, an attempt result, the audit chain, anchors,
+  receipts or claim candidates, and never producing a second lease. Each
+  upgrade is written at most once, the whole page commits in one
+  transaction, concurrent same-cursor continuations have a single winner
+  whose competing calls observe the committed progress with an empty item
+  list, and an empty sweep still persists a stable, finished batch. It
+  returns one compact JSON line; invalid arguments raise
+  :class:`ValueError` without writing, while a corrupt legacy record or
+  any storage fault is the fixed-text :class:`OSError`
+  ``execution_lease_migration_failed``.
 
 Deletion receipts close the lifecycle with an externally verifiable
 record, storage-layer only like the rest of the orchestration:
@@ -595,6 +611,69 @@ CREATE TABLE IF NOT EXISTS inspection_batch_items (
 );
 """
 
+# Lease records written by the previous execution-lease implementation.
+# The current lease operations never read or write this table; it exists
+# solely so :meth:`RequestStore.migrate_execution_leases` can recover its
+# bookkeeping into ``claim_attempts``/``claim_tokens``. One row per legacy
+# lease acquisition, carrying the same per-attempt fields the current
+# tables hold -- including the single-use credential as a salt-free
+# SHA-256 hash only, never the raw token, and never a worker identity.
+# Rows are inserted once and never updated or deleted by the store.
+_LEGACY_LEASE_TABLE = """
+CREATE TABLE IF NOT EXISTS legacy_execution_leases (
+    tenant_id        TEXT NOT NULL,
+    request_id       TEXT NOT NULL,
+    attempt_number   INTEGER NOT NULL,
+    claimed_at       TEXT NOT NULL,
+    lease_expires_at TEXT NOT NULL,
+    token_hash       TEXT NOT NULL,
+    result           TEXT,
+    completed_at     TEXT,
+    PRIMARY KEY (tenant_id, request_id, attempt_number)
+);
+"""
+
+# Persistent execution-lease migration batches. Same resumable keyset
+# shape as the reconcile and inspection batches: the batch row and its
+# committed position survive restarts, so presenting the same cursor
+# again resumes the migration from its durable position instead of
+# restarting it. The migration never writes to a request, status event,
+# anchor, receipt or current lease table beyond the one-time recovery of
+# legacy bookkeeping; only these two bookkeeping tables track the sweep.
+_LEASE_MIGRATION_BATCH_TABLE = """
+CREATE TABLE IF NOT EXISTS lease_migration_batches (
+    batch_id            TEXT PRIMARY KEY,
+    tenant_id           TEXT NOT NULL,
+    position_created_at TEXT,
+    position_request_id TEXT,
+    finished            INTEGER NOT NULL DEFAULT 0
+);
+"""
+
+# Per-request migration outcomes, one row per upgraded request. Each row,
+# the recovered bookkeeping it describes and the batch position advance
+# commit in the same page transaction, so a crash can never leave an
+# upgraded lease without its bookkeeping record (or vice versa) and a
+# cursor retry never rewrites a settled upgrade. ``attempt_number`` is
+# the latest (current) legacy attempt recovered for the request, and
+# ``outcome`` the stable, detail-free result code for the upgrade. The
+# per-tenant unique request constraint is the tenant-wide "already
+# upgraded" marker: across every batch of the tenant, the legacy record
+# of a request is upgraded at most once, and a repeat migration finds no
+# pending request, persists the empty batch and finishes.
+_LEASE_MIGRATION_ITEM_TABLE = """
+CREATE TABLE IF NOT EXISTS lease_migration_items (
+    tenant_id      TEXT NOT NULL,
+    batch_id       TEXT NOT NULL,
+    seq            INTEGER NOT NULL,
+    request_id     TEXT NOT NULL,
+    attempt_number INTEGER NOT NULL,
+    outcome        TEXT NOT NULL,
+    PRIMARY KEY (batch_id, seq),
+    UNIQUE (tenant_id, request_id)
+);
+"""
+
 # Issued deletion receipts, at most one per request. ``receipt_json``
 # holds the exact canonical text returned to the first caller (compact
 # JSON plus the trailing newline), so a regeneration, a rebuilt instance
@@ -762,6 +841,19 @@ def _audit_health_failure() -> OSError:
     return OSError(_AUDIT_HEALTH_MESSAGE)
 
 
+# Fixed, detail-free text for every execution-lease migration failure: an
+# unreadable or unwritable store, a corrupt legacy lease record, or a
+# batch commit that cannot land. It never embeds a tenant, a request id,
+# a credential, SQL text or a filesystem path, and a half-settled page is
+# never returned.
+_LEASE_MIGRATION_MESSAGE = "execution_lease_migration_failed"
+
+
+def _lease_migration_failure() -> OSError:
+    """Build the single migration error callers are ever allowed to see."""
+    return OSError(_LEASE_MIGRATION_MESSAGE)
+
+
 _BACKUP_CONFLICT_MESSAGE = "backup conflict"
 
 # Every table the schema creates. A snapshot missing any of them is not
@@ -775,6 +867,9 @@ _BACKUP_TABLES = frozenset({
     "reconcile_batch_items",
     "inspection_batches",
     "inspection_batch_items",
+    "legacy_execution_leases",
+    "lease_migration_batches",
+    "lease_migration_items",
     "deletion_receipts",
     "receipt_keys",
     "audit_anchors",
@@ -848,6 +943,11 @@ _CURSOR_PREFIX = "rc1."
 # inspection entry point (or vice versa) is an unknown format and is
 # rejected as caller error before storage is touched.
 _INSPECTION_CURSOR_PREFIX = "ai1."
+# Execution-lease migration cursors share the same envelope but carry
+# their own version prefix, so a reconcile or inspection cursor presented
+# to the migration entry point (or vice versa) is an unknown format and
+# rejected as caller error before storage is touched.
+_LEASE_MIGRATION_CURSOR_PREFIX = "em1."
 _B64URL_CHARS = frozenset(
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 )
@@ -1768,6 +1868,9 @@ class RequestStore:
                 conn.execute(_BATCH_ITEM_TABLE)
                 conn.execute(_INSPECTION_BATCH_TABLE)
                 conn.execute(_INSPECTION_BATCH_ITEM_TABLE)
+                conn.execute(_LEGACY_LEASE_TABLE)
+                conn.execute(_LEASE_MIGRATION_BATCH_TABLE)
+                conn.execute(_LEASE_MIGRATION_ITEM_TABLE)
                 conn.execute(_RECEIPT_TABLE)
                 conn.execute(_RECEIPT_KEY_TABLE)
                 conn.execute(_RECEIPT_KEY_FINGERPRINT_INDEX)
@@ -3737,6 +3840,592 @@ class RequestStore:
         )
         if cursor.rowcount != 1:
             raise _storage_failure()
+
+    # -- execution-lease migration -------------------------------------
+
+    def migrate_execution_leases(
+        self,
+        tenant_id: str,
+        cursor: str | None = None,
+        limit: int | None = None,
+    ) -> str:
+        """Recover legacy execution-lease bookkeeping in resumable batches.
+
+        Storage-layer only; never routed over HTTP. With ``cursor``
+        omitted a new persistent batch sweeps the tenant's requests that
+        carry legacy lease records in stable acceptance order
+        (``created_at`` then ``request_id``); with a cursor the batch it
+        names is resumed from its durably committed position, so a retry
+        after an interruption or a service restart continues instead of
+        restarting, and the same cursor always keeps the same batch
+        identifier. Each call upgrades at most ``limit`` requests
+        (default 100, at most 1000).
+
+        The upgrade only ever completes recoverable lease bookkeeping:
+        legacy attempt rows are copied into the current
+        ``claim_attempts`` bookkeeping with their original claim and
+        expiry times, results and completion times unchanged, and a still
+        live lease -- the latest attempt open and unexpired at commit
+        time, with no newer current lease -- recovers its single
+        credential hash row. The request status, acceptance time,
+        attempt results, the audit chain, anchors, receipts and claim
+        candidates are never changed, and no second lease is ever
+        produced: a request without a valid lease stays for the existing
+        reconcile path to converge. Repeating the migration writes each
+        upgrade exactly once; already-upgraded requests are not written
+        again.
+
+        Returns one compact JSON line (exactly one trailing newline)
+        holding, in order, ``batch_id``, ``next_cursor`` (null once the
+        sweep is finished), ``finished`` and ``items`` -- one
+        ``{"request_id", "attempt_number", "outcome"}`` entry per
+        upgraded request, in scan order, where ``attempt_number`` is the
+        request's current (latest) recovered attempt and ``outcome`` is
+        a stable result code (``upgraded`` when recoverable bookkeeping
+        was written, ``present`` when it was already fully recovered).
+        No worker identity and no claim token is ever included.
+
+        The whole page -- batch creation or resolution, every upgrade,
+        every item row and the cursor position -- commits in one
+        transaction, so a failed call never returns half a page and a
+        retry only completes items that never settled. Concurrent
+        continuations naming the same tenant, batch and cursor are
+        atomic: the single winning transaction returns that page's items
+        with the post-commit progress, while a competing call changes
+        nothing and returns the same shape with an empty item list and
+        the winner's committed position. With no legacy records the
+        batch still persists, returns an empty item list and finishes.
+
+        A non-string/empty *tenant_id*, a limit outside 1..1000 (or a
+        non-integer or boolean), and any malformed, unknown or
+        cross-tenant *cursor* raise :class:`ValueError` without
+        writing. An unreadable or unwritable store, a corrupt legacy
+        lease record and a failed page commit all raise the fixed-text
+        :class:`OSError` ``execution_lease_migration_failed``, never a
+        half-settled page.
+        """
+        # Validate everything before touching the database: no rejected
+        # call may perform a write.
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        if limit is None:
+            limit = _DEFAULT_BATCH_LIMIT
+        limit = _require_batch_limit(limit)
+        cursor_batch: tuple[str, int] | None = None
+        if cursor is not None:
+            cursor_batch = _decode_cursor(
+                cursor, _LEASE_MIGRATION_CURSOR_PREFIX
+            )
+
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                # The whole continuation is one atomic write transaction:
+                # BEGIN IMMEDIATE serialises same-batch continuations, in
+                # this process through the write lock and across processes
+                # sharing the file through the database write lock. The
+                # winning transaction upgrades the entire page (every
+                # recovered row, the item rows and the cursor position
+                # committing together); a competing transaction only reads
+                # the winner's committed position.
+                batch_id, items, finished, durable_count = (
+                    self._migration_transaction(
+                        conn,
+                        lambda: self._continue_lease_migration_locked(
+                            conn, tenant_id, cursor_batch, limit
+                        ),
+                    )
+                )
+            finally:
+                self._release(conn)
+        next_cursor = (
+            None
+            if finished
+            else _encode_cursor(
+                batch_id, durable_count, _LEASE_MIGRATION_CURSOR_PREFIX
+            )
+        )
+        # Log only counts and the stable outcome: no tenant, subject,
+        # credential, SQL text or path ever reaches the log.
+        _log.info(
+            "execution lease migration items=%s finished=%s",
+            len(items),
+            finished,
+        )
+        return (
+            json.dumps(
+                {
+                    "batch_id": batch_id,
+                    "next_cursor": next_cursor,
+                    "finished": finished,
+                    "items": items,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
+
+    def _migration_transaction(self, conn: sqlite3.Connection, action):
+        """Run one migration page inside a short-lived write transaction.
+
+        Exactly like :meth:`_batch_transaction`, except every engine
+        error and every corrupt-record signal becomes the migration's
+        own fixed-text :class:`OSError` rather than the generic storage
+        text. Domain :class:`ValueError` (an invalid cursor) is rolled
+        back and re-raised unchanged.
+        """
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.Error:
+            raise _lease_migration_failure() from None
+        try:
+            result = action()
+            conn.execute("COMMIT")
+            return result
+        except ValueError:
+            self._rollback_quietly(conn)
+            raise
+        except OSError:
+            self._rollback_quietly(conn)
+            raise _lease_migration_failure() from None
+        except sqlite3.Error:
+            self._rollback_quietly(conn)
+            raise _lease_migration_failure() from None
+
+    def _continue_lease_migration_locked(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        cursor_batch: tuple[str, int] | None,
+        limit: int,
+    ) -> tuple[str, list[dict[str, object]], bool, int]:
+        """Upgrade (or observe) one migration page in the open write txn.
+
+        Returns ``(batch_id, items, finished, item_count)``. Without a
+        cursor a fresh batch row is inserted and the sweep starts before
+        the first row; with a cursor the named batch is resumed from its
+        durably committed position -- the cursor's own position field is
+        only an envelope detail, the database is authoritative.
+
+        When the durable item count is already ahead of the position the
+        presented cursor was issued at, a concurrent (or retried)
+        continuation committed first: nothing is upgraded or written and
+        the winner's post-commit progress is returned with an empty item
+        list, so a settled upgrade is never re-reported. Otherwise up to
+        ``limit`` legacy-bearing requests after the durable position are
+        upgraded in stable scan order; the recovered bookkeeping, the
+        item rows, the cursor position and the possible end-of-sweep
+        marker all commit in this single transaction.
+
+        An unknown or cross-tenant batch id is an invalid cursor and
+        raises :class:`ValueError`; corrupt persisted state or a corrupt
+        legacy lease record raises the fixed-text migration
+        :class:`OSError`.
+        """
+        if cursor_batch is None:
+            batch_id = str(uuid.uuid4())
+            conn.execute(
+                "INSERT INTO lease_migration_batches ("
+                "batch_id, tenant_id, position_created_at, "
+                "position_request_id, finished"
+                ") VALUES (?, ?, NULL, NULL, 0)",
+                (batch_id, tenant_id),
+            )
+            issued_position = 0
+        else:
+            batch_id, issued_position = cursor_batch
+            # Confirm ownership before reading state: an unknown or
+            # cross-tenant batch id is an invalid cursor, indistinguishable
+            # from one that never existed.
+            owner = conn.execute(
+                "SELECT 1 FROM lease_migration_batches "
+                "WHERE batch_id = ? AND tenant_id = ?",
+                (batch_id, tenant_id),
+            ).fetchone()
+            if owner is None:
+                raise ValueError("cursor is not valid")
+
+        pos_created, pos_rid, finished, item_count = (
+            self._read_lease_migration_state_locked(conn, batch_id)
+        )
+        if item_count > issued_position:
+            # A concurrent same-cursor continuation (or a sequential
+            # replay) already advanced the batch past this cursor's
+            # issued position: observe the committed progress, upgrade
+            # nothing twice and write nothing.
+            return batch_id, [], finished, item_count
+
+        items: list[dict[str, object]] = []
+        # One "now" governs every liveness decision in this page so the
+        # recovered lease state is judged at one commit instant.
+        now = _utc_now_rfc3339()
+        while not finished and len(items) < limit:
+            row = self._next_lease_migration_candidate(
+                conn, tenant_id, pos_created, pos_rid
+            )
+            if row is None:
+                self._finish_lease_migration_locked(conn, batch_id)
+                finished = True
+                break
+            request_id, created_at, status = row
+            attempt_number, outcome = self._upgrade_legacy_lease_locked(
+                conn, tenant_id, request_id, status, now
+            )
+            # The sequence derives from the durable count plus this
+            # page's offset, so a resumed batch never reuses a number.
+            conn.execute(
+                "INSERT INTO lease_migration_items ("
+                "tenant_id, batch_id, seq, request_id, attempt_number, outcome"
+                ") VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    tenant_id,
+                    batch_id,
+                    item_count + 1 + len(items),
+                    request_id,
+                    attempt_number,
+                    outcome,
+                ),
+            )
+            pos_created, pos_rid = created_at, request_id
+            items.append(
+                {
+                    "request_id": request_id,
+                    "attempt_number": attempt_number,
+                    "outcome": outcome,
+                }
+            )
+        if items:
+            self._advance_lease_migration_locked(
+                conn, batch_id, pos_created, pos_rid
+            )
+        if not finished:
+            # A limit-stopped page may also have consumed the last
+            # legacy-bearing request: finish the batch in this same
+            # transaction when nothing remains after the new position.
+            if (
+                self._next_lease_migration_candidate(
+                    conn, tenant_id, pos_created, pos_rid
+                )
+                is None
+            ):
+                self._finish_lease_migration_locked(conn, batch_id)
+                finished = True
+        # Re-read the authoritative end flag and count inside the same
+        # transaction rather than trusting the in-memory tally.
+        _pos_created, _pos_rid, finished, final_count = (
+            self._read_lease_migration_state_locked(conn, batch_id)
+        )
+        return batch_id, items, finished, final_count
+
+    def _read_lease_migration_state_locked(
+        self, conn: sqlite3.Connection, batch_id: str
+    ) -> tuple[str | None, str | None, bool, int]:
+        """Read and strictly validate a migration batch's position."""
+        row = conn.execute(
+            "SELECT position_created_at, position_request_id, finished, "
+            "(SELECT count(*) FROM lease_migration_items i "
+            " WHERE i.batch_id = b.batch_id) "
+            "FROM lease_migration_batches b WHERE b.batch_id = ?",
+            (batch_id,),
+        ).fetchone()
+        if row is None:
+            # The batch this transaction is driving vanished out of band.
+            raise _lease_migration_failure()
+        pos_created, pos_rid, finished, item_count = row
+        if (
+            finished not in (0, 1)
+            or not isinstance(item_count, int)
+            or isinstance(item_count, bool)
+        ):
+            raise _lease_migration_failure()
+        if (pos_created is None) != (pos_rid is None):
+            # The keyset position is written atomically; a split pair is
+            # out-of-band corruption, never a resumable state.
+            raise _lease_migration_failure()
+        if pos_created is not None and (
+            not isinstance(pos_created, str)
+            or not pos_created
+            or not isinstance(pos_rid, str)
+            or not pos_rid
+        ):
+            raise _lease_migration_failure()
+        return pos_created, pos_rid, bool(finished), item_count
+
+    @staticmethod
+    def _next_lease_migration_candidate(
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        pos_created: str | None,
+        pos_rid: str | None,
+    ) -> tuple[str, str, str] | None:
+        """Oldest pending legacy-bearing request after the keyset position.
+
+        Only requests that carry a legacy lease record and have not yet
+        been upgraded by *any* migration batch of the tenant are visited;
+        the ``NOT EXISTS`` against the tenant-wide item marker is what
+        makes a repeat migration find nothing pending, persist the empty
+        batch and finish without writing an upgrade twice. The
+        (created_at, request_id) ordering is the same stable order the
+        claim, reconcile and inspection scans use, so the sweep is stable
+        across calls, restarts and concurrent submissions.
+        """
+        if pos_created is None:
+            return conn.execute(
+                "SELECT r.request_id, r.created_at, r.status "
+                "FROM requests r "
+                "WHERE r.tenant_id = ? AND EXISTS ( "
+                "  SELECT 1 FROM legacy_execution_leases l "
+                "  WHERE l.tenant_id = r.tenant_id "
+                "    AND l.request_id = r.request_id "
+                ") AND NOT EXISTS ( "
+                "  SELECT 1 FROM lease_migration_items m "
+                "  WHERE m.tenant_id = r.tenant_id "
+                "    AND m.request_id = r.request_id "
+                ") "
+                "ORDER BY r.created_at ASC, r.request_id ASC LIMIT 1",
+                (tenant_id,),
+            ).fetchone()
+        return conn.execute(
+            "SELECT r.request_id, r.created_at, r.status "
+            "FROM requests r "
+            "WHERE r.tenant_id = ? AND EXISTS ( "
+            "  SELECT 1 FROM legacy_execution_leases l "
+            "  WHERE l.tenant_id = r.tenant_id "
+            "    AND l.request_id = r.request_id "
+            ") AND NOT EXISTS ( "
+            "  SELECT 1 FROM lease_migration_items m "
+            "  WHERE m.tenant_id = r.tenant_id "
+            "    AND m.request_id = r.request_id "
+            ") AND (r.created_at, r.request_id) > (?, ?) "
+            "ORDER BY r.created_at ASC, r.request_id ASC LIMIT 1",
+            (tenant_id, pos_created, pos_rid),
+        ).fetchone()
+
+    @staticmethod
+    def _advance_lease_migration_locked(
+        conn: sqlite3.Connection,
+        batch_id: str,
+        pos_created: str,
+        pos_rid: str,
+    ) -> None:
+        """Move the migration batch's durable keyset position forward."""
+        cursor = conn.execute(
+            "UPDATE lease_migration_batches "
+            "SET position_created_at = ?, position_request_id = ? "
+            "WHERE batch_id = ?",
+            (pos_created, pos_rid, batch_id),
+        )
+        if cursor.rowcount != 1:
+            # The batch row this transaction itself resolved vanished;
+            # that is storage corruption, never a caller error.
+            raise _lease_migration_failure()
+
+    @staticmethod
+    def _finish_lease_migration_locked(
+        conn: sqlite3.Connection, batch_id: str
+    ) -> None:
+        """Mark the migration batch durably finished in the open txn."""
+        cursor = conn.execute(
+            "UPDATE lease_migration_batches SET finished = 1 WHERE batch_id = ?",
+            (batch_id,),
+        )
+        if cursor.rowcount != 1:
+            raise _lease_migration_failure()
+
+    def _upgrade_legacy_lease_locked(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        request_id: str,
+        status: str,
+        now: str,
+    ) -> tuple[int, str]:
+        """Recover one request's legacy lease bookkeeping in the open txn.
+
+        Returns ``(latest_attempt_number, outcome)`` with outcome
+        ``upgraded`` when recoverable bookkeeping was written and
+        ``present`` when the legacy records were already fully
+        represented by current bookkeeping (an idempotent re-migration
+        writes nothing). The request status, every timestamp and every
+        attempt result are preserved verbatim; only missing attempt rows
+        and, at most, the single still-live credential hash are added.
+
+        A malformed legacy record -- a broken attempt sequence, a
+        non-string or malformed timestamp, a malformed credential hash,
+        a result outside the terminal domain, a split result/completion
+        pair, an impossible lease window, a legacy record under an
+        accepted request, or a legacy row that contradicts an existing
+        current row -- is corrupt lease data and raises the fixed-text
+        migration :class:`OSError`; nothing is partially written.
+        """
+        legacy_rows = conn.execute(
+            "SELECT attempt_number, claimed_at, lease_expires_at, "
+            "token_hash, result, completed_at "
+            "FROM legacy_execution_leases "
+            "WHERE tenant_id = ? AND request_id = ? "
+            "ORDER BY attempt_number",
+            (tenant_id, request_id),
+        ).fetchall()
+        # The keyset candidate was selected from this same table inside
+        # this same write transaction; an empty set can only mean
+        # out-of-band corruption.
+        if not legacy_rows:
+            raise _lease_migration_failure()
+        if (
+            status not in _ALLOWED_TRANSITIONS
+            or status == _STATUS_ACCEPTED
+        ):
+            # A legacy lease can only belong to a request that entered
+            # processing or beyond; accepted status with lease history
+            # and any status outside the lifecycle are inconsistent
+            # legacy data, never something to paper over.
+            raise _lease_migration_failure()
+
+        validated: list[tuple[int, str, str, str, str | None, str | None]] = []
+        for index, row in enumerate(legacy_rows, start=1):
+            (
+                attempt_number,
+                claimed_at,
+                lease_expires_at,
+                token_hash,
+                result,
+                completed_at,
+            ) = row
+            if (
+                not isinstance(attempt_number, int)
+                or isinstance(attempt_number, bool)
+                or attempt_number != index
+                or not isinstance(claimed_at, str)
+                or not _RFC3339_RE.match(claimed_at)
+                or not isinstance(lease_expires_at, str)
+                or not _RFC3339_RE.match(lease_expires_at)
+                or claimed_at > lease_expires_at
+                or not _is_chain_hash(token_hash)
+            ):
+                raise _lease_migration_failure()
+            if result is not None and (
+                not isinstance(result, str) or result not in _TERMINAL_RESULTS
+            ):
+                raise _lease_migration_failure()
+            if completed_at is not None and (
+                not isinstance(completed_at, str)
+                or not _RFC3339_RE.match(completed_at)
+            ):
+                raise _lease_migration_failure()
+            # Result and completion time are set together; a split row is
+            # a broken legacy invariant.
+            if (result is None) != (completed_at is None):
+                raise _lease_migration_failure()
+            validated.append(
+                (
+                    attempt_number,
+                    claimed_at,
+                    lease_expires_at,
+                    token_hash,
+                    result,
+                    completed_at,
+                )
+            )
+
+        existing_rows = conn.execute(
+            "SELECT attempt_number, claimed_at, lease_expires_at, "
+            "result, completed_at FROM claim_attempts "
+            "WHERE tenant_id = ? AND request_id = ?",
+            (tenant_id, request_id),
+        ).fetchall()
+        existing = {row[0]: row[1:] for row in existing_rows}
+
+        wrote = False
+        for (
+            attempt_number,
+            claimed_at,
+            lease_expires_at,
+            _token_hash,
+            result,
+            completed_at,
+        ) in validated:
+            current = existing.get(attempt_number)
+            if current is not None:
+                # The attempt was already recovered (or exists in
+                # current bookkeeping): its history must agree field for
+                # field, otherwise the legacy record contradicts settled
+                # data and is corruption, never something to overwrite.
+                if current != (
+                    claimed_at,
+                    lease_expires_at,
+                    result,
+                    completed_at,
+                ):
+                    raise _lease_migration_failure()
+                continue
+            conn.execute(
+                "INSERT INTO claim_attempts ("
+                "tenant_id, request_id, attempt_number, claimed_at, "
+                "lease_expires_at, result, completed_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    tenant_id,
+                    request_id,
+                    attempt_number,
+                    claimed_at,
+                    lease_expires_at,
+                    result,
+                    completed_at,
+                ),
+            )
+            wrote = True
+
+        (
+            latest_number,
+            _latest_claimed_at,
+            latest_expires_at,
+            latest_token_hash,
+            latest_result,
+            _latest_completed_at,
+        ) = validated[-1]
+
+        # Recover the single live credential hash, and only when it
+        # genuinely represents the request's current live lease: the
+        # request is still processing, the latest legacy attempt is open
+        # and still inside its lease window at this transaction's
+        # instant, no current credential row already exists (never mint a
+        # second lease), and no current attempt supersedes the legacy
+        # history. Anything weaker is left exactly as found for the
+        # existing reconcile path to converge.
+        current_holder = conn.execute(
+            "SELECT 1 FROM claim_tokens "
+            "WHERE tenant_id = ? AND request_id = ?",
+            (tenant_id, request_id),
+        ).fetchone()
+        max_row = conn.execute(
+            "SELECT COALESCE(MAX(attempt_number), 0) FROM claim_attempts "
+            "WHERE tenant_id = ? AND request_id = ?",
+            (tenant_id, request_id),
+        ).fetchone()
+        current_max = max_row[0]
+        if not isinstance(current_max, int) or isinstance(current_max, bool):
+            raise _lease_migration_failure()
+        if (
+            status == _STATUS_PROCESSING
+            and latest_result is None
+            and now <= latest_expires_at
+            and current_holder is None
+            and current_max == latest_number
+        ):
+            conn.execute(
+                "INSERT INTO claim_tokens ("
+                "tenant_id, request_id, attempt_number, token_hash"
+                ") VALUES (?, ?, ?, ?)",
+                (
+                    tenant_id,
+                    request_id,
+                    latest_number,
+                    latest_token_hash,
+                ),
+            )
+            wrote = True
+
+        return latest_number, ("upgraded" if wrote else "present")
 
     # -- read-only audit inspection ------------------------------------
 

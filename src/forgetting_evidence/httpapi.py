@@ -18,7 +18,8 @@ lookup (:meth:`RequestStore.get_status`), the execution orchestration
 :meth:`RequestStore.renew_lease`,
 :meth:`RequestStore.get_execution_log`,
 :meth:`RequestStore.reconcile_execution`,
-:meth:`RequestStore.reconcile_batch`) and the deletion receipts
+:meth:`RequestStore.reconcile_batch`,
+:meth:`RequestStore.migrate_execution_leases`) and the deletion receipts
 (:meth:`RequestStore.generate_receipt`,
 :meth:`RequestStore.verify_receipt`,
 :meth:`RequestStore.rotate_receipt_key`) and the anchor capability
@@ -170,6 +171,14 @@ class DeferredRequestStore:
         # Batched, resumable reconciliation is storage-layer only; like the
         # rest of the execution orchestration it is never routed over HTTP.
         return self._ready().reconcile_batch(tenant_id, cursor, limit)
+
+    def migrate_execution_leases(self, tenant_id, cursor=None, limit=None):
+        # The recoverable legacy-lease migration is storage-layer only;
+        # like the rest of the execution orchestration it is never routed
+        # over HTTP and exposes no new endpoint.
+        return self._ready().migrate_execution_leases(
+            tenant_id, cursor, limit
+        )
 
     def verify_chain(self, tenant_id=None, request_id=None):
         # Full-chain anchor verification is storage-layer only; never
