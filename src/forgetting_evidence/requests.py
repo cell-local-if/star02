@@ -242,6 +242,28 @@ non-string reason -- or any storage fault is the fixed-text
 :class:`OSError`, never a partial aggregate or an empty reason folded
 into success.
 
+:meth:`RequestStore.backup_to` closes the storage-layer capability set
+with database backup, storage-layer only like the rest of the
+orchestration and never routed over HTTP. It takes just a target file
+path whose directory must already exist and whose name must not, and
+writes a transaction-consistent SQLite snapshot of exactly this
+instance's database -- requests, statuses, execution attempts and
+leases, receipts and key generations, audit anchors and heads, and
+inspection bookkeeping -- using SQLite's online backup, so a
+transaction committing concurrently lands in the snapshot in full or
+not at all and the source database is never modified. The copy is
+staged in a temporary file in the target's own directory, validated
+there (openable, complete table set, SQLite integrity check) and
+claimed atomically without overwriting, so two backups racing one
+target land exactly one snapshot and any failure leaves no file at
+the target path. Only content already inside the database is copied:
+no anchor secret, receipt key or other caller-held material ever
+enters the snapshot, the return value, an exception or a log. An
+empty, non-string or otherwise unusable target path raises
+:class:`ValueError` without touching anything, an already existing
+target raises :class:`BackupConflict`, and every source, filesystem
+or validation failure is the fixed-text :class:`OSError`.
+
 Caller errors are always :class:`ValueError` (invalid parameters) or the
 module's own domain exceptions; every database failure -- an unwritable
 path, an uncreatable or corrupt file, an I/O or read/write error -- is
@@ -262,6 +284,7 @@ import re
 import secrets
 import sqlite3
 import struct
+import tempfile
 import threading
 import uuid
 from collections.abc import Mapping
@@ -277,6 +300,7 @@ __all__ = [
     "ReceiptKeyConflict",
     "AnchorKeyConflict",
     "AuditInspectionNotFound",
+    "BackupConflict",
 ]
 
 _log = logging.getLogger(__name__)
@@ -343,6 +367,18 @@ class AuditInspectionNotFound(Exception):
     A summary is requested for a batch id that is missing or owned by
     another tenant; both share one detail-free outcome, so the
     read-only summary can never reveal another tenant's batches.
+    """
+
+
+class BackupConflict(Exception):
+    """Raised when a backup target cannot be claimed as asked.
+
+    The target path already exists -- either it was there before the
+    backup started, or a concurrent backup won the race to land its
+    own snapshot at the same path. The existing file is never
+    overwritten and never treated as a usable snapshot, and the fixed
+    message never identifies which condition applied or names the
+    path.
     """
 
 
@@ -643,6 +679,40 @@ _STORAGE_MESSAGE = "request store is unavailable"
 def _storage_failure() -> OSError:
     """Build the single storage error callers are ever allowed to see."""
     return OSError(_STORAGE_MESSAGE)
+
+
+# Fixed, detail-free text for every lost or refused backup-target claim.
+# It never names the path or says which condition applied.
+_BACKUP_CONFLICT_MESSAGE = "backup conflict"
+
+
+def _backup_conflict() -> BackupConflict:
+    """Build the single, detail-free backup conflict callers ever see."""
+    return BackupConflict(_BACKUP_CONFLICT_MESSAGE)
+
+
+# Tables a landed snapshot must carry before it may replace nothing and
+# be handed back as a usable database: every business, execution,
+# receipt, anchor and inspection-bookkeeping relation the store owns.
+# The check is a presence check only -- the snapshot is a byte-level
+# copy, so a missing table means the copy itself is not trustworthy.
+_BACKUP_REQUIRED_TABLES = frozenset(
+    {
+        "requests",
+        "status_events",
+        "claim_attempts",
+        "claim_tokens",
+        "reconcile_batches",
+        "reconcile_batch_items",
+        "inspection_batches",
+        "inspection_batch_items",
+        "deletion_receipts",
+        "receipt_keys",
+        "audit_anchors",
+        "audit_anchor_meta",
+        "anchor_key_generations",
+    }
+)
 
 # Allowed request lifecycle. completed and failed are terminal; moving a
 # request to the status it already holds is an idempotent no-op.
@@ -6277,3 +6347,140 @@ class RequestStore:
         # this receipt.
         expected = _receipt_tag(key, fields)
         return hmac.compare_digest(expected, fields["tag"])
+
+    def backup_to(self, target_path: str | os.PathLike[str]) -> str:
+        """Write a consistent SQLite snapshot of this store to a new file.
+
+        The snapshot is produced with SQLite's online backup, reading
+        only this instance's database: every committed transaction
+        either appears in the snapshot in full or not at all, so
+        concurrent commits never leak half-written records into the
+        copy. Only content already inside the database is copied --
+        no anchor secret, receipt key or other caller-held material is
+        ever read, derived or written -- and the source database's
+        records, leases, audit chain and inspection cursors are
+        byte-for-byte unchanged by the read.
+
+        The copy lands in a temporary file in the target's own
+        directory, is validated there (the snapshot must open, carry
+        the store's full table set and pass SQLite's integrity check)
+        and is then moved into place atomically without overwriting:
+        the target name is claimed with a no-replace link, so two
+        backups racing the same target land exactly one snapshot and
+        the loser raises :class:`BackupConflict`. No failure leaves a
+        file at the target path.
+
+        *target_path* must be a non-empty string (or path-like) naming
+        a usable file path whose directory already exists; an empty,
+        non-string or otherwise unusable value raises
+        :class:`ValueError` without touching anything. An already
+        existing target raises :class:`BackupConflict`. An unreadable
+        or corrupt source, a missing or unwritable directory, a
+        temporary-file failure or a failed snapshot validation raises
+        the fixed-text :class:`OSError`. On success the target path is
+        returned and the landed file opens as an ordinary
+        :class:`RequestStore` database.
+        """
+        if isinstance(target_path, os.PathLike):
+            target_path = os.fspath(target_path)
+        if (
+            not isinstance(target_path, str)
+            or not target_path
+            or "\0" in target_path
+            or target_path == ":memory:"
+        ):
+            raise ValueError("backup target must be a usable file path")
+        # Refuse the claim before doing any work; the atomic link below
+        # remains the authoritative check against a concurrent landing.
+        # lexists also catches a dangling symlink, which must never be
+        # overwritten either.
+        if os.path.lexists(target_path):
+            raise _backup_conflict()
+        parent = os.path.dirname(os.path.abspath(target_path))
+        tmp_path: str | None = None
+        try:
+            # The temporary file lives in the target's own directory so
+            # the final link is a same-filesystem, atomic no-overwrite
+            # claim. A missing or unwritable directory fails here as
+            # the fixed storage error.
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                prefix=".evidence-backup-", suffix=".tmp", dir=parent
+            )
+            os.close(tmp_fd)
+            self._copy_database(tmp_path)
+            self._validate_snapshot(tmp_path)
+            # Durably claim the target name without overwriting: the
+            # link either creates the target or fails, never both, and
+            # a lost race surfaces as the single conflict outcome.
+            try:
+                os.link(tmp_path, target_path)
+            except FileExistsError:
+                raise _backup_conflict() from None
+            except OSError:
+                raise _storage_failure() from None
+        except (ValueError, BackupConflict):
+            raise
+        except OSError:
+            raise _storage_failure() from None
+        finally:
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+        _log.info("backup snapshot landed")
+        return target_path
+
+    def _copy_database(self, tmp_path: str) -> None:
+        """Copy this store's database into ``tmp_path`` atomically.
+
+        SQLite's online backup yields one transaction-consistent view:
+        a transaction committing concurrently is either fully inside
+        the snapshot or fully outside it. The source is only read. A
+        file-backed store is read through a fresh connection; the
+        in-memory database is read through its shared connection under
+        the write lock so no writer mutates it mid-copy.
+        """
+        conn = self._connect()
+        try:
+            try:
+                dest = sqlite3.connect(tmp_path)
+            except sqlite3.Error:
+                raise _storage_failure() from None
+            try:
+                if self._mem_conn is not None:
+                    with self._write_lock:
+                        conn.backup(dest)
+                else:
+                    conn.backup(dest)
+            except sqlite3.Error:
+                raise _storage_failure() from None
+            finally:
+                dest.close()
+        finally:
+            self._release(conn)
+
+    @staticmethod
+    def _validate_snapshot(tmp_path: str) -> None:
+        """Check a freshly copied snapshot before it may land.
+
+        The file must open as a SQLite database, carry every table the
+        store owns and pass SQLite's own integrity check. Any failure
+        is a storage fault, never a landed snapshot.
+        """
+        try:
+            conn = sqlite3.connect(tmp_path)
+            try:
+                integrity = conn.execute("PRAGMA integrity_check").fetchall()
+                tables = {
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    )
+                }
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            raise _storage_failure() from None
+        if integrity != [("ok",)] or not _BACKUP_REQUIRED_TABLES <= tables:
+            raise _storage_failure()
