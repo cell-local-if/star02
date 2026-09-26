@@ -219,6 +219,29 @@ writing, a missing or cross-tenant batch raises
 storage fault is the fixed-text :class:`OSError`, never a fabricated
 metric.
 
+:meth:`RequestStore.audit_metrics` extends that read-only reason
+aggregate across an arbitrary set of batches, storage-layer only like
+the rest of the audit capability. It takes just a tenant and a
+non-empty list of batch identifiers, which may arrive in any order
+and are handled stably sorted by Unicode code point; it never creates
+a batch, advances a cursor or writes any business or audit record,
+and the whole aggregate is read from one consistent snapshot inside a
+single read-only transaction. The result is one compact JSON line
+(exactly one trailing newline) holding, in order, ``batch_ids`` (the
+sorted list of string ids), ``batch_count``, ``scanned``,
+``verified``, ``unverified``, ``reasons`` (the same merged,
+Unicode-ordered ``{"reason", "count"}`` list across every batch) and
+``all_finished`` -- the three counts summed over the named batches,
+``scanned`` the sum of the other two, no per-item or per-batch
+results, and never a float, a negative zero or a non-finite value.
+An empty, non-list, duplicate, empty-element or non-string-element
+batch list raises :class:`ValueError` without writing; any missing or
+cross-tenant batch raises :class:`AuditInspectionNotFound`; and
+corrupt bookkeeping -- including an unverified item with an empty or
+non-string reason -- or any storage fault is the fixed-text
+:class:`OSError`, never a partial aggregate or an empty reason folded
+into success.
+
 Caller errors are always :class:`ValueError` (invalid parameters) or the
 module's own domain exceptions; every database failure -- an unwritable
 path, an uncreatable or corrupt file, an I/O or read/write error -- is
@@ -792,6 +815,27 @@ def _normalize_scopes(scopes: object) -> list[str]:
         raise ValueError("scopes must be a non-empty sequence of distinct strings")
     # Canonical order so scope ordering never affects comparison.
     return sorted(items)
+
+
+def _require_nonempty_str_list(value: object, field: str) -> list[str]:
+    """Validate a non-empty list of distinct, non-empty strings.
+
+    A list is required (never a bare string, tuple or other sequence),
+    it must carry at least one element, every element must be a
+    non-empty string and no element may repeat. Every malformed shape
+    raises the same :class:`ValueError` before storage is touched.
+    """
+    message = f"{field} must be a non-empty list of distinct non-empty strings"
+    if not isinstance(value, list) or not value:
+        raise ValueError(message)
+    items: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item:
+            raise ValueError(message)
+        items.append(item)
+    if len(set(items)) != len(items):
+        raise ValueError(message)
+    return items
 
 
 def _format_rfc3339(moment: datetime) -> str:
@@ -3360,7 +3404,11 @@ class RequestStore:
         ``{"reason", "count"}`` entries -- one per distinct non-empty
         reason code, merged across items, ordered by Unicode code
         point, each count a positive integer -- and is an empty array
-        when no unverified item carries a reason. The batch id and
+        when every item verified. An unverified item whose persisted
+        reason is empty or not a string is bookkeeping corruption and
+        raises the fixed-text :class:`OSError`: the empty reason is
+        only ever written for a verified item and is never folded into
+        the counts as success or dropped silently. The batch id and
         cursor are strings or null and ``finished`` is a boolean; the
         text never contains a float, a negative zero or a non-finite
         number. No per-item results are included.
@@ -3441,10 +3489,18 @@ class RequestStore:
             ):
                 raise _storage_failure()
             if flag:
+                # Verified items legitimately carry the empty reason the
+                # sweep writes; it marks success and never enters the
+                # reason statistics.
                 verified += 1
-            elif reason:
-                # Only unverified items contribute to the reason
-                # statistics; an empty reason never enters the list.
+            elif not reason:
+                # An unverified item must carry a non-empty stable reason
+                # code: the sweep writes "" only for verified items, so an
+                # empty or non-string reason on an unverified row is
+                # bookkeeping corruption, never an unverified count to
+                # fold into success or drop from the list silently.
+                raise _storage_failure()
+            else:
                 reason_counts[reason] = reason_counts.get(reason, 0) + 1
         unverified = len(rows) - verified
         # The item table and the batch row's own position are committed
@@ -3479,6 +3535,181 @@ class RequestStore:
         _log.info(
             "audit inspection metrics read scanned=%s verified=%s reasons=%s",
             scanned,
+            verified,
+            len(reasons),
+        )
+        return text
+
+    def audit_metrics(
+        self,
+        tenant_id: str,
+        batch_ids: list[str],
+    ) -> str:
+        """Return read-only, reason-aggregated metrics across batches.
+
+        Storage-layer only; never routed over HTTP. The caller supplies
+        only the tenant and a non-empty list of batch identifiers
+        issued by :meth:`audit_inspection` (not cursors); the ids may
+        arrive in any order and are handled stably in Unicode code
+        point order. Like :meth:`audit_inspection_metrics` this entry
+        never creates a batch, never advances a cursor, never repairs
+        evidence and never writes any business or audit record: every
+        batch row and item row is read from one consistent snapshot
+        inside a single read-only transaction, so the aggregate can
+        never show half-settled fields, torn counts or a batch's
+        concurrent page advance. Finished and still-open batches are
+        included alike; repeating the read -- in any id order -- never
+        changes the result or any cursor position.
+
+        The result is one compact JSON object with exactly one trailing
+        newline and exactly these fields in order: ``batch_ids``,
+        ``batch_count``, ``scanned``, ``verified``, ``unverified``,
+        ``reasons`` and ``all_finished``. ``batch_ids`` carries the
+        named batch ids as strings, sorted by Unicode code point, and
+        ``batch_count`` equals its length. The three counts are
+        non-negative integers summed over every named batch, with
+        ``scanned`` always equal to ``verified`` plus ``unverified``;
+        an empty aggregate is rendered as an empty array (so
+        ``reasons`` is ``[]`` when every item verified). ``reasons``
+        is a list of ``{"reason", "count"}`` entries -- one per
+        distinct non-empty reason code, merged across every batch and
+        item, ordered by Unicode code point, each count a positive
+        integer. ``all_finished`` is true exactly when every named
+        batch has finished. No per-item or per-batch results are
+        included and the text never contains a float, a negative zero
+        or a non-finite value.
+
+        An empty or non-string *tenant_id*, and an empty, non-list,
+        duplicate, empty-element or non-string-element *batch_ids*
+        raise :class:`ValueError` without touching storage; any batch
+        that is missing or owned by another tenant raises
+        :class:`AuditInspectionNotFound` with one detail-free outcome,
+        so another tenant's batches can never be probed. A storage
+        outage, corrupt inspection bookkeeping -- including an
+        unverified item with an empty or non-string reason -- or an
+        aggregate read failure raises the fixed-text
+        :class:`OSError`, never a partial aggregate, a fabricated
+        metric or an empty reason folded into success.
+        """
+        # Validate before touching the database: a rejected call never
+        # reads or writes anything.
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        batch_ids = sorted(_require_nonempty_str_list(batch_ids, "batch_ids"))
+        if self._mem_conn is not None:
+            with self._write_lock:
+                return self._audit_metrics(tenant_id, batch_ids)
+        return self._audit_metrics(tenant_id, batch_ids)
+
+    def _audit_metrics(self, tenant_id: str, batch_ids: list[str]) -> str:
+        conn = self._connect()
+        try:
+            try:
+                # One explicit read-only transaction for the whole
+                # aggregate: every batch row and all of their item rows
+                # are read from one consistent snapshot, never piecemeal
+                # across statements that a concurrent page advance could
+                # interleave.
+                conn.execute("BEGIN")
+                try:
+                    total_scanned = 0
+                    all_finished = True
+                    rows: list[tuple] = []
+                    # Read batches in the same stable Unicode order the
+                    # output carries.
+                    for batch_id in batch_ids:
+                        # Resolve ownership before state: a missing batch
+                        # and another tenant's batch share one
+                        # indistinguishable outcome.
+                        owner = conn.execute(
+                            "SELECT 1 FROM inspection_batches "
+                            "WHERE batch_id = ? AND tenant_id = ?",
+                            (batch_id, tenant_id),
+                        ).fetchone()
+                        if owner is None:
+                            raise AuditInspectionNotFound(
+                                "audit inspection batch not found"
+                            )
+                        _pos_created, _pos_rid, finished, scanned = (
+                            self._read_inspection_state_locked(conn, batch_id)
+                        )
+                        all_finished = all_finished and finished
+                        total_scanned += scanned
+                        rows.extend(
+                            conn.execute(
+                                "SELECT verified, reason FROM "
+                                "inspection_batch_items WHERE batch_id = ?",
+                                (batch_id,),
+                            ).fetchall()
+                        )
+                except BaseException:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
+                conn.execute("COMMIT")
+            except AuditInspectionNotFound:
+                raise
+            except sqlite3.Error:
+                raise _storage_failure() from None
+        finally:
+            self._release(conn)
+
+        # Every persisted item record must be the 0/1 flag and reason
+        # string the sweep writes; anything else -- above all an
+        # unverified item with an empty or non-string reason -- is
+        # bookkeeping corruption, never a value to aggregate silently
+        # or fold into success.
+        verified = 0
+        reason_counts: dict[str, int] = {}
+        for flag, reason in rows:
+            if (
+                not isinstance(flag, int)
+                or isinstance(flag, bool)
+                or flag not in (0, 1)
+                or not isinstance(reason, str)
+            ):
+                raise _storage_failure()
+            if flag:
+                verified += 1
+            elif not reason:
+                raise _storage_failure()
+            else:
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        unverified = len(rows) - verified
+        # Each batch's item table and that batch row's own position are
+        # committed together; a split tally across the aggregate is
+        # out-of-band damage.
+        if (
+            unverified < 0
+            or total_scanned != len(rows)
+            or total_scanned != verified + unverified
+        ):
+            raise _storage_failure()
+
+        # Reason codes sort by Unicode code point (plain string order);
+        # equal reasons are already merged and every count is a
+        # positive integer by construction.
+        reasons = [
+            {"reason": reason, "count": reason_counts[reason]}
+            for reason in sorted(reason_counts)
+        ]
+        metrics = {
+            "batch_ids": batch_ids,
+            "batch_count": len(batch_ids),
+            "scanned": total_scanned,
+            "verified": verified,
+            "unverified": unverified,
+            "reasons": reasons,
+            "all_finished": all_finished,
+        }
+        text = json.dumps(metrics, ensure_ascii=False, separators=(",", ":")) + "\n"
+        # Log only counts and the stable outcome: no tenant, batch id,
+        # credential or SQL text ever reaches the log.
+        _log.info(
+            "audit metrics read batches=%s scanned=%s verified=%s reasons=%s",
+            len(batch_ids),
+            total_scanned,
             verified,
             len(reasons),
         )
