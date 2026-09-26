@@ -335,7 +335,15 @@ completeness, event order, request association, database link hashes,
 per-event anchors and generation binding without any database at all,
 returning ``True`` for a genuine bundle and ``False`` for a
 well-formed but recomputed, replaced or under-proven one -- secrets are
-never guessed.
+never guessed. :meth:`RequestStore.diagnose_audit_bundle` is the
+recoverable diagnosis companion: the same offline inputs and the same
+validation contract, but the verdict is a single compact JSON line --
+the ``trusted`` flag and then the deduplicated, code-point-sorted
+reason codes, exactly one trailing newline -- naming every determinable
+reason a well-formed bundle cannot be trusted. The diagnosis only reads
+what it is handed: it never connects to a database, never creates a
+batch, never writes or recomputes the evidence, and never guesses a
+missing secret.
 
 Caller errors are always :class:`ValueError` (invalid parameters) or the
 module's own domain exceptions; every database failure -- an unwritable
@@ -1481,6 +1489,15 @@ _BUNDLE_STATUSES = frozenset(
     {_STATUS_ACCEPTED, _STATUS_PROCESSING, _STATUS_COMPLETED, _STATUS_FAILED}
 )
 
+# The one reason code only the offline bundle diagnosis reports beyond
+# the shared anchor codes: the caller-held secret's irreversible
+# fingerprint does not match the binding the bundle records for that
+# generation, or the generation association itself is forged. Distinct
+# from ``anchor_auth_failed`` (the located secret's tag does not
+# authenticate) and ``anchor_key_missing`` (the secret was never
+# handed): here the binding itself is inconsistent.
+_BUNDLE_REASON_GENERATION_MISMATCH = "anchor_generation_mismatch"
+
 
 def _is_nonneg_int(value: object) -> bool:
     # bool is a subclass of int and 1.0 == 1: only exact integers count.
@@ -1728,6 +1745,128 @@ def _verify_audit_bundle_fields(
             return False
         anchor_predecessor = anchor["anchor_hmac"]
     return True
+
+
+def _diagnose_audit_bundle_fields(
+    fields: Mapping[str, object], secrets: Mapping[int, str]
+) -> list[str]:
+    """Pure, offline reason diagnosis of a parsed audit bundle.
+
+    Runs the same checks as :func:`_verify_audit_bundle_fields` but
+    never short-circuits: every independent failure adds its stable
+    reason code, so one problem can never mask another that is still
+    determinable. Each recorded hash chains the next recomputation --
+    never a recomputed one -- so a single tampered link cannot cascade
+    over the rest of the proof. The result is the deduplicated codes
+    sorted by Unicode code point; an empty list is exactly the case the
+    boolean check returns ``True`` for. Like the boolean check it only
+    compares and recomputes: secrets are never guessed and nothing is
+    repaired, backfilled or rewritten.
+    """
+    reasons: set[str] = set()
+    chain = fields["chain"]
+    tenant_id = chain["tenant_id"]
+    request_id = fields["request_id"]
+    events = fields["events"]
+    anchors = fields["anchors"]
+
+    # Event order: gap-free sequence numbers from zero, in order.
+    if [event["seq"] for event in events] != list(range(len(events))):
+        reasons.add(_ANCHOR_REASON_EVENT_ORDER)
+
+    # Database link hashes, recomputed from the genesis predecessor.
+    predecessor = _GENESIS_PREDECESSOR
+    for event in events:
+        recomputed = _chain_hash(
+            tenant_id,
+            request_id,
+            event["seq"],
+            event["status"],
+            event["occurred_at"],
+            predecessor,
+        )
+        if not hmac.compare_digest(recomputed, event["chain_hash"]):
+            reasons.add(_ANCHOR_REASON_CHAIN_MISMATCH)
+        predecessor = event["chain_hash"]
+
+    # Request association: the snapshot status and the chain summary
+    # must be exactly what the final event settles.
+    if chain["event_count"] != len(events):
+        reasons.add(_ANCHOR_REASON_ASSOCIATION)
+    if not hmac.compare_digest(chain["head"], events[-1]["chain_hash"]):
+        reasons.add(_ANCHOR_REASON_HEAD_MISMATCH)
+    if fields["status"] != events[-1]["status"]:
+        reasons.add(_ANCHOR_REASON_ASSOCIATION)
+
+    # One anchor per event, in the same order.
+    if len(anchors) != len(events) or [
+        anchor["seq"] for anchor in anchors
+    ] != list(range(len(events))):
+        reasons.add(_ANCHOR_REASON_ASSOCIATION)
+
+    # Secret-generation association: each recorded generation at most
+    # once, bound to its irreversible fingerprint.
+    generation_fingerprints: dict[int, str] = {}
+    for record in fields["generations"]:
+        generation = record["generation"]
+        if generation in generation_fingerprints:
+            reasons.add(_BUNDLE_REASON_GENERATION_MISMATCH)
+        else:
+            generation_fingerprints[generation] = record["key_fingerprint"]
+
+    anchor_predecessor = _ANCHOR_GENESIS_PREDECESSOR
+    for event, anchor in zip(events, anchors):
+        key_generation = anchor["key_generation"]
+        secret: str | None = None
+        if not generation_fingerprints:
+            # The pre-rotation legacy shape: only NULL attributions and
+            # no generation records; the generation-1 secret is used
+            # directly, exactly like the store's own resolution.
+            if key_generation is not None:
+                reasons.add(_BUNDLE_REASON_GENERATION_MISMATCH)
+            else:
+                secret = secrets.get(1)
+                if secret is None:
+                    reasons.add(_ANCHOR_REASON_KEY_MISSING)
+        else:
+            generation = 1 if key_generation is None else key_generation
+            fingerprint = generation_fingerprints.get(generation)
+            if fingerprint is None:
+                # The anchor names a generation the bundle does not
+                # record: a forged association can never authenticate.
+                reasons.add(_BUNDLE_REASON_GENERATION_MISMATCH)
+            else:
+                candidate = secrets.get(generation)
+                if candidate is None:
+                    # The caller did not hand this generation's secret:
+                    # the anchor can neither be authenticated nor forged.
+                    reasons.add(_ANCHOR_REASON_KEY_MISSING)
+                elif not hmac.compare_digest(
+                    _anchor_key_fingerprint(candidate), fingerprint
+                ):
+                    # The handed secret does not match the generation's
+                    # recorded fingerprint; never guess another.
+                    reasons.add(_BUNDLE_REASON_GENERATION_MISMATCH)
+                else:
+                    secret = candidate
+        if secret is not None:
+            expected = _anchor_mac(
+                secret,
+                tenant_id,
+                request_id,
+                event["seq"],
+                event["status"],
+                event["occurred_at"],
+                event["chain_hash"],
+                anchor_predecessor,
+            )
+            if not hmac.compare_digest(expected, anchor["anchor_hmac"]):
+                reasons.add(_ANCHOR_REASON_AUTH_FAILED)
+        # The recorded seal chains the next anchor's recomputation even
+        # when this one could not be authenticated, so one unprovable
+        # anchor never cascades over the rest.
+        anchor_predecessor = anchor["anchor_hmac"]
+    return sorted(reasons)
 
 
 def _render_audit_bundle(
@@ -8174,3 +8313,49 @@ class RequestStore:
         fields = _parse_audit_bundle_text(bundle_text)
         secrets = _require_bundle_secrets(anchor_history_secrets)
         return _verify_audit_bundle_fields(fields, secrets)
+
+    @staticmethod
+    def diagnose_audit_bundle(
+        bundle_text: str,
+        anchor_history_secrets: Mapping[int, str],
+    ) -> str:
+        """Diagnose an exported evidence bundle fully offline.
+
+        Storage-layer only; never routed over HTTP. The recoverable
+        companion of :meth:`verify_audit_bundle`: handed the bundle
+        text and the caller-kept mapping of anchor secret generations,
+        it runs the same offline authentication but reports *why* a
+        well-formed bundle cannot be trusted instead of only ``False``.
+        The verdict is a single compact JSON line --
+        ``{"trusted":...,"reasons":[...]}`` with exactly one trailing
+        newline, never a float, a negative zero or a non-finite number
+        -- where ``trusted`` is the boolean verdict and ``reasons``
+        holds every determinable stable reason code, deduplicated and
+        sorted by Unicode code point: ``event_order_invalid``,
+        ``chain_hash_mismatch``, ``request_association_mismatch``,
+        ``chain_head_mismatch``, ``anchor_key_missing``,
+        ``anchor_generation_mismatch`` or ``anchor_auth_failed``. A
+        genuine bundle whose anchors all authenticate under the handed
+        generations yields ``true`` and an empty list, even with the
+        database gone. The diagnosis only reads what it is handed: it
+        never connects to a database, never creates a batch, never
+        writes anything anywhere, and never repairs, backfills,
+        recomputes or guesses -- a missing historical secret, a
+        fingerprint that does not match its generation binding, an
+        anchor that does not authenticate or an inconsistent chain
+        proof only ever yields the untrusted verdict, and secret
+        material never reaches the result, an exception or a log.
+
+        The validation contract is exactly
+        :meth:`verify_audit_bundle`'s: a non-string *bundle_text*, an
+        invalid secret mapping or a malformed text (a missing or
+        duplicated trailing newline, an interior line break, unparsable
+        JSON, a missing or extra field, a wrong-typed or out-of-shape
+        value) raises :class:`ValueError` identically, and no partial
+        result is ever produced.
+        """
+        fields = _parse_audit_bundle_text(bundle_text)
+        secrets = _require_bundle_secrets(anchor_history_secrets)
+        reasons = _diagnose_audit_bundle_fields(fields, secrets)
+        verdict = {"trusted": not reasons, "reasons": reasons}
+        return json.dumps(verdict, ensure_ascii=False, separators=(",", ":")) + "\n"
