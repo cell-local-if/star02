@@ -242,6 +242,33 @@ non-string reason -- or any storage fault is the fixed-text
 :class:`OSError`, never a partial aggregate or an empty reason folded
 into success.
 
+:meth:`RequestStore.audit_health` complements the batched audit
+capability with an instantaneous tenant-wide health snapshot,
+storage-layer only like the rest of the audit capability and never
+routed over HTTP. It takes just a tenant identifier and reads every
+request the tenant holds at the moment of the call from one consistent
+snapshot inside a single read-only transaction -- never creating a
+batch, advancing a cursor, repairing evidence or writing any business
+or audit record. The result is a plain dictionary with exactly
+``total``, ``statuses``, ``verified``, ``unverified`` and ``reasons``:
+``statuses`` maps each of the four lifecycle status names to a
+non-negative integer (a status no request holds is explicitly zero and
+``total`` is always the four counts' sum), ``verified`` and
+``unverified`` are complementary and cover every request exactly once,
+and ``reasons`` is the same merged, Unicode-ordered
+``{"reason", "count"}`` list the batch metrics produce, empty when
+every request verifies. Each request is assessed against the same
+full-chain criteria as the inspection sweep -- event order, chain
+head, anchor authentication, secret-generation binding and the
+file-wide seal -- so a missing current or historical secret, a legacy
+un-anchored database, an interrupted commit or damaged evidence marks
+the affected requests unverified with the existing stable reason
+codes. An empty or non-string tenant raises :class:`ValueError`
+without touching storage; an unreadable store, corrupt bookkeeping or
+evidence records, an unverified request without a non-empty reason, or
+a snapshot that cannot be read consistently raises the fixed-text
+:class:`OSError` ``audit_health_failed``, never a partial snapshot.
+
 Storage-layer backup closes the persistence capability:
 :meth:`RequestStore.backup_to` copies this instance's SQLite database
 into a caller-named snapshot file as one transaction-consistent view --
@@ -673,6 +700,18 @@ _STORAGE_MESSAGE = "request store is unavailable"
 def _storage_failure() -> OSError:
     """Build the single storage error callers are ever allowed to see."""
     return OSError(_STORAGE_MESSAGE)
+
+
+# Fixed, detail-free text for every tenant health snapshot failure: an
+# unreadable store, corrupt bookkeeping or evidence records, or a
+# snapshot that cannot be read consistently. It never embeds a tenant,
+# a request id, a credential, SQL text or a filesystem path.
+_AUDIT_HEALTH_MESSAGE = "audit_health_failed"
+
+
+def _audit_health_failure() -> OSError:
+    """Build the single health-snapshot error callers are ever allowed to see."""
+    return OSError(_AUDIT_HEALTH_MESSAGE)
 
 
 _BACKUP_CONFLICT_MESSAGE = "backup conflict"
@@ -3787,6 +3826,187 @@ class RequestStore:
             len(reasons),
         )
         return text
+
+    def audit_health(self, tenant_id: str) -> dict[str, object]:
+        """Return an instantaneous read-only health snapshot of a tenant.
+
+        Storage-layer only; never routed over HTTP. The caller supplies
+        only the tenant identifier; the snapshot covers every request
+        the tenant holds at the moment of the call, read from one
+        consistent snapshot inside a single read-only transaction, so a
+        concurrent submission, status advance or inspection page can
+        never contribute half-settled fields and no request is counted
+        twice. The entry never creates a batch, advances a cursor,
+        repairs, backfills, recomputes or overwrites any business,
+        audit, anchor or key record, and never writes at all.
+
+        The result is a plain dictionary with exactly these keys:
+        ``total`` (the tenant's request count), ``statuses`` (a mapping
+        of the four lifecycle status names to non-negative integer
+        counts -- a status no request holds is explicitly zero and
+        ``total`` always equals the four counts' sum), ``verified`` and
+        ``unverified`` (complementary counts covering every request
+        exactly once) and ``reasons`` (a list of
+        ``{"reason", "count"}`` entries -- one per distinct stable
+        reason code of an unverified request, merged across requests,
+        ordered by Unicode code point, each count a positive integer,
+        empty when every request verifies). Every value is an integer,
+        a string, a boolean-free list or a nested dictionary: never a
+        float, a negative zero or a non-finite number.
+
+        Each request is assessed against the same full-chain criteria
+        as the read-only inspection sweep: the event order and database
+        link hashes, the request row's chain head and current status,
+        the one-to-one event/anchor binding, every anchor's
+        authentication under the secret of its recorded generation, and
+        the file-wide seal (meta head, secret generations, gap-free
+        commit order and the replayed global head). A missing current
+        or historical secret, a legacy un-anchored database, an
+        interrupted commit or damaged evidence marks the affected
+        requests unverified with the existing stable reason codes.
+        Repeating the read, or reading through a rebuilt instance with
+        the same secrets, yields the same snapshot.
+
+        An empty or non-string *tenant_id* raises :class:`ValueError`
+        without touching storage. An unreadable store, corrupt
+        bookkeeping or evidence records, an unverified request without
+        a non-empty stable reason, or a snapshot that cannot be read
+        consistently raises the fixed-text :class:`OSError`
+        ``audit_health_failed`` -- never a partial snapshot, and never
+        a tenant, request id, credential or path in the error or the
+        log.
+        """
+        # Validate before touching the database: a rejected call never
+        # reads or writes anything.
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        if self._mem_conn is not None:
+            with self._write_lock:
+                return self._audit_health(tenant_id)
+        return self._audit_health(tenant_id)
+
+    def _audit_health(self, tenant_id: str) -> dict[str, object]:
+        conn = self._connect()
+        try:
+            try:
+                # One explicit read-only transaction: the request rows
+                # and every piece of audit evidence are read from a
+                # single consistent snapshot, never piecemeal across
+                # statements that a concurrent write could interleave.
+                conn.execute("BEGIN")
+                try:
+                    meta_rows = conn.execute(
+                        "SELECT head_hmac FROM audit_anchor_meta"
+                    ).fetchall()
+                    event_rows = conn.execute(
+                        "SELECT tenant_id, request_id, seq, status, "
+                        "occurred_at, chain_hash FROM status_events "
+                        "ORDER BY tenant_id, request_id, seq"
+                    ).fetchall()
+                    anchor_rows = conn.execute(
+                        "SELECT commit_seq, tenant_id, request_id, seq, "
+                        "event_hash, anchor_hmac, key_generation "
+                        "FROM audit_anchors ORDER BY commit_seq"
+                    ).fetchall()
+                    request_rows = conn.execute(
+                        "SELECT tenant_id, request_id, status, chain_hash "
+                        "FROM requests"
+                    ).fetchall()
+                    generation_rows = conn.execute(
+                        "SELECT generation, key_fingerprint, effective_at "
+                        "FROM anchor_key_generations ORDER BY generation"
+                    ).fetchall()
+                except BaseException:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
+                conn.execute("COMMIT")
+            except sqlite3.Error:
+                raise _audit_health_failure() from None
+        finally:
+            self._release(conn)
+
+        # Bucket the tenant's requests by the four lifecycle statuses; a
+        # status no request holds stays explicitly zero. A request row
+        # whose id or status is not what the store writes is bookkeeping
+        # corruption, never a request to skip or a count to fabricate.
+        statuses = {
+            _STATUS_ACCEPTED: 0,
+            _STATUS_PROCESSING: 0,
+            _STATUS_COMPLETED: 0,
+            _STATUS_FAILED: 0,
+        }
+        scoped_ids: list[str] = []
+        for row_tenant, request_id, status, _chain_hash in request_rows:
+            if row_tenant != tenant_id:
+                continue
+            if (
+                not isinstance(request_id, str)
+                or not request_id
+                or not isinstance(status, str)
+                or status not in statuses
+            ):
+                raise _audit_health_failure()
+            statuses[status] += 1
+            scoped_ids.append(request_id)
+
+        # Assess every request exactly once, against the same full-chain
+        # criteria the inspection sweep applies and purely from the one
+        # snapshot read above: the evaluation only compares and
+        # recomputes, it never writes.
+        snapshot_rows = (
+            tuple(meta_rows),
+            tuple(event_rows),
+            tuple(anchor_rows),
+            tuple(request_rows),
+            tuple(generation_rows),
+        )
+        verified = 0
+        reason_counts: dict[str, int] = {}
+        for request_id in scoped_ids:
+            reasons = self._evaluate_inspection_rows(
+                *snapshot_rows,
+                self._anchor_secret,
+                self._anchor_history_secrets,
+                (tenant_id, request_id),
+            )
+            if not reasons:
+                verified += 1
+                continue
+            reason = reasons[0]
+            if not isinstance(reason, str) or not reason:
+                # An unverified request must carry a non-empty stable
+                # reason code: an empty or non-string reason is
+                # corruption, never an untrusted count folded into
+                # success or dropped from the list silently.
+                raise _audit_health_failure()
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+
+        total = len(scoped_ids)
+        unverified = total - verified
+        # Reason codes sort by Unicode code point (plain string order);
+        # equal reasons are already merged and every count is a positive
+        # integer by construction.
+        snapshot = {
+            "total": total,
+            "statuses": statuses,
+            "verified": verified,
+            "unverified": unverified,
+            "reasons": [
+                {"reason": reason, "count": reason_counts[reason]}
+                for reason in sorted(reason_counts)
+            ],
+        }
+        # Log only counts and the stable outcome: no tenant, request id,
+        # credential or SQL text ever reaches the log.
+        _log.info(
+            "audit health read total=%s verified=%s reasons=%s",
+            total,
+            verified,
+            len(reason_counts),
+        )
+        return snapshot
 
     @staticmethod
     def _next_inspection_candidate(
