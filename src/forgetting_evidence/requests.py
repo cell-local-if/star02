@@ -296,6 +296,31 @@ source database is left untouched. Rebuilt with the same current and
 historical anchor secrets, a snapshot instance reaches the same
 verification, summary and metric conclusions as its source.
 
+Portable audit evidence bundles close the audit capability,
+storage-layer only like the rest of the orchestration and never routed
+over HTTP. :meth:`RequestStore.export_audit_bundle` freezes one
+request's currently settled chain -- the request id, the snapshot
+status, the event sequence, the chain summary, the per-event anchors
+and the secret-generation association, in that order -- into a single
+compact JSON line (exactly one trailing newline, never a float, a
+negative zero or a non-finite number) the caller can keep outside the
+database. The export is read-only, freezes the request chain head as
+settled at that moment (later status events never change or invalidate
+an already exported bundle, and repeated exports at the same chain head
+are byte-identical), and carries only the business fields the proof
+needs -- never a subject, a raw scope, an idempotency key, a worker, a
+claim token or any secret. An un-anchored chain, a missing historical
+secret, or damaged or untrusted evidence raises
+:class:`AuditBundleUnavailable` instead of exporting.
+:meth:`RequestStore.verify_audit_bundle` is the fully offline
+companion: handed the bundle text and the caller-kept mapping of anchor
+secret generations, it authenticates the text boundaries, field
+completeness, event order, request association, database link hashes,
+per-event anchors and generation binding without any database at all,
+returning ``True`` for a genuine bundle and ``False`` for a
+well-formed but recomputed, replaced or under-proven one -- secrets are
+never guessed.
+
 Caller errors are always :class:`ValueError` (invalid parameters) or the
 module's own domain exceptions; every database failure -- an unwritable
 path, an uncreatable or corrupt file, an I/O or read/write error -- is
@@ -332,6 +357,7 @@ __all__ = [
     "ReceiptKeyConflict",
     "AnchorKeyConflict",
     "AuditInspectionNotFound",
+    "AuditBundleUnavailable",
     "BackupConflict",
 ]
 
@@ -410,6 +436,18 @@ class BackupConflict(Exception):
     overwritten nor treated as a usable snapshot. The fixed message
     never identifies which condition applied and never embeds the
     target path.
+    """
+
+
+class AuditBundleUnavailable(Exception):
+    """Raised when no audit evidence bundle can be exported as asked.
+
+    The request exists and is visible to the tenant, but its settled
+    chain cannot be vouched for: the chain was never anchored, a
+    historical anchor secret generation is missing, or the persisted
+    evidence is damaged or untrusted. The fixed message never
+    identifies which condition applied, and no bundle text -- complete
+    or partial -- is ever produced on this path.
     """
 
 
@@ -1301,6 +1339,367 @@ def _parse_receipt_text(text: object) -> dict[str, str]:
         if not _is_chain_hash(fields[name]):
             raise ValueError("receipt is not valid")
     return fields
+
+
+# -- audit evidence bundles ---------------------------------------------
+
+# Fixed, detail-free text for every evidence-bundle availability
+# rejection. It never says whether the chain was un-anchored, a
+# historical secret was missing or the evidence was damaged, and it
+# never names a tenant, a request, a credential or a path.
+_AUDIT_BUNDLE_UNAVAILABLE_MESSAGE = "audit bundle is not available"
+
+# The exported audit evidence bundle is a single compact JSON object
+# with exactly these top-level fields in exactly this order, followed
+# by exactly one trailing newline: the request id, the snapshot status,
+# the event sequence, the chain summary, the per-event anchors and the
+# secret-generation association. Every value is a string, a positive
+# (or sequence) integer, a boolean-free list, a nested object or null:
+# never a float, a negative zero or a non-finite number. The object
+# carries only the business fields the off-site proof needs -- never a
+# subject, a raw scope, an idempotency key, a worker, a claim token or
+# any secret material.
+_AUDIT_BUNDLE_FIELDS = (
+    "request_id",
+    "status",
+    "events",
+    "chain",
+    "anchors",
+    "generations",
+)
+_AUDIT_BUNDLE_EVENT_FIELDS = ("seq", "status", "occurred_at", "chain_hash")
+_AUDIT_BUNDLE_CHAIN_FIELDS = ("tenant_id", "event_count", "head")
+_AUDIT_BUNDLE_ANCHOR_FIELDS = ("seq", "anchor_hmac", "key_generation")
+_AUDIT_BUNDLE_GENERATION_FIELDS = (
+    "generation",
+    "key_fingerprint",
+    "effective_at",
+)
+
+# The only status values an exported bundle can ever carry.
+_BUNDLE_STATUSES = frozenset(
+    {_STATUS_ACCEPTED, _STATUS_PROCESSING, _STATUS_COMPLETED, _STATUS_FAILED}
+)
+
+
+def _is_nonneg_int(value: object) -> bool:
+    # bool is a subclass of int and 1.0 == 1: only exact integers count.
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _is_positive_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
+def _require_bundle_secrets(value: object) -> dict[int, str]:
+    """Validate the caller-held generation-to-anchor-secret mapping.
+
+    The container must be a mapping; every generation key must be a
+    non-boolean positive integer and every secret a non-empty string.
+    An empty mapping is a valid shape -- it simply holds no secret, so
+    every anchored proof fails closed as ``False``. The secrets live
+    solely in the caller's hands and are never persisted, logged or
+    placed in an exception.
+    """
+    message = (
+        "anchor_history_secrets must be a mapping of positive integer "
+        "generations to non-empty secret strings"
+    )
+    if not isinstance(value, Mapping):
+        raise ValueError(message)
+    validated: dict[int, str] = {}
+    for generation, secret in value.items():
+        if (
+            not _is_positive_int(generation)
+            or not isinstance(secret, str)
+            or not secret
+        ):
+            raise ValueError(message)
+        validated[generation] = secret
+    return validated
+
+
+def _parse_audit_bundle_text(text: object) -> dict[str, object]:
+    """Parse and strictly validate a presented audit bundle text.
+
+    Every malformed value -- a non-string, a missing or duplicated
+    trailing newline, an interior line break, unparsable JSON, a
+    missing or extra field, a wrong-typed value, an unknown status, a
+    malformed timestamp or a digest that is not 64 lowercase hex
+    characters -- raises :class:`ValueError` identically, so the format
+    can never be probed through distinguishable failures. A well-formed
+    bundle whose content simply does not authenticate is *not* a parse
+    failure: the caller gets ``False`` from verification instead.
+    """
+    if not isinstance(text, str) or not text:
+        raise ValueError("audit bundle must be a non-empty string")
+    # Exactly one trailing newline is part of the bundle format: a
+    # missing newline or an extra (duplicated) newline is a malformed
+    # presentation rather than an authentication mismatch.
+    if not text.endswith("\n") or text.endswith("\n\n"):
+        raise ValueError("audit bundle is not valid")
+    body = text[:-1]
+    # The bundle is a single line: any interior line break is damage.
+    if "\n" in body or "\r" in body:
+        raise ValueError("audit bundle is not valid")
+    try:
+        parsed = json.loads(body)
+    except (ValueError, RecursionError):
+        raise ValueError("audit bundle is not valid") from None
+    if not isinstance(parsed, dict) or set(parsed) != set(_AUDIT_BUNDLE_FIELDS):
+        raise ValueError("audit bundle is not valid")
+
+    request_id = parsed["request_id"]
+    if not isinstance(request_id, str) or not request_id:
+        raise ValueError("audit bundle is not valid")
+    status = parsed["status"]
+    if not isinstance(status, str) or status not in _BUNDLE_STATUSES:
+        raise ValueError("audit bundle is not valid")
+
+    events = parsed["events"]
+    if not isinstance(events, list) or not events:
+        raise ValueError("audit bundle is not valid")
+    for event in events:
+        if not isinstance(event, dict) or set(event) != set(
+            _AUDIT_BUNDLE_EVENT_FIELDS
+        ):
+            raise ValueError("audit bundle is not valid")
+        if (
+            not _is_nonneg_int(event["seq"])
+            or not isinstance(event["status"], str)
+            or event["status"] not in _BUNDLE_STATUSES
+            or not isinstance(event["occurred_at"], str)
+            or not _RFC3339_RE.match(event["occurred_at"])
+            or not _is_chain_hash(event["chain_hash"])
+        ):
+            raise ValueError("audit bundle is not valid")
+
+    chain = parsed["chain"]
+    if not isinstance(chain, dict) or set(chain) != set(_AUDIT_BUNDLE_CHAIN_FIELDS):
+        raise ValueError("audit bundle is not valid")
+    if (
+        not isinstance(chain["tenant_id"], str)
+        or not chain["tenant_id"]
+        or not _is_positive_int(chain["event_count"])
+        or not _is_chain_hash(chain["head"])
+    ):
+        raise ValueError("audit bundle is not valid")
+
+    anchors = parsed["anchors"]
+    if not isinstance(anchors, list) or not anchors:
+        raise ValueError("audit bundle is not valid")
+    for anchor in anchors:
+        if not isinstance(anchor, dict) or set(anchor) != set(
+            _AUDIT_BUNDLE_ANCHOR_FIELDS
+        ):
+            raise ValueError("audit bundle is not valid")
+        key_generation = anchor["key_generation"]
+        if (
+            not _is_nonneg_int(anchor["seq"])
+            or not _is_chain_hash(anchor["anchor_hmac"])
+            # Null is the legacy generation-1 attribution; any present
+            # value must be a positive integer naming a generation.
+            or not (key_generation is None or _is_positive_int(key_generation))
+        ):
+            raise ValueError("audit bundle is not valid")
+
+    generations = parsed["generations"]
+    if not isinstance(generations, list):
+        raise ValueError("audit bundle is not valid")
+    for record in generations:
+        if not isinstance(record, dict) or set(record) != set(
+            _AUDIT_BUNDLE_GENERATION_FIELDS
+        ):
+            raise ValueError("audit bundle is not valid")
+        if (
+            not _is_positive_int(record["generation"])
+            or not _is_chain_hash(record["key_fingerprint"])
+            or not isinstance(record["effective_at"], str)
+            or not _RFC3339_RE.match(record["effective_at"])
+        ):
+            raise ValueError("audit bundle is not valid")
+    return parsed
+
+
+def _verify_audit_bundle_fields(
+    fields: Mapping[str, object], secrets: Mapping[int, str]
+) -> bool:
+    """Pure, offline authentication of a parsed audit bundle.
+
+    Only compares and recomputes: the event order, the request
+    association between the snapshot status, the chain summary and the
+    final event, every database link hash, every per-event anchor under
+    the secret of its recorded generation, and the generation binding
+    between the caller-held secrets and the bundle's irreversible
+    fingerprints. A missing secret, a fingerprint mismatch, a forged
+    generation association or any recomputed value that differs yields
+    ``False`` -- secrets are never guessed.
+    """
+    chain = fields["chain"]
+    tenant_id = chain["tenant_id"]
+    request_id = fields["request_id"]
+    events = fields["events"]
+    anchors = fields["anchors"]
+
+    # Event order: gap-free sequence numbers from zero, in order.
+    if [event["seq"] for event in events] != list(range(len(events))):
+        return False
+
+    # Database link hashes, recomputed from the genesis predecessor.
+    predecessor = _GENESIS_PREDECESSOR
+    for event in events:
+        recomputed = _chain_hash(
+            tenant_id,
+            request_id,
+            event["seq"],
+            event["status"],
+            event["occurred_at"],
+            predecessor,
+        )
+        if not hmac.compare_digest(recomputed, event["chain_hash"]):
+            return False
+        predecessor = event["chain_hash"]
+
+    # Request association: the snapshot status and the chain summary
+    # must be exactly what the final event settles.
+    if chain["event_count"] != len(events):
+        return False
+    if not hmac.compare_digest(chain["head"], events[-1]["chain_hash"]):
+        return False
+    if fields["status"] != events[-1]["status"]:
+        return False
+
+    # One anchor per event, in the same order.
+    if len(anchors) != len(events):
+        return False
+    if [anchor["seq"] for anchor in anchors] != list(range(len(events))):
+        return False
+
+    # Secret-generation association: each recorded generation at most
+    # once, bound to its irreversible fingerprint.
+    generation_fingerprints: dict[int, str] = {}
+    for record in fields["generations"]:
+        generation = record["generation"]
+        if generation in generation_fingerprints:
+            return False
+        generation_fingerprints[generation] = record["key_fingerprint"]
+
+    anchor_predecessor = _ANCHOR_GENESIS_PREDECESSOR
+    for event, anchor in zip(events, anchors):
+        key_generation = anchor["key_generation"]
+        if not generation_fingerprints:
+            # The pre-rotation legacy shape: only NULL attributions and
+            # no generation records; the generation-1 secret is used
+            # directly, exactly like the store's own resolution.
+            if key_generation is not None:
+                return False
+            secret = secrets.get(1)
+            if secret is None:
+                return False
+        else:
+            generation = 1 if key_generation is None else key_generation
+            fingerprint = generation_fingerprints.get(generation)
+            if fingerprint is None:
+                # The anchor names a generation the bundle does not
+                # record: a forged association can never authenticate.
+                return False
+            secret = secrets.get(generation)
+            if secret is None:
+                # The caller did not hand this generation's secret: the
+                # anchor can neither be authenticated nor forged.
+                return False
+            if not hmac.compare_digest(
+                _anchor_key_fingerprint(secret), fingerprint
+            ):
+                # The handed secret does not match the generation's
+                # recorded fingerprint; never guess another.
+                return False
+        expected = _anchor_mac(
+            secret,
+            tenant_id,
+            request_id,
+            event["seq"],
+            event["status"],
+            event["occurred_at"],
+            event["chain_hash"],
+            anchor_predecessor,
+        )
+        if not hmac.compare_digest(expected, anchor["anchor_hmac"]):
+            return False
+        anchor_predecessor = anchor["anchor_hmac"]
+    return True
+
+
+def _render_audit_bundle(
+    tenant_id: str,
+    request_id: str,
+    status: str,
+    head: str,
+    event_rows: tuple,
+    anchor_rows: tuple,
+    generation_rows: tuple,
+) -> str:
+    """Render the canonical bundle text for one request's settled chain.
+
+    The content derives entirely from the persisted, already-assessed
+    snapshot rows -- no clock, no randomness -- so repeated exports at
+    the same request chain head are byte-identical. Only the secret
+    generations this request's own anchors actually name are recorded:
+    a later rotation or another request's events can never change what
+    this request's proof needs.
+    """
+    events = sorted(
+        (row for row in event_rows if row[0] == tenant_id and row[1] == request_id),
+        key=lambda row: row[2],
+    )
+    anchors = sorted(
+        (
+            row
+            for row in anchor_rows
+            if row[1] == tenant_id and row[2] == request_id
+        ),
+        key=lambda row: row[3],
+    )
+    generation_records = {row[0]: (row[1], row[2]) for row in generation_rows}
+    referenced = sorted(
+        {(row[6] if row[6] is not None else 1) for row in anchors}
+    )
+    bundle = {
+        "request_id": request_id,
+        "status": status,
+        "events": [
+            {
+                "seq": seq,
+                "status": event_status,
+                "occurred_at": occurred_at,
+                "chain_hash": chain_hash,
+            }
+            for _t, _r, seq, event_status, occurred_at, chain_hash in events
+        ],
+        "chain": {
+            "tenant_id": tenant_id,
+            "event_count": len(events),
+            "head": head,
+        },
+        "anchors": [
+            {
+                "seq": seq,
+                "anchor_hmac": anchor_hmac,
+                "key_generation": key_generation,
+            }
+            for _cs, _t, _r, seq, _eh, anchor_hmac, key_generation in anchors
+        ],
+        "generations": [
+            {
+                "generation": generation,
+                "key_fingerprint": generation_records[generation][0],
+                "effective_at": generation_records[generation][1],
+            }
+            for generation in referenced
+            if generation in generation_records
+        ],
+    }
+    return json.dumps(bundle, ensure_ascii=False, separators=(",", ":")) + "\n"
 
 
 class RequestStore:
@@ -6917,3 +7316,172 @@ class RequestStore:
             _validate_backup_snapshot(dest)
         finally:
             dest.close()
+
+    # -- audit evidence bundles -----------------------------------------
+
+    def export_audit_bundle(self, tenant_id: str, request_id: str) -> str:
+        """Export the request's settled chain as a portable evidence bundle.
+
+        Storage-layer only; never routed over HTTP. The bundle is a
+        single compact JSON line (exactly one trailing newline) holding,
+        in order, the request id, the snapshot status, the event
+        sequence, the chain summary, the per-event anchors and the
+        secret-generation association -- everything an off-site
+        :meth:`verify_audit_bundle` check needs, and nothing else: no
+        subject, raw scope, idempotency key, worker, claim token or
+        secret material. Strings keep their stored values, counts and
+        generations are positive integers, nulls stay null, and the
+        text never contains a float, a negative zero or a non-finite
+        number.
+
+        The export freezes the request's chain head as settled at this
+        moment: status events appended afterwards produce a different
+        head and a different bundle, but never change or invalidate a
+        bundle already handed out -- the earlier bundle's events,
+        anchors and generations are a prefix of the growing chain and
+        keep verifying. Repeated exports at the same chain head are
+        byte-identical, and other requests' events or a later anchor
+        key rotation never alter what this request's proof carries.
+
+        The whole snapshot is read inside a single read-only
+        transaction and assessed against the same full-chain trust
+        criteria as the inspection sweep before anything is rendered;
+        the entry never writes, repairs, backfills, recomputes or
+        overwrites any record. An empty or non-string *tenant_id*
+        raises :class:`ValueError` without touching storage; a null,
+        non-string, malformed, unknown or cross-tenant *request_id*
+        raises :class:`RequestNotFound` with one detail-free outcome;
+        an un-anchored chain, a missing historical secret, or damaged
+        or untrusted evidence raises :class:`AuditBundleUnavailable`;
+        an unreadable store or a failed read transaction raises the
+        fixed-text :class:`OSError`, never a partial bundle.
+        """
+        # Validate before touching the database: a rejected call never
+        # reads or writes anything.
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        request_id = _require_identifier(request_id)
+        if self._mem_conn is not None:
+            with self._write_lock:
+                return self._export_audit_bundle(tenant_id, request_id)
+        return self._export_audit_bundle(tenant_id, request_id)
+
+    def _export_audit_bundle(self, tenant_id: str, request_id: str) -> str:
+        conn = self._connect()
+        try:
+            try:
+                # One explicit read-only transaction: the request row
+                # and every piece of audit evidence are read from a
+                # single consistent snapshot, so a concurrent write can
+                # never contribute half-settled fields to the bundle.
+                conn.execute("BEGIN")
+                try:
+                    owner = conn.execute(
+                        "SELECT status, chain_hash FROM requests "
+                        "WHERE tenant_id = ? AND request_id = ?",
+                        (tenant_id, request_id),
+                    ).fetchone()
+                    if owner is None:
+                        # Identical outcome for unknown ids and
+                        # cross-tenant lookups.
+                        raise RequestNotFound("request not found")
+                    status, head = owner
+                    meta_rows = conn.execute(
+                        "SELECT head_hmac FROM audit_anchor_meta"
+                    ).fetchall()
+                    event_rows = conn.execute(
+                        "SELECT tenant_id, request_id, seq, status, "
+                        "occurred_at, chain_hash FROM status_events "
+                        "ORDER BY tenant_id, request_id, seq"
+                    ).fetchall()
+                    anchor_rows = conn.execute(
+                        "SELECT commit_seq, tenant_id, request_id, seq, "
+                        "event_hash, anchor_hmac, key_generation "
+                        "FROM audit_anchors ORDER BY commit_seq"
+                    ).fetchall()
+                    request_rows = conn.execute(
+                        "SELECT tenant_id, request_id, status, chain_hash "
+                        "FROM requests"
+                    ).fetchall()
+                    generation_rows = conn.execute(
+                        "SELECT generation, key_fingerprint, effective_at "
+                        "FROM anchor_key_generations ORDER BY generation"
+                    ).fetchall()
+                except BaseException:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
+                conn.execute("COMMIT")
+            except RequestNotFound:
+                raise
+            except sqlite3.Error:
+                raise _storage_failure() from None
+        finally:
+            self._release(conn)
+
+        # Assess the settled evidence against the same full-chain
+        # criteria as the inspection sweep, purely from the one
+        # snapshot read above: an un-anchored chain, a missing current
+        # or historical secret, or damaged or untrusted evidence can
+        # never be exported as if it were proof.
+        reasons = self._evaluate_inspection_rows(
+            tuple(meta_rows),
+            tuple(event_rows),
+            tuple(anchor_rows),
+            tuple(request_rows),
+            tuple(generation_rows),
+            self._anchor_secret,
+            self._anchor_history_secrets,
+            (tenant_id, request_id),
+        )
+        if reasons:
+            raise AuditBundleUnavailable(_AUDIT_BUNDLE_UNAVAILABLE_MESSAGE)
+        text = _render_audit_bundle(
+            tenant_id,
+            request_id,
+            status,
+            head,
+            tuple(event_rows),
+            tuple(anchor_rows),
+            tuple(generation_rows),
+        )
+        # Log only the stable outcome: no tenant, request id, credential
+        # or SQL text ever reaches the log.
+        _log.info("audit bundle exported")
+        return text
+
+    @staticmethod
+    def verify_audit_bundle(
+        bundle_text: str,
+        anchor_history_secrets: Mapping[int, str],
+    ) -> bool:
+        """Authenticate an exported evidence bundle fully offline.
+
+        Storage-layer only; never routed over HTTP. The check needs no
+        database and no store instance: it takes the exported bundle
+        text and the caller-held mapping of anchor secret generations
+        and judges trustworthiness from the bundle alone -- the text
+        boundaries, the field completeness, the event order, the
+        request association between the snapshot status, the chain
+        summary and the final event, every database link hash, every
+        per-event anchor under the secret of its recorded generation,
+        and the generation binding between the handed secrets and the
+        bundle's irreversible fingerprints. A valid bundle returns
+        ``True`` even with the database gone; a bundle whose events,
+        chain summary or anchors were recomputed and replaced returns
+        ``False``, because the anchors cannot authenticate without the
+        external secrets. The check never writes anything, anywhere.
+
+        A non-string *bundle_text*, an invalid secret mapping or a
+        malformed text (a missing or duplicated trailing newline, an
+        interior line break, unparsable JSON, a missing or extra field,
+        a wrong-typed or out-of-shape value) raises :class:`ValueError`
+        identically. A well-formed bundle whose authentication does not
+        match, whose needed historical secret is missing from the
+        mapping, or whose generation proof is inconsistent returns
+        ``False`` -- secrets are never guessed.
+        """
+        fields = _parse_audit_bundle_text(bundle_text)
+        secrets = _require_bundle_secrets(anchor_history_secrets)
+        return _verify_audit_bundle_fields(fields, secrets)
