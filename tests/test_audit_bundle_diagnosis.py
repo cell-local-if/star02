@@ -469,6 +469,30 @@ class DiagnosisValidationTests(_StoreCase):
         self._assert_value_error("not json\n")
         self._assert_value_error('{"request_id": 1}\n')
 
+    def test_only_compact_presentation_is_accepted(self):
+        body = self.text[:-1]
+        # Any insignificant whitespace beyond the single required
+        # trailing newline is malformed and yields ValueError, never a
+        # partial untrusted diagnosis.
+        self._assert_value_error(" " + body + "\n")          # leading
+        self._assert_value_error(body + " \n")               # trailing
+        self._assert_value_error(body + "\t\n")              # tab padding
+        self._assert_value_error(
+            body.replace(',"', ', "', 1) + "\n"
+        )                                                    # indentation
+        self._assert_value_error(
+            body.replace('":', '": ', 1) + "\n"
+        )                                                    # space after colon
+        # A non-canonical \u spelling is rejected though json.loads
+        # accepts it; the genuine compact export still diagnoses trusted.
+        self._assert_value_error(
+            body.replace('"tenant-a"', '"\\u0074enant-a"', 1) + "\n"
+        )
+        self.assertEqual(
+            RequestStore.diagnose_audit_bundle(self.text, {1: "anchor-secret-alpha-0001"}),
+            '{"trusted":true,"reasons":[]}\n',
+        )
+
     def test_field_completeness(self):
         for key in ("request_id", "status", "events", "chain", "anchors",
                     "generations"):

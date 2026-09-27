@@ -1530,13 +1530,15 @@ def _parse_audit_bundle_text(text: object) -> dict[str, object]:
     """Parse and strictly validate a presented audit bundle text.
 
     Every malformed value -- a non-string, a missing or duplicated
-    trailing newline, an interior line break, unparsable JSON, a
-    missing or extra field, a wrong-typed value, an unknown status, a
-    malformed timestamp or a digest that is not 64 lowercase hex
-    characters -- raises :class:`ValueError` identically, so the format
-    can never be probed through distinguishable failures. A well-formed
-    bundle whose content simply does not authenticate is *not* a parse
-    failure: the caller gets ``False`` from verification instead.
+    trailing newline, an interior line break, unparsable JSON, any
+    insignificant whitespace or other non-canonical spelling that is not
+    the exporter's exact compact form, a missing or extra field, a
+    wrong-typed value, an unknown status, a malformed timestamp or a
+    digest that is not 64 lowercase hex characters -- raises
+    :class:`ValueError` identically, so the format can never be probed
+    through distinguishable failures. A well-formed bundle whose content
+    simply does not authenticate is *not* a parse failure: the caller
+    gets ``False`` from verification instead.
     """
     if not isinstance(text, str) or not text:
         raise ValueError("audit bundle must be a non-empty string")
@@ -1625,6 +1627,28 @@ def _parse_audit_bundle_text(text: object) -> dict[str, object]:
             or not _RFC3339_RE.match(record["effective_at"])
         ):
             raise ValueError("audit bundle is not valid")
+
+    # The accepted presentation is exactly the compact single-line form
+    # the exporter emits -- no insignificant whitespace of any kind
+    # (leading or trailing padding, indentation, tabs) and no other
+    # non-canonical spelling. Re-render the parsed value with the very
+    # serializer used by :func:`_render_audit_bundle` and demand a
+    # byte-for-byte equal body: a genuine export round-trips identically,
+    # while a padded or otherwise non-compact presentation is a malformed
+    # bundle rather than an authentication mismatch. ``allow_nan=False``
+    # also refuses any non-finite token that somehow survived the shape
+    # checks.
+    try:
+        canonical = json.dumps(
+            parsed,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except (TypeError, ValueError):
+        raise ValueError("audit bundle is not valid") from None
+    if body != canonical:
+        raise ValueError("audit bundle is not valid")
     return parsed
 
 

@@ -384,6 +384,30 @@ class VerifyValidationTests(_StoreCase):
         self._assert_value_error("not json\n")
         self._assert_value_error('{"request_id": 1}\n')
 
+    def test_only_compact_presentation_is_accepted(self):
+        body = self.text[:-1]
+        # Any insignificant whitespace beyond the single required
+        # trailing newline is malformed, not an authentication mismatch.
+        self._assert_value_error(" " + body + "\n")          # leading
+        self._assert_value_error(body + " \n")               # trailing
+        self._assert_value_error(body + "\t\n")              # tab padding
+        self._assert_value_error(
+            body.replace(',"', ', "', 1) + "\n"
+        )                                                    # indentation
+        self._assert_value_error(
+            body.replace('":', '": ', 1) + "\n"
+        )                                                    # space after colon
+        # A non-canonical spelling of an accepted value (a \u escape for
+        # a literal ASCII char) re-renders differently, so it is rejected
+        # even though json.loads would accept it.
+        self._assert_value_error(
+            body.replace('"tenant-a"', '"\\u0074enant-a"', 1) + "\n"
+        )
+        # The genuine compact export still authenticates.
+        self.assertTrue(
+            RequestStore.verify_audit_bundle(self.text, {1: SECRET_A})
+        )
+
     def test_field_completeness(self):
         for key in ("request_id", "status", "events", "chain", "anchors",
                     "generations"):
