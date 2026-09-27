@@ -1526,17 +1526,14 @@ def _require_bundle_secrets(value: object) -> dict[int, str]:
     return validated
 
 
-def _parse_audit_bundle_text(text: object) -> dict[str, object]:
-    """Parse and strictly validate a presented audit bundle text.
+def _audit_bundle_line_body(text: object) -> str:
+    """Enforce the single-line presentation and return the JSON body.
 
-    Every malformed value -- a non-string, a missing or duplicated
-    trailing newline, an interior line break, unparsable JSON, a
-    missing or extra field, a wrong-typed value, an unknown status, a
-    malformed timestamp or a digest that is not 64 lowercase hex
-    characters -- raises :class:`ValueError` identically, so the format
-    can never be probed through distinguishable failures. A well-formed
-    bundle whose content simply does not authenticate is *not* a parse
-    failure: the caller gets ``False`` from verification instead.
+    The bundle is exactly one line of text terminated by exactly one
+    newline: a non-string, an empty value, a missing or duplicated
+    trailing newline or an interior line break (LF or CR) is a malformed
+    presentation. Every failure is the same detail-free
+    :class:`ValueError`.
     """
     if not isinstance(text, str) or not text:
         raise ValueError("audit bundle must be a non-empty string")
@@ -1549,10 +1546,19 @@ def _parse_audit_bundle_text(text: object) -> dict[str, object]:
     # The bundle is a single line: any interior line break is damage.
     if "\n" in body or "\r" in body:
         raise ValueError("audit bundle is not valid")
-    try:
-        parsed = json.loads(body)
-    except (ValueError, RecursionError):
-        raise ValueError("audit bundle is not valid") from None
+    return body
+
+
+def _validate_audit_bundle_shape(parsed: object) -> dict[str, object]:
+    """Validate a parsed bundle's field set, types and collection shapes.
+
+    Every structural defect -- a non-object document, a missing or extra
+    field, a wrong-typed value, an unknown status, a malformed timestamp
+    or a digest that is not 64 lowercase hex characters -- is the same
+    detail-free :class:`ValueError`, so the format cannot be probed
+    through distinguishable failures. Field *order* is deliberately not
+    part of the shape: only the field set and each value's type matter.
+    """
     if not isinstance(parsed, dict) or set(parsed) != set(_AUDIT_BUNDLE_FIELDS):
         raise ValueError("audit bundle is not valid")
 
@@ -1626,6 +1632,97 @@ def _parse_audit_bundle_text(text: object) -> dict[str, object]:
         ):
             raise ValueError("audit bundle is not valid")
     return parsed
+
+
+def _audit_bundle_has_insignificant_space(body: str) -> bool:
+    """Return whether *body* carries whitespace outside JSON strings.
+
+    A compact line has no insignificant whitespace anywhere; spaces that
+    belong to a string value are, of course, content and never count.
+    The boundary check has already excluded CR and LF, so only the other
+    JSON whitespace bytes (space and tab) can appear here.
+    """
+    in_string = False
+    escaped = False
+    for char in body:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in " \t\n\r":
+            return True
+    return False
+
+
+def _audit_bundle_reject_duplicate_keys(pairs: list[tuple[object, object]]) -> dict:
+    """``object_pairs_hook`` rejecting a repeated object member name.
+
+    Python's JSON decoder otherwise keeps only the last value for a
+    repeated key, silently hiding an extra/duplicated member; the bundle
+    format names exactly one value per field, so any repetition is a
+    malformed presentation rather than last-wins content.
+    """
+    seen: set[object] = set()
+    for key, _value in pairs:
+        if key in seen:
+            raise ValueError("audit bundle is not valid")
+        seen.add(key)
+    return dict(pairs)
+
+
+def _parse_audit_bundle_text(text: object) -> dict[str, object]:
+    """Parse and strictly validate a presented audit bundle text.
+
+    Historical boundary used unchanged by the boolean
+    :meth:`RequestStore.verify_audit_bundle` check. Every malformed
+    value -- a non-string, a missing or duplicated trailing newline, an
+    interior line break, unparsable JSON, a missing or extra field, a
+    wrong-typed value, an unknown status, a malformed timestamp or a
+    digest that is not 64 lowercase hex characters -- raises
+    :class:`ValueError` identically, so the format can never be probed
+    through distinguishable failures. A well-formed bundle whose content
+    simply does not authenticate is *not* a parse failure: the caller
+    gets ``False`` from verification instead.
+    """
+    body = _audit_bundle_line_body(text)
+    try:
+        parsed = json.loads(body)
+    except (ValueError, RecursionError):
+        raise ValueError("audit bundle is not valid") from None
+    return _validate_audit_bundle_shape(parsed)
+
+
+def _parse_audit_bundle_text_canonical(text: object) -> dict[str, object]:
+    """Parse a presented audit bundle under the tightened line boundary.
+
+    Used by the offline :meth:`RequestStore.diagnose_audit_bundle`
+    entry. In addition to every check in :func:`_parse_audit_bundle_text`,
+    the presentation must be exactly one canonical compact JSON line:
+    no insignificant whitespace outside string values and no repeated
+    object member name (an extra/duplicated member). Trailing data after
+    the JSON object is rejected as well. Any deviation is the same
+    detail-free :class:`ValueError` and yields no partial diagnosis.
+    """
+    body = _audit_bundle_line_body(text)
+    if _audit_bundle_has_insignificant_space(body):
+        raise ValueError("audit bundle is not valid")
+    try:
+        parsed, index = json.JSONDecoder(
+            object_pairs_hook=_audit_bundle_reject_duplicate_keys
+        ).raw_decode(body)
+    except (ValueError, RecursionError):
+        raise ValueError("audit bundle is not valid") from None
+    # No trailing data after the single JSON object (raw_decode would
+    # otherwise accept a prefix).
+    if index != len(body):
+        raise ValueError("audit bundle is not valid")
+    return _validate_audit_bundle_shape(parsed)
 
 
 def _audit_bundle_reasons(
@@ -8286,17 +8383,21 @@ class RequestStore:
 
         A non-string *bundle_text*, an invalid secret mapping or a
         malformed text (a missing or duplicated trailing newline, an
-        interior line break, unparsable JSON, a missing or extra field,
-        a wrong-typed or out-of-shape value) raises :class:`ValueError`
-        identically and produces no partial result. A well-formed bundle
-        whose history is incomplete, whose fingerprints disagree, whose
-        anchors do not authenticate or whose chain proof is inconsistent
-        yields the untrusted diagnosis instead -- the diagnosis never
-        guesses, repairs, backfills, recomputes or rewrites the bundle.
+        interior line break, any insignificant whitespace so the line is
+        not canonical compact JSON, a trailing suffix, a repeated member
+        name, unparsable JSON, a missing or extra field, a wrong-typed or
+        out-of-shape value) raises :class:`ValueError` identically and
+        produces no partial result. A well-formed bundle whose history is
+        incomplete, whose fingerprints disagree, whose anchors do not
+        authenticate or whose chain proof is inconsistent yields the
+        untrusted diagnosis instead -- the diagnosis never guesses,
+        repairs, backfills, recomputes or rewrites the bundle.
         """
-        # Validate the whole presentation first: a rejected call never
-        # produces a partial diagnosis, exactly like the boolean check.
-        fields = _parse_audit_bundle_text(bundle_text)
+        # Validate the whole presentation first, under the tightened
+        # canonical compact line boundary: a rejected call never produces
+        # a partial diagnosis. The boolean verify and export entries keep
+        # their historical, byte-identical behavior.
+        fields = _parse_audit_bundle_text_canonical(bundle_text)
         secrets = _require_bundle_secrets(anchor_history_secrets)
         reasons = sorted(_audit_bundle_reasons(fields, secrets))
         result = {"trusted": not reasons, "reasons": reasons}

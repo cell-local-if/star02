@@ -469,6 +469,89 @@ class DiagnosisValidationTests(_StoreCase):
         self._assert_value_error("not json\n")
         self._assert_value_error('{"request_id": 1}\n')
 
+    def test_insignificant_whitespace_is_rejected(self):
+        # The diagnosis entry accepts exactly one canonical compact JSON
+        # line: any whitespace outside string values is a boundary error.
+        body = self.text[:-1]
+        variants = (
+            body + " \n",                                   # trailing space
+            body + "\t\n",                                  # trailing tab
+            " " + self.text,                                # leading space
+            "\t" + self.text,                               # leading tab
+            body.replace(":", ": ", 1) + "\n",             # space after colon
+            body.replace(",", ", ", 1) + "\n",             # space after comma
+        )
+        for candidate in variants:
+            with self.subTest(candidate=candidate):
+                self._assert_value_error(candidate)
+
+    def test_duplicate_member_names_are_rejected(self):
+        # A repeated member is an extra field, never silently last-wins.
+        body = self.text[:-1]
+        request_id = self.payload["request_id"]
+        variants = (
+            body.replace(
+                '"request_id":"%s"' % request_id,
+                '"request_id":"%s","request_id":"%s"'
+                % (request_id, request_id),
+                1,
+            )
+            + "\n",
+            body.replace(
+                '"status":"completed"',
+                '"status":"processing","status":"completed"',
+                1,
+            )
+            + "\n",
+            body.replace('"seq":0', '"seq":0,"seq":0', 1) + "\n",
+            body.replace(
+                '"generation":1', '"generation":1,"generation":1', 1
+            )
+            + "\n",
+        )
+        for candidate in variants:
+            with self.subTest(candidate=candidate):
+                self._assert_value_error(candidate)
+
+    def test_trailing_data_after_object_is_rejected(self):
+        body = self.text[:-1]
+        for suffix in (" ", "\t", "junk", "{}"):
+            with self.subTest(suffix=suffix):
+                self._assert_value_error(body + suffix + "\n")
+
+    def test_whitespace_inside_string_value_is_content_not_boundary(self):
+        # A space that belongs to a string value is content: it changes
+        # the proof (untrusted) but is not a malformed presentation.
+        payload = json.loads(self.text)
+        payload["chain"]["tenant_id"] = "tenant-a "
+        rendered = _render(payload)
+        parsed = json.loads(
+            RequestStore.diagnose_audit_bundle(rendered, {1: SECRET_A})
+        )
+        self.assertFalse(parsed["trusted"])
+
+    def test_boolean_verify_keeps_historical_lenient_boundary(self):
+        # 既有布尔核验保持不变: the tightened boundary applies to the
+        # diagnosis entry only; verify still parses a single-line object
+        # carrying insignificant whitespace or repeated (last-wins)
+        # members and answers with a boolean, never ValueError.
+        body = self.text[:-1]
+        request_id = self.payload["request_id"]
+        self.assertTrue(
+            RequestStore.verify_audit_bundle(body + " \n", {1: SECRET_A})
+        )
+        self.assertTrue(
+            RequestStore.verify_audit_bundle(" " + self.text, {1: SECRET_A})
+        )
+        duplicate = body.replace(
+            '"request_id":"%s"' % request_id,
+            '"request_id":"%s","request_id":"%s"' % (request_id, request_id),
+            1,
+        ) + "\n"
+        self.assertTrue(
+            RequestStore.verify_audit_bundle(duplicate, {1: SECRET_A})
+        )
+
     def test_field_completeness(self):
         for key in ("request_id", "status", "events", "chain", "anchors",
                     "generations"):
