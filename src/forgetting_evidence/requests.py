@@ -854,6 +854,19 @@ def _lease_migration_failure() -> OSError:
     return OSError(_LEASE_MIGRATION_MESSAGE)
 
 
+# Fixed, detail-free text for every scope-resolution failure: an
+# unreadable store, a corrupt request record or a snapshot that cannot
+# be read consistently. It never embeds a tenant, a subject, a scope, a
+# request id, SQL text or a filesystem path, and a partial result or a
+# half-formed conflict list is never returned.
+_SCOPE_RESOLUTION_MESSAGE = "scope_resolution_failed"
+
+
+def _scope_resolution_failure() -> OSError:
+    """Build the single scope-resolution error callers ever see."""
+    return OSError(_SCOPE_RESOLUTION_MESSAGE)
+
+
 _BACKUP_CONFLICT_MESSAGE = "backup conflict"
 
 # Every table the schema creates. A snapshot missing any of them is not
@@ -1075,6 +1088,115 @@ def _normalize_scopes(scopes: object) -> list[str]:
         raise ValueError("scopes must be a non-empty sequence of distinct strings")
     # Canonical order so scope ordering never affects comparison.
     return sorted(items)
+
+
+# Business selector grammar for scope resolution: ``*`` selects all
+# data, ``<collection>:*`` selects a whole collection and
+# ``<collection>:<item>`` selects one entry. A name segment only carries
+# lowercase letters, digits, underscores, dots and hyphens, so leading
+# or trailing whitespace can never take part in a valid selector.
+_SCOPE_ALL_SELECTOR = "*"
+_SCOPE_SELECTOR_RE = re.compile(r"([a-z0-9_.-]+):([a-z0-9_.-]+|\*)")
+
+
+def _parse_scope_selector(value: str) -> tuple[str, ...] | None:
+    """Parse one selector into its coverage tuple, or ``None`` if invalid.
+
+    The tuples are ``("all",)`` for the star, ``("group", collection)``
+    for a whole-collection selector and ``("item", collection, item)``
+    for a single entry. Anything outside the grammar -- a bare name, an
+    empty segment, extra segments, uppercase letters, whitespace or
+    other characters -- is not a selector at all.
+    """
+    if value == _SCOPE_ALL_SELECTOR:
+        return ("all",)
+    match = _SCOPE_SELECTOR_RE.fullmatch(value)
+    if match is None:
+        return None
+    collection, item = match.groups()
+    if item == _SCOPE_ALL_SELECTOR:
+        return ("group", collection)
+    return ("item", collection, item)
+
+
+def _require_scope_selectors(scopes: object) -> list[str]:
+    """Validate a non-empty sequence of distinct, well-formed selectors.
+
+    Strings, bytes and mappings are not scope sequences; an empty
+    sequence, a null or non-string element, an exact duplicate or a
+    selector outside the grammar all raise the same :class:`ValueError`
+    before storage is touched.
+    """
+    message = "scopes must be a non-empty sequence of distinct valid selectors"
+    if isinstance(scopes, (str, bytes)) or isinstance(scopes, Mapping):
+        raise ValueError(message)
+    try:
+        items = list(scopes)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise ValueError(message) from exc
+    if not items:
+        raise ValueError(message)
+    for item in items:
+        if not isinstance(item, str) or _parse_scope_selector(item) is None:
+            raise ValueError(message)
+    if len(set(items)) != len(items):
+        raise ValueError(message)
+    return items
+
+
+def _normalize_scope_selectors(selectors: list[str]) -> list[str]:
+    """Reduce validated selectors to the canonical, stable form.
+
+    The star subsumes every other selector; a whole-collection selector
+    subsumes that collection's individual entries. What remains is
+    sorted by Unicode code point, so the normalized result is identical
+    across instances and calls.
+    """
+    parsed = [_parse_scope_selector(item) for item in selectors]
+    if any(kind is not None and kind[0] == "all" for kind in parsed):
+        return [_SCOPE_ALL_SELECTOR]
+    groups = {kind[1] for kind in parsed if kind is not None and kind[0] == "group"}
+    kept = [
+        item
+        for item, kind in zip(selectors, parsed)
+        if kind is not None and (kind[0] == "group" or kind[1] not in groups)
+    ]
+    return sorted(set(kept))
+
+
+def _stored_scope_kind(value: str) -> tuple[str, ...]:
+    """Parse a persisted scope string, keeping unparseable ones opaque.
+
+    Records accepted before the selector grammar existed may hold
+    arbitrary strings; such a value only ever matches the identical
+    string and never a collection or the star's members.
+    """
+    kind = _parse_scope_selector(value)
+    if kind is None:
+        return ("opaque", value)
+    return kind
+
+
+def _scope_selector_covers(outer: tuple[str, ...], inner: tuple[str, ...]) -> bool:
+    """Return whether the ``outer`` selector covers the ``inner`` one."""
+    if outer[0] == "all":
+        return True
+    if outer[0] == "group":
+        return inner[0] in ("group", "item") and inner[1] == outer[1]
+    # A single entry (or an opaque persisted value) covers only itself.
+    return outer == inner
+
+
+def _require_scope_party(value: object, field: str) -> str:
+    """Validate a tenant or subject identifier for scope resolution.
+
+    An empty, non-string or whitespace-only identifier is caller error
+    regardless of whether any record exists, so the check can never
+    probe for stored requests.
+    """
+    if not isinstance(value, str) or not value or not value.strip():
+        raise ValueError(f"{field} must be a non-empty, non-blank string")
+    return value
 
 
 def _require_nonempty_str_list(value: object, field: str) -> list[str]:
@@ -5496,6 +5618,154 @@ class RequestStore:
             len(reason_counts),
         )
         return snapshot
+
+    def resolve_scopes(
+        self,
+        tenant_id: str,
+        subject_id: str,
+        scopes: object,
+    ) -> dict[str, object]:
+        """Resolve normalized scopes and conflicts for a subject.
+
+        Storage-layer only; never routed over HTTP. The caller supplies
+        the tenant, the subject identifier and the candidate scope
+        selectors; the entry reads the tenant's already-accepted
+        requests for that subject from one consistent snapshot inside a
+        single read-only transaction and returns the normalized scopes
+        together with the conflicting requests. The entry never creates
+        a request and never changes status, execution, evidence or
+        inspection bookkeeping: a concurrent acceptance or status
+        advance can never contribute half a record, requests committed
+        before the call are stably included and requests committed
+        after it never appear early.
+
+        Selectors follow the business grammar: ``*`` selects all data,
+        ``<collection>:*`` a whole collection and
+        ``<collection>:<item>`` a single entry, with name segments of
+        lowercase letters, digits, underscores, dots and hyphens only.
+        Normalization keeps the star alone once it appears, keeps a
+        whole-collection selector over that collection's entries and
+        sorts what remains by Unicode code point, so the result is
+        stable across instances. A conflict is any already-accepted
+        request of the same tenant and subject whose scopes overlap the
+        normalized ones -- the star covers everything, a
+        whole-collection selector covers its collection's entries and
+        an identical single entry covers itself; anything else does not
+        conflict. Conflicts are ordered by first acceptance time, then
+        request id, and each carries exactly ``request_id`` and
+        ``status`` -- never the subject, the original scopes, an
+        idempotency key, a credential, SQL or a path.
+
+        The result is a plain dictionary with exactly the keys
+        ``scopes`` (a list of strings) and ``conflicts`` (a list of
+        dictionaries with exactly ``request_id`` then ``status``), in
+        that order; every value is a string, a list or a dictionary and
+        no float, negative zero or non-finite number ever appears.
+        Repeated resolutions, rebuilt instances and concurrent read-only
+        calls over the same snapshot return the same dictionary.
+
+        An empty, non-string or whitespace-only *tenant_id* or
+        *subject_id*, and an empty, non-sequence, null-element,
+        non-string-element, exactly duplicated or malformed-selector
+        *scopes* raise :class:`ValueError` without touching storage,
+        indistinguishably whether or not any record exists. A storage
+        outage, a corrupt request record or a snapshot read failure
+        raises the fixed-text :class:`OSError`
+        (``scope_resolution_failed``), never a partial result or a
+        half-formed conflict list.
+        """
+        # Validate everything before touching the database so a rejected
+        # call never reads or writes anything.
+        tenant_id = _require_scope_party(tenant_id, "tenant_id")
+        subject_id = _require_scope_party(subject_id, "subject_id")
+        normalized = _normalize_scope_selectors(_require_scope_selectors(scopes))
+        if self._mem_conn is not None:
+            with self._write_lock:
+                return self._resolve_scopes(tenant_id, subject_id, normalized)
+        return self._resolve_scopes(tenant_id, subject_id, normalized)
+
+    def _resolve_scopes(
+        self,
+        tenant_id: str,
+        subject_id: str,
+        normalized: list[str],
+    ) -> dict[str, object]:
+        conn = self._connect()
+        try:
+            try:
+                # One explicit read-only transaction: every candidate
+                # request row is read from a single consistent snapshot,
+                # never piecemeal across statements that a concurrent
+                # acceptance or status advance could interleave.
+                conn.execute("BEGIN")
+                try:
+                    rows = conn.execute(
+                        "SELECT request_id, status, created_at, scopes_json "
+                        "FROM requests WHERE tenant_id = ? AND subject_id = ? "
+                        "ORDER BY created_at, request_id",
+                        (tenant_id, subject_id),
+                    ).fetchall()
+                except BaseException:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
+                conn.execute("COMMIT")
+            except sqlite3.Error:
+                raise _scope_resolution_failure() from None
+        finally:
+            self._release(conn)
+
+        new_kinds = [
+            kind
+            for kind in (_parse_scope_selector(item) for item in normalized)
+            if kind is not None
+        ]
+        conflicts: list[dict[str, str]] = []
+        for request_id, status, created_at, scopes_json in rows:
+            # Every persisted row must be what the store writes; anything
+            # else is record corruption, never a request to skip or a
+            # conflict to fabricate.
+            if (
+                not isinstance(request_id, str)
+                or not request_id
+                or not isinstance(status, str)
+                or status not in _ALLOWED_TRANSITIONS
+                or not isinstance(created_at, str)
+                or not created_at
+                or not isinstance(scopes_json, str)
+            ):
+                raise _scope_resolution_failure()
+            try:
+                stored = json.loads(scopes_json)
+            except ValueError:
+                raise _scope_resolution_failure() from None
+            if not isinstance(stored, list) or not all(
+                isinstance(scope, str) and scope for scope in stored
+            ):
+                raise _scope_resolution_failure()
+            stored_kinds = [_stored_scope_kind(scope) for scope in stored]
+            if any(
+                _scope_selector_covers(new, old)
+                or _scope_selector_covers(old, new)
+                for new in new_kinds
+                for old in stored_kinds
+            ):
+                conflicts.append({"request_id": request_id, "status": status})
+
+        result: dict[str, object] = {
+            "scopes": list(normalized),
+            "conflicts": conflicts,
+        }
+        # Log only counts and the stable outcome: no tenant, subject,
+        # scope, request id, credential or SQL text ever reaches the log.
+        _log.info(
+            "scope resolution read scopes=%s conflicts=%s",
+            len(normalized),
+            len(conflicts),
+        )
+        return result
 
     @staticmethod
     def _next_inspection_candidate(
