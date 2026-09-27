@@ -1199,11 +1199,18 @@ _ANCHOR_REASON_AUTH_FAILED = "anchor_auth_failed"
 _ANCHOR_REASON_SEQUENCE_GAP = "anchor_sequence_gap"
 _ANCHOR_REASON_GLOBAL_HEAD = "anchor_head_mismatch"
 _ANCHOR_REASON_CORRUPT_ROW = "anchor_row_corrupt"
-# An anchor needs a secret generation the assessing store was not
-# handed (neither the current secret nor ``anchor_history_secrets``
-# provides it). Distinct from ``anchor_auth_failed``: the material is
-# absent, not wrong.
+# An anchor needs a secret generation the assessing caller was not
+# handed (the caller-held generation map has no entry for it).
+# Distinct from ``anchor_auth_failed``: the material is absent, not
+# wrong, and the current generation's secret is never tried in its
+# place to guess a historical secret.
 _ANCHOR_REASON_KEY_MISSING = "anchor_key_missing"
+# A handed secret can be located for the anchor's recorded generation
+# but it is not bound to that generation's irreversible fingerprint:
+# the fingerprint/generation association disagrees with the secret
+# supplied for that generation. Distinct from ``anchor_key_missing``:
+# the generation was locatable, the binding just does not authenticate.
+_ANCHOR_REASON_GENERATION_MISMATCH = "anchor_generation_mismatch"
 
 # Fixed, detail-free text for every lost anchor rotation race. It never
 # says which secret or generation was involved.
@@ -1621,113 +1628,180 @@ def _parse_audit_bundle_text(text: object) -> dict[str, object]:
     return parsed
 
 
-def _verify_audit_bundle_fields(
+def _audit_bundle_reasons(
     fields: Mapping[str, object], secrets: Mapping[int, str]
-) -> bool:
-    """Pure, offline authentication of a parsed audit bundle.
+) -> set[str]:
+    """Collect every independently decidable untrusted reason.
 
-    Only compares and recomputes: the event order, the request
-    association between the snapshot status, the chain summary and the
-    final event, every database link hash, every per-event anchor under
-    the secret of its recorded generation, and the generation binding
-    between the caller-held secrets and the bundle's irreversible
-    fingerprints. A missing secret, a fingerprint mismatch, a forged
-    generation association or any recomputed value that differs yields
-    ``False`` -- secrets are never guessed.
+    Pure and offline, like :func:`_verify_audit_bundle_fields`: it only
+    compares and recomputes. Unlike the boolean check it does not stop at
+    the first failure -- one tampered field never masks the others, so a
+    bundle carrying, say, both a reordered event and an anchor sealed
+    under a missing generation reports both reasons. Secrets are never
+    guessed: a missing historical generation is
+    ``anchor_key_missing``, a fingerprint that disagrees with the secret
+    handed for a locatable generation is
+    ``anchor_generation_mismatch``, and only a located, fingerprint-bound
+    secret that fails to authenticate the recorded anchor value is
+    ``anchor_auth_failed``.
     """
     chain = fields["chain"]
     tenant_id = chain["tenant_id"]
     request_id = fields["request_id"]
     events = fields["events"]
     anchors = fields["anchors"]
+    reasons: set[str] = set()
 
-    # Event order: gap-free sequence numbers from zero, in order.
-    if [event["seq"] for event in events] != list(range(len(events))):
-        return False
-
-    # Database link hashes, recomputed from the genesis predecessor.
-    predecessor = _GENESIS_PREDECESSOR
+    # Index events and anchors by their declared sequence, so a mere
+    # reordering is diagnosed as the single order problem it is while a
+    # genuinely damaged hash or anchor on an otherwise locatable entry
+    # still reports its own independent reason. Duplicate declarations
+    # are order/shape damage covered by the sequence checks below.
+    events_by_seq: dict[int, object] = {}
     for event in events:
+        events_by_seq[event["seq"]] = event
+    anchors_by_seq: dict[int, object] = {}
+    for anchor in anchors:
+        anchors_by_seq[anchor["seq"]] = anchor
+
+    # Event order: gap-free sequence numbers from zero, in order, with
+    # no duplicate declaration.
+    event_seqs = [event["seq"] for event in events]
+    if event_seqs != list(range(len(events))):
+        reasons.add(_ANCHOR_REASON_EVENT_ORDER)
+
+    # Database link hashes, replayed by declared sequence from the
+    # genesis predecessor; each locatable event is judged on its own.
+    predecessor = _GENESIS_PREDECESSOR
+    for expected_seq in range(len(events)):
+        event = events_by_seq.get(expected_seq)
+        if event is None:
+            continue
         recomputed = _chain_hash(
             tenant_id,
             request_id,
-            event["seq"],
+            expected_seq,
             event["status"],
             event["occurred_at"],
             predecessor,
         )
         if not hmac.compare_digest(recomputed, event["chain_hash"]):
-            return False
+            reasons.add(_ANCHOR_REASON_CHAIN_MISMATCH)
         predecessor = event["chain_hash"]
 
-    # Request association: the snapshot status and the chain summary
-    # must be exactly what the final event settles.
+    # Request association and the chain summary head: the snapshot
+    # status, the event count and the summary head must each be exactly
+    # what the settled event sequence states.
     if chain["event_count"] != len(events):
-        return False
-    if not hmac.compare_digest(chain["head"], events[-1]["chain_hash"]):
-        return False
-    if fields["status"] != events[-1]["status"]:
-        return False
+        reasons.add(_ANCHOR_REASON_ASSOCIATION)
+    final_event = events_by_seq.get(len(events) - 1)
+    if final_event is not None:
+        if not hmac.compare_digest(chain["head"], final_event["chain_hash"]):
+            reasons.add(_ANCHOR_REASON_HEAD_MISMATCH)
+        if fields["status"] != final_event["status"]:
+            reasons.add(_ANCHOR_REASON_ASSOCIATION)
 
-    # One anchor per event, in the same order.
+    # One anchor per event; a count disagreement is an association
+    # problem, while equal counts in a broken order is the same order
+    # defect as displaced events.
     if len(anchors) != len(events):
-        return False
-    if [anchor["seq"] for anchor in anchors] != list(range(len(events))):
-        return False
+        reasons.add(_ANCHOR_REASON_ASSOCIATION)
+    elif [anchor["seq"] for anchor in anchors] != list(range(len(events))):
+        reasons.add(_ANCHOR_REASON_EVENT_ORDER)
 
     # Secret-generation association: each recorded generation at most
-    # once, bound to its irreversible fingerprint.
+    # once, bound to its irreversible fingerprint. Duplicate records are a
+    # forged generation association, never a parse failure.
     generation_fingerprints: dict[int, str] = {}
+    duplicate_generation = False
     for record in fields["generations"]:
         generation = record["generation"]
         if generation in generation_fingerprints:
-            return False
+            duplicate_generation = True
         generation_fingerprints[generation] = record["key_fingerprint"]
+    if duplicate_generation:
+        reasons.add(_ANCHOR_REASON_GENERATION_MISMATCH)
 
+    # Per-event anchor authentication, replayed by declared sequence so
+    # each anchor chains to its predecessor anchor; a displaced anchor
+    # declaration is additionally covered by the order reason above.
     anchor_predecessor = _ANCHOR_GENESIS_PREDECESSOR
-    for event, anchor in zip(events, anchors):
+    for expected_seq in range(len(events)):
+        event = events_by_seq.get(expected_seq)
+        anchor = anchors_by_seq.get(expected_seq)
+        if event is None or anchor is None:
+            continue
         key_generation = anchor["key_generation"]
+        secret: str | None
         if not generation_fingerprints:
             # The pre-rotation legacy shape: only NULL attributions and
             # no generation records; the generation-1 secret is used
             # directly, exactly like the store's own resolution.
             if key_generation is not None:
-                return False
-            secret = secrets.get(1)
-            if secret is None:
-                return False
+                reasons.add(_ANCHOR_REASON_GENERATION_MISMATCH)
+                secret = None
+            else:
+                secret = secrets.get(1)
+                if secret is None:
+                    reasons.add(_ANCHOR_REASON_KEY_MISSING)
         else:
             generation = 1 if key_generation is None else key_generation
             fingerprint = generation_fingerprints.get(generation)
             if fingerprint is None:
                 # The anchor names a generation the bundle does not
-                # record: a forged association can never authenticate.
-                return False
-            secret = secrets.get(generation)
-            if secret is None:
-                # The caller did not hand this generation's secret: the
-                # anchor can neither be authenticated nor forged.
-                return False
-            if not hmac.compare_digest(
-                _anchor_key_fingerprint(secret), fingerprint
-            ):
-                # The handed secret does not match the generation's
-                # recorded fingerprint; never guess another.
-                return False
-        expected = _anchor_mac(
-            secret,
-            tenant_id,
-            request_id,
-            event["seq"],
-            event["status"],
-            event["occurred_at"],
-            event["chain_hash"],
-            anchor_predecessor,
-        )
-        if not hmac.compare_digest(expected, anchor["anchor_hmac"]):
-            return False
+                # record: its fingerprint/generation binding cannot be
+                # established.
+                reasons.add(_ANCHOR_REASON_GENERATION_MISMATCH)
+                secret = None
+            else:
+                secret = secrets.get(generation)
+                if secret is None:
+                    # The caller did not hand this generation's secret:
+                    # the anchor can neither be authenticated nor forged,
+                    # and the current secret must never be tried here.
+                    reasons.add(_ANCHOR_REASON_KEY_MISSING)
+                elif not hmac.compare_digest(
+                    _anchor_key_fingerprint(secret), fingerprint
+                ):
+                    # The generation is locatable, but the handed secret
+                    # is not bound to its recorded fingerprint. The MAC
+                    # is deliberately not tried against it: the binding
+                    # disagrees, so the material cannot authenticate.
+                    reasons.add(_ANCHOR_REASON_GENERATION_MISMATCH)
+                    secret = None
+        if secret is not None:
+            expected = _anchor_mac(
+                secret,
+                tenant_id,
+                request_id,
+                event["seq"],
+                event["status"],
+                event["occurred_at"],
+                event["chain_hash"],
+                anchor_predecessor,
+            )
+            if not hmac.compare_digest(expected, anchor["anchor_hmac"]):
+                reasons.add(_ANCHOR_REASON_AUTH_FAILED)
         anchor_predecessor = anchor["anchor_hmac"]
-    return True
+    return reasons
+
+
+def _verify_audit_bundle_fields(
+    fields: Mapping[str, object], secrets: Mapping[int, str]
+) -> bool:
+    """Pure, offline authentication of a parsed audit bundle.
+
+    Trusted exactly when :func:`_audit_bundle_reasons` finds no reason:
+    the event order, the request association between the snapshot
+    status, the chain summary and the final event, every database link
+    hash, every per-event anchor under the secret of its recorded
+    generation, and the generation binding between the caller-held
+    secrets and the bundle's irreversible fingerprints all agree. A
+    missing secret, a fingerprint mismatch, a forged generation
+    association or any recomputed value that differs yields ``False`` --
+    secrets are never guessed.
+    """
+    return not _audit_bundle_reasons(fields, secrets)
 
 
 def _render_audit_bundle(
@@ -8174,3 +8248,56 @@ class RequestStore:
         fields = _parse_audit_bundle_text(bundle_text)
         secrets = _require_bundle_secrets(anchor_history_secrets)
         return _verify_audit_bundle_fields(fields, secrets)
+
+    @staticmethod
+    def diagnose_audit_bundle(
+        bundle_text: str,
+        anchor_history_secrets: Mapping[int, str],
+    ) -> str:
+        """Recoverable offline diagnosis of an exported evidence bundle.
+
+        Storage-layer only; never routed over HTTP and never a health
+        command. Like :meth:`verify_audit_bundle` the diagnosis runs
+        fully offline: it reads only the presented bundle text and the
+        caller-held mapping of anchor secret generations. It never
+        connects to a store or a database, never creates a batch, never
+        writes an on-disk copy and never modifies historical evidence.
+
+        The result is a single compact JSON line with exactly one
+        trailing newline, holding, in order, ``trusted`` (a boolean) and
+        ``reasons`` (a list of stable strings, deduplicated and sorted by
+        Unicode code point). A trusted bundle reports ``true`` and an
+        empty list -- including with the database gone; an untrusted
+        bundle reports ``false`` with every independently decidable
+        reason, so one defect never masks the others. The reason codes
+        are ``event_order_invalid``, ``chain_hash_mismatch``,
+        ``request_association_mismatch`` (the snapshot status, the event
+        count or the event/anchor one-to-one association),
+        ``chain_head_mismatch`` (the chain summary head),
+        ``anchor_key_missing`` (a named generation has no handed secret;
+        the current secret is never tried in its place),
+        ``anchor_generation_mismatch`` (a locatable generation's secret
+        is not bound to its recorded fingerprint, or the generation
+        association is forged) and ``anchor_auth_failed`` (the located
+        generation secret does not authenticate the anchor). The line
+        never contains a float, a negative zero or a non-finite number,
+        and secret material never enters the result, an exception or a
+        log.
+
+        A non-string *bundle_text*, an invalid secret mapping or a
+        malformed text (a missing or duplicated trailing newline, an
+        interior line break, unparsable JSON, a missing or extra field,
+        a wrong-typed or out-of-shape value) raises :class:`ValueError`
+        identically and produces no partial result. A well-formed bundle
+        whose history is incomplete, whose fingerprints disagree, whose
+        anchors do not authenticate or whose chain proof is inconsistent
+        yields the untrusted diagnosis instead -- the diagnosis never
+        guesses, repairs, backfills, recomputes or rewrites the bundle.
+        """
+        # Validate the whole presentation first: a rejected call never
+        # produces a partial diagnosis, exactly like the boolean check.
+        fields = _parse_audit_bundle_text(bundle_text)
+        secrets = _require_bundle_secrets(anchor_history_secrets)
+        reasons = sorted(_audit_bundle_reasons(fields, secrets))
+        result = {"trusted": not reasons, "reasons": reasons}
+        return json.dumps(result, ensure_ascii=False, separators=(",", ":")) + "\n"
