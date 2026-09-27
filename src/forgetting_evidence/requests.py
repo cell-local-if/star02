@@ -367,6 +367,44 @@ record or an unreadable snapshot raises the fixed-text
 or a half-built list, and never a tenant, subject, scope, request id,
 SQL or path in the error or the log.
 
+:meth:`RequestStore.resolve_retention` is the storage-layer retention
+policy resolution entry, never routed over HTTP. It takes a tenant, a
+subject identifier, an ordered sequence of business scope selectors, an
+ordinary rule catalog and a subject exception catalog -- both mappings
+keyed by their policy number -- and resolves the effective retention
+for the normalized scopes from those catalogs alone, reading the
+subject's already accepted requests from one consistent snapshot inside
+a single read-only transaction; it never creates a request, changes a
+status, an execution record, evidence or inspection bookkeeping, and
+never writes anything. The scope set only accepts an ordered element
+sequence: a bare string, a set, a mapping or a generator (any
+non-sequence iterator) is caller error. Every ordinary rule declares a
+selector, a non-boolean non-negative integer day count and a non-empty
+reason, and the catalog must hold at least the whole-data ``*``
+default; every exception binds a subject, a selector, a day count and a
+reason and only ever covers a matched scope of the same tenant and the
+same subject. Policy numbers are non-empty strings, unique across both
+catalogs within the tenant. Inside one scope a concrete entry rule
+beats a whole-collection rule, which beats the whole-data default; a
+hit subject exception beats every ordinary rule, and rules or
+exceptions reaching the same precedence are ordered by policy number
+Unicode code point, never by passing order. Each normalized scope is
+matched independently and the effective retention is the largest day
+count any scope resolved to. The result carries exactly
+``retention_days``, ``policy_id``, ``exceptions`` and ``reason``: the
+hit-exception list reports only the bound subject, the scope, the
+retention days and the reason, stably ordered by normalized scope, and
+the decision reason is the reason of the winning record that determined
+the maximum retention. A null, wrongly typed or out-of-range argument,
+rule or exception -- a missing default rule, a duplicated policy
+number, an illegal selector or a negative day count -- raises
+:class:`ValueError` before storage is touched; a storage outage, a
+corrupt accepted request record or an unreadable snapshot raises
+:class:`OSError`; every failure carries the fixed text
+``retention_policy_resolution_failed`` and never a partial result, a
+tenant, a subject, a scope, a policy number, SQL or a path in the
+error, the result or the log.
+
 Caller errors are always :class:`ValueError` (invalid parameters) or the
 module's own domain exceptions; every database failure -- an unwritable
 path, an uncreatable or corrupt file, an I/O or read/write error -- is
@@ -390,7 +428,7 @@ import struct
 import tempfile
 import threading
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta, timezone
 
 __all__ = [
@@ -897,6 +935,25 @@ def _scope_resolution_failure() -> OSError:
     return OSError(_SCOPE_RESOLUTION_MESSAGE)
 
 
+# Fixed, detail-free text for every retention-policy resolution failure:
+# a null, wrongly typed or out-of-range argument, rule or exception, an
+# unreadable store, a corrupt accepted request record, or a snapshot
+# read that cannot complete. It never embeds a tenant, a subject, a
+# scope, a policy number, SQL text or a filesystem path, and a partial
+# result is never returned.
+_RETENTION_RESOLUTION_MESSAGE = "retention_policy_resolution_failed"
+
+
+def _retention_resolution_failure() -> OSError:
+    """Build the single retention-resolution storage error callers see."""
+    return OSError(_RETENTION_RESOLUTION_MESSAGE)
+
+
+def _retention_value_failure() -> ValueError:
+    """Build the single retention-resolution validation error callers see."""
+    return ValueError(_RETENTION_RESOLUTION_MESSAGE)
+
+
 # Business scope selector grammar. A selector has exactly three shapes:
 #
 # * ``*`` -- every datum in the store (whole-data);
@@ -1025,6 +1082,140 @@ def _selectors_overlap(incoming_text: str, stored_text: str) -> bool:
     group = incoming if incoming[0] == "group" else stored
     entry = stored if incoming[0] == "group" else incoming
     return group[1] == entry[1]
+
+
+# Retention rule precedence inside one matched scope: a concrete entry
+# rule beats a whole-collection rule, which beats the whole-data
+# default. Lower sorts first, so the winning candidate is a plain min.
+_SELECTOR_PRECEDENCE = {"entry": 0, "group": 1, "all": 2}
+
+
+def _selector_covers(rule_selector: str, scope: str) -> bool:
+    """Whether a policy selector applies to a normalized scope.
+
+    Both arguments are already validated against the selector grammar.
+    The whole-data selector covers every scope, a whole-collection
+    selector covers that collection's group scope and each of its
+    concrete entries, and a concrete entry selector covers exactly that
+    one entry scope.
+    """
+    kind, collection, entry = _classify_selector(rule_selector)
+    if kind == "all":
+        return True
+    scope_kind, scope_collection, scope_entry = _classify_selector(scope)
+    if kind == "group":
+        return collection == scope_collection
+    return (
+        scope_kind == "entry"
+        and collection == scope_collection
+        and entry == scope_entry
+    )
+
+
+def _normalize_retention_scopes(raw: object) -> list[str]:
+    """Validate the retention scope set as an ordered element sequence.
+
+    Stricter than acceptance: only an ordered sequence is a scope set,
+    so a bare string, a set, a mapping or a generator (any non-sequence
+    iterator) is caller error even though it is iterable. Everything
+    else defers to the shared selector normalization, and every
+    rejection carries the fixed retention message.
+    """
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, Sequence):
+        raise _retention_value_failure()
+    try:
+        return _normalize_scope_selectors(raw)
+    except ValueError:
+        raise _retention_value_failure() from None
+
+
+# A policy rule or exception value is a mapping of exactly these keys;
+# anything missing, extra or of a foreign shape is caller error.
+_RETENTION_RULE_KEYS = frozenset({"selector", "days", "reason"})
+_RETENTION_EXCEPTION_KEYS = frozenset({"subject", "selector", "days", "reason"})
+
+
+def _require_retention_selector(value: object) -> str:
+    if not isinstance(value, str) or _SCOPE_SELECTOR_RE.fullmatch(value) is None:
+        raise _retention_value_failure()
+    return value
+
+
+def _require_retention_days(value: object) -> int:
+    # Retention days are a non-boolean, non-negative integer; a boolean,
+    # a float, a string or a negative count is out of domain.
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        raise _retention_value_failure()
+    return value
+
+
+def _require_retention_text(value: object) -> str:
+    # A policy number and a decision reason are non-empty strings.
+    if not isinstance(value, str) or not value:
+        raise _retention_value_failure()
+    return value
+
+
+def _validate_retention_rules(raw: object) -> dict[str, tuple[str, int, str]]:
+    """Validate the ordinary retention rule catalog.
+
+    The catalog maps each policy number to a rule declaring exactly a
+    selector, a day count and a reason, and it must hold at least the
+    whole-data ``*`` default rule. Returns ``{policy_id: (selector,
+    days, reason)}``; every malformed shape raises the fixed
+    :class:`ValueError` before storage is touched.
+    """
+    if not isinstance(raw, Mapping) or not raw:
+        raise _retention_value_failure()
+    validated: dict[str, tuple[str, int, str]] = {}
+    has_default = False
+    for policy_id, rule in raw.items():
+        _require_retention_text(policy_id)
+        if not isinstance(rule, Mapping) or set(rule) != _RETENTION_RULE_KEYS:
+            raise _retention_value_failure()
+        selector = _require_retention_selector(rule["selector"])
+        days = _require_retention_days(rule["days"])
+        reason = _require_retention_text(rule["reason"])
+        if selector == "*":
+            has_default = True
+        validated[policy_id] = (selector, days, reason)
+    if not has_default:
+        raise _retention_value_failure()
+    return validated
+
+
+def _validate_retention_exceptions(
+    raw: object,
+    rule_policy_ids: object,
+) -> dict[str, tuple[str, str, int, str]]:
+    """Validate the subject exception catalog.
+
+    The catalog maps each policy number to an exception binding exactly
+    a subject, a selector, a day count and a reason; it may be empty but
+    never null. A policy number already used by an ordinary rule is a
+    duplicate within the tenant and therefore illegal. Returns
+    ``{policy_id: (subject, selector, days, reason)}``.
+    """
+    if not isinstance(raw, Mapping):
+        raise _retention_value_failure()
+    validated: dict[str, tuple[str, str, int, str]] = {}
+    for policy_id, exception in raw.items():
+        _require_retention_text(policy_id)
+        if policy_id in rule_policy_ids:
+            raise _retention_value_failure()
+        if (
+            not isinstance(exception, Mapping)
+            or set(exception) != _RETENTION_EXCEPTION_KEYS
+        ):
+            raise _retention_value_failure()
+        subject = exception["subject"]
+        if not isinstance(subject, str) or not subject.strip():
+            raise _retention_value_failure()
+        selector = _require_retention_selector(exception["selector"])
+        days = _require_retention_days(exception["days"])
+        reason = _require_retention_text(exception["reason"])
+        validated[policy_id] = (subject, selector, days, reason)
+    return validated
 
 
 _BACKUP_CONFLICT_MESSAGE = "backup conflict"
@@ -2786,6 +2977,239 @@ class RequestStore:
             "scopes resolved scopes=%s conflicts=%s",
             len(normalized),
             len(conflicts),
+        )
+        return result
+
+    def resolve_retention(
+        self,
+        tenant_id: str,
+        subject_id: str,
+        scopes: object,
+        rules: object,
+        exceptions: object,
+    ) -> dict[str, object]:
+        """Resolve the effective retention for a subject's data scopes.
+
+        Storage-layer only; never routed over HTTP and never a health
+        command, a parsed table or a background scan. The caller
+        supplies the tenant, a subject identifier, an ordered sequence
+        of business scope selectors, an ordinary rule catalog and a
+        subject exception catalog; the entry normalizes the scopes,
+        reads the same tenant's already accepted requests for that same
+        subject from one consistent snapshot inside a single read-only
+        transaction, and resolves the retention from the catalogs
+        alone. It never creates a request, changes a status, an
+        execution record, evidence or inspection bookkeeping, and never
+        writes anything at all.
+
+        The scope set only accepts an ordered element sequence (a list
+        or tuple): a bare string, a set, a mapping or a generator --
+        any non-sequence iterator -- is caller error. Both catalogs are
+        mappings keyed by their policy number, a non-empty string that
+        is unique across the two catalogs within the tenant. Every
+        ordinary rule declares exactly a selector, a day count and a
+        reason, and the catalog must hold at least the whole-data ``*``
+        default rule; every exception binds exactly a subject, a
+        selector, a day count and a reason, and only ever covers a
+        matched scope of the same tenant and the same subject. A
+        selector uses the business selector grammar, a day count is a
+        non-boolean non-negative integer, and a reason is a non-empty
+        string.
+
+        Inside one scope a concrete entry rule beats a whole-collection
+        rule, which beats the whole-data default; a hit subject
+        exception beats every ordinary rule, and ordinary rules or
+        exceptions reaching the same precedence are ordered by policy
+        number Unicode code point, never by passing order. Each
+        normalized scope is matched independently and the effective
+        retention is the largest day count any scope resolved to.
+
+        The result dictionary has exactly four keys, in order:
+        ``retention_days`` (the effective integer day count),
+        ``policy_id`` (the winning policy number), ``exceptions`` (the
+        hit-exception list) and ``reason`` (the reason of the winning
+        record that determined the maximum retention). Each hit
+        exception reports exactly ``subject``, ``scope``,
+        ``retention_days`` and ``reason``, stably ordered by normalized
+        scope; with no hit exception the list is empty. Every value is
+        an integer, a string, a list or a dictionary, and repeated
+        resolutions, rebuilt instances and concurrent read-only calls
+        with the same input and catalogs return the same dictionary.
+
+        A null, wrongly typed or out-of-range argument, rule or
+        exception -- a missing default rule, a duplicated policy
+        number, an illegal selector or a negative day count -- raises
+        :class:`ValueError` without touching storage, whether or not
+        any record exists. A storage outage, a corrupt accepted request
+        record or a snapshot read that cannot complete raises
+        :class:`OSError`. Every failure carries the fixed text
+        ``retention_policy_resolution_failed`` -- never a partial
+        result, and never a tenant, subject, scope, policy number, SQL
+        or path in the error or the log.
+        """
+        # Validate everything before touching the database: a rejected
+        # call never reads or writes anything, and every validation
+        # failure carries the same fixed text.
+        try:
+            tenant_id = _require_scope_identity(tenant_id, "tenant_id")
+            subject_id = _require_scope_identity(subject_id, "subject_id")
+        except ValueError:
+            raise _retention_value_failure() from None
+        normalized = _normalize_retention_scopes(scopes)
+        validated_rules = _validate_retention_rules(rules)
+        validated_exceptions = _validate_retention_exceptions(
+            exceptions, validated_rules.keys()
+        )
+
+        if self._mem_conn is not None:
+            with self._write_lock:
+                return self._resolve_retention(
+                    tenant_id,
+                    subject_id,
+                    normalized,
+                    validated_rules,
+                    validated_exceptions,
+                )
+        return self._resolve_retention(
+            tenant_id,
+            subject_id,
+            normalized,
+            validated_rules,
+            validated_exceptions,
+        )
+
+    def _resolve_retention(
+        self,
+        tenant_id: str,
+        subject_id: str,
+        normalized: list[str],
+        rules: dict[str, tuple[str, int, str]],
+        exceptions: dict[str, tuple[str, str, int, str]],
+    ) -> dict[str, object]:
+        conn = self._connect()
+        try:
+            try:
+                # One explicit read-only transaction for the whole
+                # resolution: the subject's accepted rows are read from
+                # one consistent snapshot, so a concurrent acceptance or
+                # status advance can never contribute half a record.
+                conn.execute("BEGIN")
+                try:
+                    rows = conn.execute(
+                        "SELECT request_id, status, scopes_json FROM requests "
+                        "WHERE tenant_id = ? AND subject_id = ? "
+                        "ORDER BY created_at ASC, request_id ASC",
+                        (tenant_id, subject_id),
+                    ).fetchall()
+                except BaseException:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
+                conn.execute("COMMIT")
+            except sqlite3.Error:
+                raise _retention_resolution_failure() from None
+        finally:
+            self._release(conn)
+
+        for request_id, status, stored_json in rows:
+            # Every persisted request the store itself wrote carries a
+            # non-empty id, a non-empty current status and a JSON list
+            # of non-empty scope strings; anything else is record
+            # corruption, never a row to skip or fold into a result.
+            if (
+                not isinstance(request_id, str)
+                or not request_id
+                or not isinstance(status, str)
+                or status not in _ALLOWED_TRANSITIONS
+            ):
+                raise _retention_resolution_failure()
+            try:
+                stored_scopes = json.loads(stored_json)
+            except (TypeError, ValueError):
+                raise _retention_resolution_failure() from None
+            if (
+                not isinstance(stored_scopes, list)
+                or not stored_scopes
+                or not all(
+                    isinstance(scope, str) and scope for scope in stored_scopes
+                )
+            ):
+                raise _retention_resolution_failure()
+
+        best_days: int | None = None
+        best_policy_id = ""
+        best_reason = ""
+        hit_exceptions: list[dict[str, object]] = []
+        for scope in normalized:
+            # A candidate is (precedence, policy number, days, reason,
+            # is_exception); the winner of one catalog is the min by
+            # (precedence, policy number), so the passing order of the
+            # catalog never influences the outcome.
+            winner: tuple[int, str, int, str, bool] | None = None
+            for policy_id, (bound_subject, selector, days, reason) in (
+                exceptions.items()
+            ):
+                if bound_subject != subject_id:
+                    continue
+                if not _selector_covers(selector, scope):
+                    continue
+                candidate = (
+                    _SELECTOR_PRECEDENCE[_classify_selector(selector)[0]],
+                    policy_id,
+                    days,
+                    reason,
+                    True,
+                )
+                if winner is None or candidate[:2] < winner[:2]:
+                    winner = candidate
+            if winner is None:
+                for policy_id, (selector, days, reason) in rules.items():
+                    if not _selector_covers(selector, scope):
+                        continue
+                    candidate = (
+                        _SELECTOR_PRECEDENCE[_classify_selector(selector)[0]],
+                        policy_id,
+                        days,
+                        reason,
+                        False,
+                    )
+                    if winner is None or candidate[:2] < winner[:2]:
+                        winner = candidate
+            # The mandatory whole-data default rule covers every scope,
+            # so a winner always exists.
+            _, policy_id, days, reason, is_exception = winner
+            if is_exception:
+                hit_exceptions.append(
+                    {
+                        "subject": subject_id,
+                        "scope": scope,
+                        "retention_days": days,
+                        "reason": reason,
+                    }
+                )
+            # The effective retention is the largest day count any scope
+            # resolved to; the first scope reaching the maximum keeps
+            # the winning policy number and the decision reason.
+            if best_days is None or days > best_days:
+                best_days = days
+                best_policy_id = policy_id
+                best_reason = reason
+
+        result = {
+            "retention_days": best_days,
+            "policy_id": best_policy_id,
+            "exceptions": hit_exceptions,
+            "reason": best_reason,
+        }
+        # Log only stable counts: no tenant, subject, scope, policy
+        # number, reason, credential, SQL or path ever reaches the log.
+        _log.info(
+            "retention resolved scopes=%s rules=%s exceptions=%s",
+            len(normalized),
+            len(rules),
+            len(hit_exceptions),
         )
         return result
 
