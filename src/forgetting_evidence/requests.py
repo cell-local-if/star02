@@ -337,6 +337,36 @@ returning ``True`` for a genuine bundle and ``False`` for a
 well-formed but recomputed, replaced or under-proven one -- secrets are
 never guessed.
 
+:meth:`RequestStore.resolve_scopes` is the storage-layer subject and
+data-scope resolution entry, never routed over HTTP. It takes a
+tenant, a subject identifier and a non-empty sequence of business
+scope selectors and reads the same tenant's already accepted requests
+for that same subject from one consistent snapshot inside a single
+read-only transaction; it never creates a request, changes a status,
+an execution record, evidence or inspection bookkeeping, and never
+writes anything. Selectors use the business selector grammar -- ``*``
+for every datum, ``<collection>*`` for a whole collection and
+``<collection>:<entry>`` for one concrete entry, the two name
+segments joined by a colon and each restricted to lower-case letters,
+digits, underscore, dot and hyphen with no surrounding padding.
+Normalization keeps the stronger of overlapping choices (a whole
+collection absorbs that collection's entries, ``*`` absorbs
+everything), sorts the survivors by Unicode code point, and rejects
+an empty, non-sequence, null-element, non-string-element,
+exact-duplicate or illegal-selector sequence -- as it rejects an
+empty, non-string or whitespace-only tenant or subject, whether or
+not any record exists -- as :class:`ValueError` before storage is
+touched. Conflicts compare only same-tenant, same-subject accepted
+requests, returned stably by first acceptance time and then request
+id: ``*`` conflicts with every range, a group with the same group and
+its collection's entries, and an identical concrete entry with
+itself. Each conflict item carries exactly ``request_id`` and the
+request's current ``status``. A storage outage, a corrupt request
+record or an unreadable snapshot raises the fixed-text
+:class:`OSError` ``scope_resolution_failed`` -- never a partial result
+or a half-built list, and never a tenant, subject, scope, request id,
+SQL or path in the error or the log.
+
 Caller errors are always :class:`ValueError` (invalid parameters) or the
 module's own domain exceptions; every database failure -- an unwritable
 path, an uncreatable or corrupt file, an I/O or read/write error -- is
@@ -852,6 +882,149 @@ _LEASE_MIGRATION_MESSAGE = "execution_lease_migration_failed"
 def _lease_migration_failure() -> OSError:
     """Build the single migration error callers are ever allowed to see."""
     return OSError(_LEASE_MIGRATION_MESSAGE)
+
+
+# Fixed, detail-free text for every subject/data-scope resolution failure:
+# an unreadable or unwritable store, a corrupt accepted request record, or
+# a snapshot read that cannot complete. It never embeds a tenant, a
+# subject, a scope, a request id, SQL text or a filesystem path, and a
+# half-read snapshot is never returned.
+_SCOPE_RESOLUTION_MESSAGE = "scope_resolution_failed"
+
+
+def _scope_resolution_failure() -> OSError:
+    """Build the single scope-resolution error callers ever see."""
+    return OSError(_SCOPE_RESOLUTION_MESSAGE)
+
+
+# Business scope selector grammar. A selector has exactly three shapes:
+#
+# * ``*`` -- every datum in the store (whole-data);
+# * ``<collection>*`` -- every datum of one named collection;
+# * ``<collection>:<entry>`` -- one named entry of one collection.
+#
+# Both name segments share one restricted alphabet: lower-case ASCII
+# letters, digits, underscore, dot and hyphen, with no surrounding
+# padding. Anchored with ``fullmatch``, the rule therefore rejects
+# surrounding whitespace, an interior star, a colon-star suffix, a bare
+# single-segment name and any upper-case or otherwise foreign character.
+_SCOPE_NAME_PATTERN = r"[a-z0-9_.-]+"
+_SCOPE_SELECTOR_RE = re.compile(
+    r"\*"
+    rf"|{_SCOPE_NAME_PATTERN}\*"
+    rf"|{_SCOPE_NAME_PATTERN}:{_SCOPE_NAME_PATTERN}"
+)
+
+
+def _require_scope_identity(value: object, field: str) -> str:
+    """Validate a tenant or subject for scope resolution.
+
+    Unlike the other entry points a whitespace-only string is rejected
+    here exactly like an empty or non-string value; validation never
+    depends on whether a matching record exists.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a non-blank string")
+    return value
+
+
+def _normalize_scope_selectors(raw: object) -> list[str]:
+    """Validate and canonicalize a sequence of business scope selectors.
+
+    The value must be a non-empty sequence (never a bare string, bytes
+    or mapping) of non-empty strings with no exact duplicates, and every
+    element must match the selector grammar. The normalized result keeps
+    the stronger of overlapping choices: a whole-data ``*`` dominates
+    everything else, and a whole-collection selector dominates that same
+    collection's concrete entries; the survivors are sorted by Unicode
+    code point so the resolution is identical across instances and
+    calls. Every malformed shape raises the same :class:`ValueError`
+    before storage is touched.
+    """
+    message = "scopes must be a non-empty sequence of valid selectors"
+    # Strings, bytes and mappings are iterable but are never a scope
+    # sequence; any other non-iterable is caller error just as at
+    # acceptance.
+    if isinstance(raw, (str, bytes)) or isinstance(raw, Mapping):
+        raise ValueError(message)
+    try:
+        items = list(raw)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise ValueError(message) from exc
+    if not items:
+        raise ValueError(message)
+    # None and every other non-string element share one outcome with an
+    # empty string element.
+    for item in items:
+        if not isinstance(item, str) or not item:
+            raise ValueError(message)
+    # Exact duplicates are illegal even when a stronger selector present
+    # in the same sequence would have absorbed them; reject before any
+    # collapsing.
+    if len(set(items)) != len(items):
+        raise ValueError(message)
+    for item in items:
+        if _SCOPE_SELECTOR_RE.fullmatch(item) is None:
+            raise ValueError(message)
+    # A whole-data selector dominates every other choice: once it
+    # appears nothing else survives.
+    if "*" in items:
+        return ["*"]
+    groups = {item[:-1] for item in items if item.endswith("*")}
+    normalized = [f"{collection}*" for collection in groups]
+    # A whole-collection selector dominates that collection's concrete
+    # entries; entries of collections no group names survive.
+    for item in items:
+        if item.endswith("*"):
+            continue
+        collection = item.split(":", 1)[0]
+        if collection not in groups:
+            normalized.append(item)
+    normalized.sort()
+    return normalized
+
+
+def _classify_selector(text: str) -> tuple[str, str | None, str | None] | None:
+    """Return the shape of a selector, or ``None`` for a legacy name.
+
+    The tuple is ``(kind, collection, entry)`` with ``kind`` one of
+    ``all``, ``group`` or ``entry``. A scope string an older store
+    accepted before the selector grammar existed (a non-empty free-form
+    name that matches none of the three shapes) classifies as ``None``
+    so it can only ever be covered by the whole-data selector.
+    """
+    if _SCOPE_SELECTOR_RE.fullmatch(text) is None:
+        return None
+    if text == "*":
+        return "all", None, None
+    if text.endswith("*"):
+        return "group", text[:-1], None
+    collection, entry = text.split(":", 1)
+    return "entry", collection, entry
+
+
+def _selectors_overlap(incoming_text: str, stored_text: str) -> bool:
+    """Whether an incoming selector covers a scope an earlier request named.
+
+    ``*`` covers every range (including a legacy free-form name), a
+    collection group covers the same group and that collection's
+    concrete entries, and the same concrete entry covers itself; every
+    other pairing is non-overlapping.
+    """
+    incoming = _classify_selector(incoming_text)
+    stored = _classify_selector(stored_text)
+    if incoming is None or stored is None:
+        # An unparseable legacy name is covered only by whole-data.
+        return incoming_text == "*" or stored_text == "*"
+    if incoming[0] == "all" or stored[0] == "all":
+        return True
+    if incoming[0] == "group" and stored[0] == "group":
+        return incoming[1] == stored[1]
+    if incoming[0] == "entry" and stored[0] == "entry":
+        return incoming[1] == stored[1] and incoming[2] == stored[2]
+    group = incoming if incoming[0] == "group" else stored
+    entry = stored if incoming[0] == "group" else incoming
+    return group[1] == entry[1]
 
 
 _BACKUP_CONFLICT_MESSAGE = "backup conflict"
@@ -2464,6 +2637,157 @@ class RequestStore:
             "status": row[1],
             "created_at": row[2],
         }
+
+    def resolve_scopes(
+        self,
+        tenant_id: str,
+        subject_id: str,
+        scopes: object,
+    ) -> dict[str, object]:
+        """Normalize requested data scopes and list prior-scope conflicts.
+
+        Storage-layer only; never routed over HTTP and never a health
+        command, a parsed table or a background scan. The caller
+        supplies the tenant, a subject identifier and a non-empty
+        sequence of business scope selectors; the entry reads the
+        requests the same tenant has already accepted for that same
+        subject from one consistent snapshot inside a single read-only
+        transaction and returns the normalized scopes together with the
+        conflicting earlier requests. It never creates a request,
+        changes a status, an execution record, evidence or inspection
+        bookkeeping, and never writes anything at all.
+
+        Selectors use the business selector grammar: ``*`` names every
+        datum, ``<collection>*`` names a whole collection and
+        ``<collection>:<entry>`` names one concrete entry. The two name
+        segments are joined by a colon and each segment only uses
+        lower-case letters, digits, underscore, dot and hyphen with no
+        surrounding padding. When a concrete entry and its whole
+        collection appear together the stronger whole-collection
+        choice is kept, concrete entries are sorted by Unicode code
+        point, and an exact duplicate selector is illegal. Once ``*``
+        appears no other scope survives; a whole-collection selector
+        removes that collection's entries; the normalized result is
+        stable across instances.
+
+        Conflicts only compare already-accepted requests of the same
+        tenant and same subject, returned stably by first acceptance
+        time and then request id. ``*`` conflicts with every range, a
+        collection group conflicts with the same group and with that
+        collection's entries, and an identical concrete entry conflicts
+        with itself; every other pairing is non-conflicting. A
+        conflict item carries exactly ``request_id`` and the request's
+        current ``status`` -- never a subject, a raw scope, an
+        idempotency key, a credential, SQL or a path.
+
+        The result dictionary has exactly two keys, in order:
+        ``scopes`` (the sorted list of normalized selector strings)
+        and ``conflicts`` (a list of ``{"request_id", "status"}``
+        dictionaries). Every value is a string, an integer, a boolean
+        or null; the result never contains a float, a negative zero or
+        a non-finite value, and repeated resolutions, rebuilt instances
+        and concurrent read-only calls against the same snapshot return
+        the same dictionary.
+
+        An empty, non-string or whitespace-only *tenant_id* or
+        *subject_id*, and an empty, non-sequence, null-element,
+        non-string-element, exact-duplicate or otherwise
+        illegal-selector *scopes* raise :class:`ValueError` without
+        touching storage, whether or not any record exists. A storage
+        outage, a corrupt request record or a snapshot read that cannot
+        complete raises the fixed-text :class:`OSError`
+        ``scope_resolution_failed`` -- never a partial result or a
+        half-built conflict list, and never a tenant, subject, scope,
+        request id, SQL or path in the error or the log.
+        """
+        # Validate everything before touching the database: a rejected
+        # call never reads or writes anything, and the blank-only rule
+        # applies whether or not a matching record exists.
+        tenant_id = _require_scope_identity(tenant_id, "tenant_id")
+        subject_id = _require_scope_identity(subject_id, "subject_id")
+        normalized = _normalize_scope_selectors(scopes)
+
+        if self._mem_conn is not None:
+            with self._write_lock:
+                return self._resolve_scopes(tenant_id, subject_id, normalized)
+        return self._resolve_scopes(tenant_id, subject_id, normalized)
+
+    def _resolve_scopes(
+        self,
+        tenant_id: str,
+        subject_id: str,
+        normalized: list[str],
+    ) -> dict[str, object]:
+        conn = self._connect()
+        try:
+            try:
+                # One explicit read-only transaction for the whole
+                # resolution: the subject's accepted rows are read from
+                # one consistent snapshot, so a concurrent acceptance or
+                # status advance can never contribute half a record -- a
+                # request committed before the call is stably included and
+                # one committed during it never appears early.
+                conn.execute("BEGIN")
+                try:
+                    rows = conn.execute(
+                        "SELECT request_id, status, scopes_json FROM requests "
+                        "WHERE tenant_id = ? AND subject_id = ? "
+                        "ORDER BY created_at ASC, request_id ASC",
+                        (tenant_id, subject_id),
+                    ).fetchall()
+                except BaseException:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
+                conn.execute("COMMIT")
+            except sqlite3.Error:
+                raise _scope_resolution_failure() from None
+        finally:
+            self._release(conn)
+
+        conflicts: list[dict[str, str]] = []
+        for request_id, status, stored_json in rows:
+            # Every persisted request the store itself wrote carries a
+            # non-empty id, a non-empty current status and a JSON list of
+            # non-empty scope strings; anything else is record corruption,
+            # never a row to skip or fold into a partial conflict list.
+            if (
+                not isinstance(request_id, str)
+                or not request_id
+                or not isinstance(status, str)
+                or status not in _ALLOWED_TRANSITIONS
+            ):
+                raise _scope_resolution_failure()
+            try:
+                stored_scopes = json.loads(stored_json)
+            except (TypeError, ValueError):
+                raise _scope_resolution_failure() from None
+            if (
+                not isinstance(stored_scopes, list)
+                or not stored_scopes
+                or not all(
+                    isinstance(scope, str) and scope for scope in stored_scopes
+                )
+            ):
+                raise _scope_resolution_failure()
+            if any(
+                _selectors_overlap(incoming, stored)
+                for incoming in normalized
+                for stored in stored_scopes
+            ):
+                conflicts.append({"request_id": request_id, "status": status})
+
+        result = {"scopes": normalized, "conflicts": conflicts}
+        # Log only stable counts: no tenant, subject, request id, scope
+        # value, credential, SQL or path ever reaches the log.
+        _log.info(
+            "scopes resolved scopes=%s conflicts=%s",
+            len(normalized),
+            len(conflicts),
+        )
+        return result
 
     def transition(
         self,
