@@ -405,6 +405,29 @@ corrupt accepted request record or an unreadable snapshot raises
 tenant, a subject, a scope, a policy number, SQL or a path in the
 error, the result or the log.
 
+:meth:`RequestStore.publish_policy_catalog`,
+:meth:`RequestStore.read_policy_catalog` and
+:meth:`RequestStore.audit_policy_catalogs` add storage-layer-only
+versioning for those policy catalogs. A publish freezes the ordinary
+rule catalog and the subject exception catalog -- normalized with
+exactly the retention-resolution semantics and sorted by policy
+number -- as one immutable, tenant-scoped positive-integer version
+(1, 2, 3, ...) with a UTC RFC3339 effective time. Re-publishing the
+same normalized pair replays the first version and time without
+writing; a different pair mints the next version. The version row,
+every rule row and every exception row commit in one transaction, so
+a failure never leaves a half-written version; concurrent publishes
+of the same pair land exactly once, while a concurrent publish of a
+different pair has one winner and the loser raises
+:class:`PolicyCatalogConflict`. A read returns one compact JSON line
+of the named version or the current one, and the audit returns the
+ascending version-history summaries (counts and a boolean ``current``
+marker, never subject details); both are strictly read-only and
+never repair, backfill, recompute or overwrite a version. A missing
+or cross-tenant version raises :class:`PolicyCatalogNotFound`; every
+caller-shape, not-found, conflict, corruption or commit failure
+carries the single fixed text ``policy_catalog_failed``.
+
 Caller errors are always :class:`ValueError` (invalid parameters) or the
 module's own domain exceptions; every database failure -- an unwritable
 path, an uncreatable or corrupt file, an I/O or read/write error -- is
@@ -443,6 +466,8 @@ __all__ = [
     "AuditInspectionNotFound",
     "AuditBundleUnavailable",
     "BackupConflict",
+    "PolicyCatalogConflict",
+    "PolicyCatalogNotFound",
 ]
 
 _log = logging.getLogger(__name__)
@@ -532,6 +557,28 @@ class AuditBundleUnavailable(Exception):
     evidence is damaged or untrusted. The fixed message never
     identifies which condition applied, and no bundle text -- complete
     or partial -- is ever produced on this path.
+    """
+
+
+class PolicyCatalogConflict(Exception):
+    """Raised when a concurrent different catalog publish wins.
+
+    Two concurrent publishes for one tenant can only mint one new
+    version: the first differing catalog commits and takes the next
+    version, and every losing caller observes this single, detail-free
+    outcome rather than a second version. A repeated publish of the
+    same normalized catalog is not a conflict -- it replays the first
+    version and its first effective time.
+    """
+
+
+class PolicyCatalogNotFound(Exception):
+    """Raised when no catalog version visible to the tenant matches.
+
+    A read or audit names a version that was never issued for the
+    tenant or that belongs to another tenant; both share one
+    detail-free outcome, so another tenant's catalog versions can
+    never be probed.
     """
 
 
@@ -858,6 +905,83 @@ _ANCHOR_KEY_FINGERPRINT_INDEX = """
 CREATE UNIQUE INDEX IF NOT EXISTS idx_anchor_key_fingerprint
     ON anchor_key_generations(key_fingerprint);
 """
+
+# Versioned policy catalogs, one row per issued version of a tenant.
+# Versions are the positive integers 1, 2, 3, ... per tenant and are
+# append-only: a row is inserted once and never updated or deleted, so a
+# published version is read-only for the lifetime of the file. The
+# normalized ordinary-rule and subject-exception catalogs are frozen as
+# canonical compact JSON at publish time, so rule order, exception order
+# and every reason text are reproduced byte-stably without ever being
+# re-derived or repaired on read. A whole tenant history -- version rows,
+# rule rows and exception rows -- always commits in one transaction.
+_POLICY_CATALOG_TABLE = """
+CREATE TABLE IF NOT EXISTS policy_catalog_versions (
+    tenant_id       TEXT NOT NULL,
+    version         INTEGER NOT NULL,
+    effective_at    TEXT NOT NULL,
+    rules_json      TEXT NOT NULL,
+    exceptions_json TEXT NOT NULL,
+    rule_count      INTEGER NOT NULL,
+    exception_count INTEGER NOT NULL,
+    PRIMARY KEY (tenant_id, version)
+);
+"""
+
+# One row per ordinary rule of each issued version, carrying the rule's
+# stable position within the normalized rule list. The rows exist solely
+# so a version can be reconstructed strictly read-only; the canonical
+# JSON on the version row stays authoritative for the rendered order.
+_POLICY_CATALOG_RULE_TABLE = """
+CREATE TABLE IF NOT EXISTS policy_catalog_rules (
+    tenant_id    TEXT NOT NULL,
+    version      INTEGER NOT NULL,
+    position     INTEGER NOT NULL,
+    policy_id    TEXT NOT NULL,
+    selector     TEXT NOT NULL,
+    days         INTEGER NOT NULL,
+    reason       TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, version, position)
+);
+"""
+
+# One row per subject exception of each issued version, in the same
+# append-only, position-stable shape as the ordinary-rule table.
+_POLICY_CATALOG_EXCEPTION_TABLE = """
+CREATE TABLE IF NOT EXISTS policy_catalog_exceptions (
+    tenant_id    TEXT NOT NULL,
+    version      INTEGER NOT NULL,
+    position     INTEGER NOT NULL,
+    policy_id    TEXT NOT NULL,
+    subject_id   TEXT NOT NULL,
+    selector     TEXT NOT NULL,
+    days         INTEGER NOT NULL,
+    reason       TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, version, position)
+);
+"""
+
+# Policy-number lookup for one version's two catalogs; never used to
+# reorder anything, only to back a read-time integrity cross-check.
+_POLICY_CATALOG_RULE_ID_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_policy_catalog_rules_id
+    ON policy_catalog_rules(tenant_id, version, policy_id);
+"""
+_POLICY_CATALOG_EXCEPTION_ID_INDEX = """
+CREATE INDEX IF NOT EXISTS idx_policy_catalog_exceptions_id
+    ON policy_catalog_exceptions(tenant_id, version, policy_id);
+"""
+
+# Fixed, detail-free text for every policy-catalog entry failure. It is
+# shared by caller-shape ValueErrors, the not-found/conflict domain
+# exceptions and storage OSErrors, so the outcome never leaks which
+# condition applied nor any tenant, subject, policy, SQL or path.
+_POLICY_CATALOG_MESSAGE = "policy_catalog_failed"
+
+
+def _policy_catalog_failure() -> OSError:
+    """Build the single policy-catalog storage error callers see."""
+    return OSError(_POLICY_CATALOG_MESSAGE)
 
 # Column probes used to upgrade database files created before chain
 # hashes existed. The upgrade is purely additive (nullable columns plus a
@@ -1218,6 +1342,150 @@ def _validate_retention_exceptions(
     return validated
 
 
+def _normalize_policy_catalogs(
+    raw_rules: object,
+    raw_exceptions: object,
+) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    """Validate and normalize the two catalogs of one publish.
+
+    The domain validation is exactly the retention resolution's: the
+    ordinary rules need the whole-data ``*`` default and the exception
+    policy numbers must be disjoint from the rule numbers, so a
+    versioned catalog resolves identically whether it is passed to
+    :meth:`RequestStore.resolve_retention` directly or read back from
+    an issued version. The validated mappings are frozen into lists
+    sorted by policy number Unicode code point; rule priority and the
+    passing order never influence the stored order, and every reason
+    text is kept verbatim. Every malformed shape raises
+    :class:`ValueError` carrying the fixed
+    ``policy_catalog_failed`` text before storage is touched.
+    """
+    try:
+        rules_map = _validate_retention_rules(raw_rules)
+        exceptions_map = _validate_retention_exceptions(
+            raw_exceptions, rules_map.keys()
+        )
+    except ValueError:
+        raise ValueError(_POLICY_CATALOG_MESSAGE) from None
+    rules: list[dict[str, object]] = [
+        {
+            "policy_id": policy_id,
+            "selector": selector,
+            "days": days,
+            "reason": reason,
+        }
+        for policy_id, (selector, days, reason) in sorted(rules_map.items())
+    ]
+    exceptions: list[dict[str, object]] = [
+        {
+            "policy_id": policy_id,
+            "subject": subject,
+            "selector": selector,
+            "days": days,
+            "reason": reason,
+        }
+        for policy_id, (
+            subject,
+            selector,
+            days,
+            reason,
+        ) in sorted(exceptions_map.items())
+    ]
+    return rules, exceptions
+
+
+def _canonical_policy_json(payload: object) -> str:
+    """Render a normalized catalog list as its canonical compact JSON."""
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _require_policy_version(value: object) -> int:
+    """Validate a catalog version: a non-boolean positive integer."""
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValueError(_POLICY_CATALOG_MESSAGE)
+    return value
+
+
+_POLICY_RULE_ENTRY_KEYS = frozenset({"policy_id", "selector", "days", "reason"})
+_POLICY_EXCEPTION_ENTRY_KEYS = frozenset(
+    {"policy_id", "subject", "selector", "days", "reason"}
+)
+
+
+def _parse_policy_rule_entries(raw: object) -> list[dict[str, object]]:
+    """Parse a stored rules JSON column back into normalized entries."""
+    if not isinstance(raw, list):
+        raise _policy_catalog_failure()
+    entries: list[dict[str, object]] = []
+    for item in raw:
+        if not isinstance(item, Mapping) or set(item) != _POLICY_RULE_ENTRY_KEYS:
+            raise _policy_catalog_failure()
+        policy_id = item["policy_id"]
+        selector = item["selector"]
+        days = item["days"]
+        reason = item["reason"]
+        if (
+            not isinstance(policy_id, str)
+            or not policy_id
+            or not isinstance(selector, str)
+            or _SCOPE_SELECTOR_RE.fullmatch(selector) is None
+            or not isinstance(days, int)
+            or isinstance(days, bool)
+            or days < 0
+            or not isinstance(reason, str)
+            or not reason
+        ):
+            raise _policy_catalog_failure()
+        entries.append(
+            {
+                "policy_id": policy_id,
+                "selector": selector,
+                "days": days,
+                "reason": reason,
+            }
+        )
+    return entries
+
+
+def _parse_policy_exception_entries(raw: object) -> list[dict[str, object]]:
+    """Parse a stored exceptions JSON column into normalized entries."""
+    if not isinstance(raw, list):
+        raise _policy_catalog_failure()
+    entries: list[dict[str, object]] = []
+    for item in raw:
+        if not isinstance(item, Mapping) or set(item) != _POLICY_EXCEPTION_ENTRY_KEYS:
+            raise _policy_catalog_failure()
+        policy_id = item["policy_id"]
+        subject = item["subject"]
+        selector = item["selector"]
+        days = item["days"]
+        reason = item["reason"]
+        if (
+            not isinstance(policy_id, str)
+            or not policy_id
+            or not isinstance(subject, str)
+            or not subject.strip()
+            or not isinstance(selector, str)
+            or _SCOPE_SELECTOR_RE.fullmatch(selector) is None
+            or not isinstance(days, int)
+            or isinstance(days, bool)
+            or days < 0
+            or not isinstance(reason, str)
+            or not reason
+        ):
+            raise _policy_catalog_failure()
+        entries.append(
+            {
+                "policy_id": policy_id,
+                "subject": subject,
+                "selector": selector,
+                "days": days,
+                "reason": reason,
+            }
+        )
+    return entries
+
+
 _BACKUP_CONFLICT_MESSAGE = "backup conflict"
 
 # Every table the schema creates. A snapshot missing any of them is not
@@ -1239,6 +1507,9 @@ _BACKUP_TABLES = frozenset({
     "audit_anchors",
     "audit_anchor_meta",
     "anchor_key_generations",
+    "policy_catalog_versions",
+    "policy_catalog_rules",
+    "policy_catalog_exceptions",
 })
 
 
@@ -2414,6 +2685,11 @@ class RequestStore:
                 conn.execute(_ANCHOR_META_TABLE)
                 conn.execute(_ANCHOR_KEY_TABLE)
                 conn.execute(_ANCHOR_KEY_FINGERPRINT_INDEX)
+                conn.execute(_POLICY_CATALOG_TABLE)
+                conn.execute(_POLICY_CATALOG_RULE_TABLE)
+                conn.execute(_POLICY_CATALOG_EXCEPTION_TABLE)
+                conn.execute(_POLICY_CATALOG_RULE_ID_INDEX)
+                conn.execute(_POLICY_CATALOG_EXCEPTION_ID_INDEX)
                 self._migrate_schema(conn)
                 self._migrate_anchor_generation_column(conn)
             except sqlite3.Error:
@@ -3212,6 +3488,595 @@ class RequestStore:
             len(hit_exceptions),
         )
         return result
+
+    # ------------------------------------------------------------------
+    # Versioned policy catalogs (storage-layer only)
+    # ------------------------------------------------------------------
+
+    def publish_policy_catalog(
+        self,
+        tenant_id: str,
+        rules: object,
+        exceptions: object,
+    ) -> dict[str, object]:
+        """Publish one immutable version of a tenant's policy catalogs.
+
+        Storage-layer only; never routed over HTTP and never a health
+        command. The caller supplies the tenant, the ordinary rule
+        catalog and the subject exception catalog; both catalogs are
+        validated and normalized with exactly the retention-resolution
+        semantics (the mandatory whole-data ``*`` default rule,
+        non-boolean non-negative day counts, non-empty reasons, policy
+        numbers unique across both catalogs, rule priority and order
+        independent of passing order) before storage is touched.
+
+        Versions are the positive integers 1, 2, 3, ... per tenant,
+        append-only and read-only. Publishing the same normalized
+        catalog pair again replays the first version and its first
+        effective time without writing anything; a different pair
+        mints the next version with a fresh UTC RFC3339 effective
+        time. The version row, every rule row and every exception row
+        commit in one transaction, so a failed commit can never leave
+        a half-written version. Concurrent publishes of the same pair
+        land exactly one version and every caller observes it; when
+        concurrent publishes carry different pairs only one wins and
+        the loser raises :class:`PolicyCatalogConflict`.
+
+        The result carries exactly ``version`` (a positive int) and
+        ``effective_at`` (the UTC RFC3339 time the reused or winning
+        version first became effective). An invalid tenant or an
+        invalid catalog shape raises :class:`ValueError` without
+        writing; corrupt catalog records or a failed commit raise the
+        fixed-text :class:`OSError` ``policy_catalog_failed``.
+        """
+        try:
+            tenant_id = _require_scope_identity(tenant_id, "tenant_id")
+        except ValueError:
+            raise ValueError(_POLICY_CATALOG_MESSAGE) from None
+        normalized_rules, normalized_exceptions = _normalize_policy_catalogs(
+            rules, exceptions
+        )
+        rules_json = _canonical_policy_json(normalized_rules)
+        exceptions_json = _canonical_policy_json(normalized_exceptions)
+        if self._mem_conn is not None:
+            # One shared connection: hold the instance lock across both
+            # phases so two threads can never interleave transactions
+            # (the second BEGIN would otherwise raise on the first).
+            with self._write_lock:
+                return self._publish_policy_catalog(
+                    tenant_id,
+                    normalized_rules,
+                    normalized_exceptions,
+                    rules_json,
+                    exceptions_json,
+                )
+        return self._publish_policy_catalog(
+            tenant_id,
+            normalized_rules,
+            normalized_exceptions,
+            rules_json,
+            exceptions_json,
+        )
+
+    def _publish_policy_catalog(
+        self,
+        tenant_id: str,
+        normalized_rules: list[dict[str, object]],
+        normalized_exceptions: list[dict[str, object]],
+        rules_json: str,
+        exceptions_json: str,
+    ) -> dict[str, object]:
+        """Validate-then-insert publish; caller holds the lock in-memory."""
+        # Phase 1: an unlocked read snapshot records the tenant's
+        # current versions and the max version. A concurrent publisher
+        # can land a version between this snapshot and phase 2; phase 2
+        # re-probes inside its reserved write transaction and resolves
+        # that race (replay or conflict).
+        conn = self._connect()
+        try:
+            try:
+                conn.execute("BEGIN")
+                snapshot = self._load_policy_versions_locked(conn, tenant_id)
+                conn.execute("COMMIT")
+            except sqlite3.Error:
+                self._rollback_quietly(conn)
+                raise _policy_catalog_failure() from None
+            except OSError:
+                self._rollback_quietly(conn)
+                raise
+        finally:
+            self._release(conn)
+        for (
+            version,
+            effective_at,
+            stored_rules_json,
+            stored_exceptions_json,
+            _r,
+            _e,
+        ) in snapshot:
+            if (
+                stored_rules_json == rules_json
+                and stored_exceptions_json == exceptions_json
+            ):
+                _log.info(
+                    "policy catalog publish reused version=%s",
+                    version,
+                )
+                return {"version": version, "effective_at": effective_at}
+        base_version = snapshot[-1][0] if snapshot else 0
+
+        # Phase 2: on a file-backed store only the reserved write
+        # transaction is serialized, so two in-process publishers that
+        # read the same snapshot race deterministically at the version
+        # slot; the in-memory store is already serialized by the caller.
+        def _phase() -> dict[str, object]:
+            write_conn = self._connect()
+            try:
+                try:
+                    write_conn.execute("BEGIN IMMEDIATE")
+                except sqlite3.Error:
+                    raise _policy_catalog_failure() from None
+                try:
+                    published = self._publish_policy_catalog_locked(
+                        write_conn,
+                        tenant_id,
+                        normalized_rules,
+                        normalized_exceptions,
+                        rules_json,
+                        exceptions_json,
+                        base_version,
+                    )
+                    write_conn.execute("COMMIT")
+                except (PolicyCatalogConflict, OSError):
+                    self._rollback_quietly(write_conn)
+                    raise
+                except sqlite3.IntegrityError:
+                    # Another process sharing the file won the same
+                    # version slot: resolve strictly read-only.
+                    self._rollback_quietly(write_conn)
+                    published = self._resolve_lost_policy_publish_race(
+                        write_conn,
+                        tenant_id,
+                        rules_json,
+                        exceptions_json,
+                    )
+                except sqlite3.Error:
+                    self._rollback_quietly(write_conn)
+                    raise _policy_catalog_failure() from None
+            finally:
+                self._release(write_conn)
+            return published
+
+        if self._mem_conn is not None:
+            result = _phase()
+        else:
+            with self._write_lock:
+                result = _phase()
+        _log.info(
+            "policy catalog published version=%s rules=%s exceptions=%s",
+            result["version"],
+            len(normalized_rules),
+            len(normalized_exceptions),
+        )
+        return result
+
+    def _publish_policy_catalog_locked(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        rules: list[dict[str, object]],
+        exceptions: list[dict[str, object]],
+        rules_json: str,
+        exceptions_json: str,
+        base_version: int,
+    ) -> dict[str, object]:
+        """Insert the next catalog version inside a reserved write tx."""
+        current = self._load_policy_versions_locked(conn, tenant_id)
+        latest = current[-1][0] if current else 0
+        # A newer version landed after the phase-1 snapshot: either it
+        # carries this exact pair (replay) or the caller lost the
+        # concurrent publish race for the next slot (conflict).
+        if latest != base_version:
+            for (
+                version,
+                effective_at,
+                stored_rules_json,
+                stored_exceptions_json,
+                _r,
+                _e,
+            ) in current:
+                if (
+                    stored_rules_json == rules_json
+                    and stored_exceptions_json == exceptions_json
+                ):
+                    return {"version": version, "effective_at": effective_at}
+            raise PolicyCatalogConflict(_POLICY_CATALOG_MESSAGE)
+        next_version = latest + 1
+        effective_at = _utc_now_rfc3339()
+        conn.execute(
+            "INSERT INTO policy_catalog_versions ("
+            "tenant_id, version, effective_at, rules_json, exceptions_json, "
+            "rule_count, exception_count"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                tenant_id,
+                next_version,
+                effective_at,
+                rules_json,
+                exceptions_json,
+                len(rules),
+                len(exceptions),
+            ),
+        )
+        for position, entry in enumerate(rules):
+            conn.execute(
+                "INSERT INTO policy_catalog_rules ("
+                "tenant_id, version, position, policy_id, selector, days, reason"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    tenant_id,
+                    next_version,
+                    position,
+                    entry["policy_id"],
+                    entry["selector"],
+                    entry["days"],
+                    entry["reason"],
+                ),
+            )
+        for position, entry in enumerate(exceptions):
+            conn.execute(
+                "INSERT INTO policy_catalog_exceptions ("
+                "tenant_id, version, position, policy_id, subject_id, "
+                "selector, days, reason"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    tenant_id,
+                    next_version,
+                    position,
+                    entry["policy_id"],
+                    entry["subject"],
+                    entry["selector"],
+                    entry["days"],
+                    entry["reason"],
+                ),
+            )
+        return {"version": next_version, "effective_at": effective_at}
+
+    def _resolve_lost_policy_publish_race(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        rules_json: str,
+        exceptions_json: str,
+    ) -> dict[str, object]:
+        """Replay or conflict after another process won the insert race."""
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            current = self._load_policy_versions_locked(conn, tenant_id)
+            conn.execute("COMMIT")
+        except (OSError, sqlite3.Error):
+            self._rollback_quietly(conn)
+            raise _policy_catalog_failure() from None
+        for (
+            version,
+            effective_at,
+            stored_rules_json,
+            stored_exceptions_json,
+            _r,
+            _e,
+        ) in current:
+            if (
+                stored_rules_json == rules_json
+                and stored_exceptions_json == exceptions_json
+            ):
+                return {"version": version, "effective_at": effective_at}
+        raise PolicyCatalogConflict(_POLICY_CATALOG_MESSAGE)
+
+    def _load_policy_versions_locked(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+    ) -> list[tuple[int, str, str, str, list[dict[str, object]], list[dict[str, object]]]]:
+        """Load and integrity-check every catalog version of a tenant.
+
+        Versions must be the contiguous positive integers 1..N, each
+        with a non-empty UTC effective time, consistent counts, a
+        parseable canonical catalog pair that includes the whole-data
+        default rule, disjoint policy numbers and rule/exception child
+        rows matching the frozen JSON position by position. Any
+        deviation is catalog corruption and the fixed-text
+        :class:`OSError` is raised; nothing is ever repaired.
+        """
+        try:
+            rows = conn.execute(
+                "SELECT version, effective_at, rules_json, exceptions_json, "
+                "rule_count, exception_count FROM policy_catalog_versions "
+                "WHERE tenant_id = ? ORDER BY version ASC",
+                (tenant_id,),
+            ).fetchall()
+        except sqlite3.Error:
+            raise _policy_catalog_failure() from None
+        loaded: list[
+            tuple[int, str, str, str, list[dict[str, object]], list[dict[str, object]]]
+        ] = []
+        seen_catalog_pairs: set[tuple[str, str]] = set()
+        for expected, row in enumerate(rows, start=1):
+            version, effective_at, rules_json, exceptions_json, rule_count, exc_count = row
+            if (
+                not isinstance(version, int)
+                or isinstance(version, bool)
+                or version != expected
+                or not isinstance(effective_at, str)
+                or _RFC3339_RE.match(effective_at) is None
+                or not isinstance(rule_count, int)
+                or isinstance(rule_count, bool)
+                or rule_count < 1
+                or not isinstance(exc_count, int)
+                or isinstance(exc_count, bool)
+                or exc_count < 0
+            ):
+                raise _policy_catalog_failure()
+            try:
+                parsed_rules_raw = json.loads(rules_json)
+                parsed_exceptions_raw = json.loads(exceptions_json)
+            except (TypeError, ValueError):
+                raise _policy_catalog_failure() from None
+            rule_entries = _parse_policy_rule_entries(parsed_rules_raw)
+            exception_entries = _parse_policy_exception_entries(
+                parsed_exceptions_raw
+            )
+            if len(rule_entries) != rule_count or len(exception_entries) != exc_count:
+                raise _policy_catalog_failure()
+            if not any(entry["selector"] == "*" for entry in rule_entries):
+                raise _policy_catalog_failure()
+            rule_ids = [entry["policy_id"] for entry in rule_entries]
+            exception_ids = [entry["policy_id"] for entry in exception_entries]
+            if len(set(rule_ids)) != len(rule_ids):
+                raise _policy_catalog_failure()
+            if len(set(exception_ids)) != len(exception_ids):
+                raise _policy_catalog_failure()
+            if set(rule_ids) & set(exception_ids):
+                raise _policy_catalog_failure()
+            # Re-render the parsed entries: the frozen columns must
+            # already be canonical normalized text, never something a
+            # read would silently have to reformat.
+            if _canonical_policy_json(rule_entries) != rules_json:
+                raise _policy_catalog_failure()
+            if _canonical_policy_json(exception_entries) != exceptions_json:
+                raise _policy_catalog_failure()
+            # An identical catalog pair is always replayed, never issued
+            # twice, so two versions carrying the same pair are corrupt
+            # duplicate versions; the same rules with different subject
+            # exceptions is a legitimate new version.
+            pair_key = (rules_json, exceptions_json)
+            if pair_key in seen_catalog_pairs:
+                raise _policy_catalog_failure()
+            seen_catalog_pairs.add(pair_key)
+            self._verify_policy_child_rows_locked(
+                conn,
+                tenant_id,
+                version,
+                "policy_catalog_rules",
+                ("policy_id", "selector", "days", "reason"),
+                rule_entries,
+            )
+            self._verify_policy_child_rows_locked(
+                conn,
+                tenant_id,
+                version,
+                "policy_catalog_exceptions",
+                ("policy_id", "selector", "days", "reason", "subject_id"),
+                [
+                    {
+                        "policy_id": entry["policy_id"],
+                        "selector": entry["selector"],
+                        "days": entry["days"],
+                        "reason": entry["reason"],
+                        "subject_id": entry["subject"],
+                    }
+                    for entry in exception_entries
+                ],
+            )
+            loaded.append(
+                (
+                    version,
+                    effective_at,
+                    rules_json,
+                    exceptions_json,
+                    rule_entries,
+                    exception_entries,
+                )
+            )
+        return loaded
+
+    @staticmethod
+    def _verify_policy_child_rows_locked(
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        version: int,
+        table: str,
+        columns: tuple[str, ...],
+        entries: list[dict[str, object]],
+    ) -> None:
+        """Compare one version's child table with its frozen JSON list."""
+        # The table names are module constants, never caller input.
+        try:
+            child_rows = conn.execute(
+                f"SELECT position, {', '.join(columns)} FROM {table} "
+                "WHERE tenant_id = ? AND version = ? ORDER BY position ASC",
+                (tenant_id, version),
+            ).fetchall()
+        except sqlite3.Error:
+            raise _policy_catalog_failure() from None
+        if len(child_rows) != len(entries):
+            raise _policy_catalog_failure()
+        for position, row in enumerate(child_rows):
+            stored_position = row[0]
+            values = row[1:]
+            if (
+                not isinstance(stored_position, int)
+                or isinstance(stored_position, bool)
+                or stored_position != position
+            ):
+                raise _policy_catalog_failure()
+            expected = tuple(entries[position][column] for column in columns)
+            if tuple(values) != expected:
+                raise _policy_catalog_failure()
+
+    def read_policy_catalog(
+        self,
+        tenant_id: str,
+        version: int | None = None,
+    ) -> str:
+        """Return one published catalog version as one compact JSON line.
+
+        Storage-layer only; never routed over HTTP and never a health
+        command. The read is strictly read-only: it never repairs,
+        backfills, recomputes or overwrites a version and never
+        changes request state, execution records or the audit chain.
+        With *version* omitted the current (highest) version is read;
+        an explicit version must be a non-boolean positive integer
+        issued for this tenant. The result is one compact JSON line
+        with exactly one trailing newline, holding, in order,
+        ``tenant_id``, ``version``, ``effective_at``, ``rules`` and
+        ``exceptions``: the rules are the normalized ordinary-rule
+        entries (``policy_id``, ``selector``, ``days``, ``reason``) in
+        normalized order and the exceptions the normalized
+        subject-exception entries (``policy_id``, ``subject``,
+        ``selector``, ``days``, ``reason``) in normalized order, every
+        reason text kept verbatim. Empty collections are empty arrays;
+        the line never contains a float, a negative zero or a
+        non-finite number.
+
+        An invalid tenant or version raises :class:`ValueError`
+        without touching storage; a version that is missing or owned
+        by another tenant raises :class:`PolicyCatalogNotFound` with
+        one detail-free outcome (asking an unknown tenant and an
+        unknown version are indistinguishable). Corrupt catalog
+        records or an unreadable store raise the fixed-text
+        :class:`OSError` ``policy_catalog_failed``.
+        """
+        try:
+            tenant_id = _require_scope_identity(tenant_id, "tenant_id")
+        except ValueError:
+            raise ValueError(_POLICY_CATALOG_MESSAGE) from None
+        if version is not None:
+            version = _require_policy_version(version)
+        if self._mem_conn is not None:
+            with self._write_lock:
+                return self._read_policy_catalog(tenant_id, version)
+        return self._read_policy_catalog(tenant_id, version)
+
+    def _read_policy_catalog(
+        self,
+        tenant_id: str,
+        version: int | None,
+    ) -> str:
+        conn = self._connect()
+        try:
+            try:
+                conn.execute("BEGIN")
+                loaded = self._load_policy_versions_locked(conn, tenant_id)
+                if version is None:
+                    selected = loaded[-1] if loaded else None
+                else:
+                    selected = next(
+                        (entry for entry in loaded if entry[0] == version),
+                        None,
+                    )
+                conn.execute("COMMIT")
+            except sqlite3.Error:
+                self._rollback_quietly(conn)
+                raise _policy_catalog_failure() from None
+            except OSError:
+                self._rollback_quietly(conn)
+                raise
+        finally:
+            self._release(conn)
+        if selected is None:
+            raise PolicyCatalogNotFound(_POLICY_CATALOG_MESSAGE)
+        result_version, effective_at, _rj, _ej, rule_entries, exception_entries = selected
+        payload = {
+            "tenant_id": tenant_id,
+            "version": result_version,
+            "effective_at": effective_at,
+            "rules": rule_entries,
+            "exceptions": exception_entries,
+        }
+        _log.info(
+            "policy catalog read version=%s rules=%s exceptions=%s",
+            result_version,
+            len(rule_entries),
+            len(exception_entries),
+        )
+        return (
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+        )
+
+    def audit_policy_catalogs(self, tenant_id: str) -> str:
+        """Return the read-only version history summary of one tenant.
+
+        Storage-layer only; never routed over HTTP and never a health
+        command. The audit is strictly read-only: it never repairs,
+        backfills, recomputes or overwrites a version and never
+        changes request state, execution records or the audit chain.
+        The result is one compact JSON line with exactly one trailing
+        newline holding, in order, ``tenant_id`` and ``versions``;
+        each summary item is ordered by ascending version number and
+        carries exactly ``version``, ``effective_at`` (UTC RFC3339),
+        ``rule_count``, ``exception_count`` (non-negative integers)
+        and ``current`` (a boolean: true only for the tenant's
+        highest version, false for every superseded one). No subject
+        details, selectors, reasons or day counts are included; a
+        tenant with no published versions gets an empty array. The
+        line never contains a float, a negative zero or a non-finite
+        number, and the status stays a boolean.
+
+        An invalid tenant raises :class:`ValueError` without touching
+        storage; corrupt catalog records or an unreadable store raise
+        the fixed-text :class:`OSError` ``policy_catalog_failed``.
+        """
+        try:
+            tenant_id = _require_scope_identity(tenant_id, "tenant_id")
+        except ValueError:
+            raise ValueError(_POLICY_CATALOG_MESSAGE) from None
+        if self._mem_conn is not None:
+            with self._write_lock:
+                return self._audit_policy_catalogs(tenant_id)
+        return self._audit_policy_catalogs(tenant_id)
+
+    def _audit_policy_catalogs(self, tenant_id: str) -> str:
+        conn = self._connect()
+        try:
+            try:
+                conn.execute("BEGIN")
+                loaded = self._load_policy_versions_locked(conn, tenant_id)
+                conn.execute("COMMIT")
+            except sqlite3.Error:
+                self._rollback_quietly(conn)
+                raise _policy_catalog_failure() from None
+            except OSError:
+                self._rollback_quietly(conn)
+                raise
+        finally:
+            self._release(conn)
+        latest = loaded[-1][0] if loaded else None
+        summaries = [
+            {
+                "version": version,
+                "effective_at": effective_at,
+                "rule_count": len(rule_entries),
+                "exception_count": len(exception_entries),
+                "current": version == latest,
+            }
+            for version, effective_at, _rj, _ej, rule_entries, exception_entries in loaded
+        ]
+        payload = {"tenant_id": tenant_id, "versions": summaries}
+        _log.info(
+            "policy catalog audit versions=%s",
+            len(summaries),
+        )
+        return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
 
     def transition(
         self,
