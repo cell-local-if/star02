@@ -1100,6 +1100,14 @@ def _require_retention_catalog_version(value: object) -> int:
     return value
 
 
+# The two exclusive catalog sources the retention entries accept: the
+# call-time catalog input versus one published, immutable version read
+# from the store. These words are the trace's only source labels; they
+# are business evidence, never a filesystem path or SQL text.
+_RETENTION_SOURCE_CALL_TIME = "call_time"
+_RETENTION_SOURCE_PUBLISHED_VERSION = "published_version"
+
+
 # Fixed, detail-free text for every policy-catalog versioning failure:
 # a null, wrongly typed or out-of-range tenant, catalog or version, an
 # unreadable or unwritable store, a duplicate version, a corrupt catalog
@@ -1479,6 +1487,121 @@ def _validate_retention_exceptions(
         reason = _require_retention_text(exception["reason"])
         validated[policy_id] = (subject, selector, days, reason)
     return validated
+
+
+def _decide_retention_scopes(
+    normalized: list[str],
+    subject_id: str,
+    rules: dict[str, tuple[str, int, str]],
+    exceptions: dict[str, tuple[str, str, int, str]],
+) -> tuple[
+    list[dict[str, object]], int, str, str, bool, list[dict[str, object]]
+]:
+    """Resolve every normalized scope and the aggregate verdict.
+
+    Returns ``(scope_evidence, retention_days, policy_id, reason,
+    is_exception, hit_exceptions)``: one evidence item per normalized
+    scope plus the aggregate fields exactly as retention resolution
+    reports them. ``scope_evidence`` items hold, in order, ``scope`` (the
+    normalized scope), ``level`` (the matched selector's ``entry``/
+    ``group``/``all`` level), ``policy_id``, ``exception`` (whether a
+    subject exception won) and ``retention_days``. ``is_exception``
+    marks the single aggregate winner that determined the maximum.
+
+    A candidate orders by ``(precedence, policy number)`` and the min
+    wins, so catalog passing order never influences a scope: a hit
+    subject exception beats every ordinary rule, a concrete-entry
+    selector beats a whole-collection selector, which beats the
+    whole-data default, and ties inside one level break on the policy
+    number's Unicode code point. The effective retention is the largest
+    day count any scope resolved to; on a cross-scope tie the first
+    scope in normalized scope order keeps the winning policy number and
+    reason. Each hit exception is also recorded for the aggregate's
+    exception list in normalized scope order.
+    """
+    scope_evidence: list[dict[str, object]] = []
+    best_days: int | None = None
+    best_policy_id = ""
+    best_reason = ""
+    best_is_exception = False
+    hit_exceptions: list[dict[str, object]] = []
+    for scope in normalized:
+        # A candidate is (precedence, policy number, days, reason,
+        # is_exception, level); the winner of one catalog is the min by
+        # (precedence, policy number), so the passing order of the
+        # catalog never influences the outcome.
+        winner: tuple[int, str, int, str, bool, str] | None = None
+        for policy_id, (bound_subject, selector, days, reason) in (
+            exceptions.items()
+        ):
+            if bound_subject != subject_id:
+                continue
+            if not _selector_covers(selector, scope):
+                continue
+            level = _classify_selector(selector)[0]
+            candidate = (
+                _SELECTOR_PRECEDENCE[level],
+                policy_id,
+                days,
+                reason,
+                True,
+                level,
+            )
+            if winner is None or candidate[:2] < winner[:2]:
+                winner = candidate
+        if winner is None:
+            for policy_id, (selector, days, reason) in rules.items():
+                if not _selector_covers(selector, scope):
+                    continue
+                level = _classify_selector(selector)[0]
+                candidate = (
+                    _SELECTOR_PRECEDENCE[level],
+                    policy_id,
+                    days,
+                    reason,
+                    False,
+                    level,
+                )
+                if winner is None or candidate[:2] < winner[:2]:
+                    winner = candidate
+        # The mandatory whole-data default rule covers every scope, so a
+        # winner always exists.
+        _, policy_id, days, reason, is_exception, level = winner
+        scope_evidence.append(
+            {
+                "scope": scope,
+                "level": level,
+                "policy_id": policy_id,
+                "exception": is_exception,
+                "retention_days": days,
+            }
+        )
+        if is_exception:
+            hit_exceptions.append(
+                {
+                    "subject": subject_id,
+                    "scope": scope,
+                    "retention_days": days,
+                    "reason": reason,
+                }
+            )
+        # The effective retention is the largest day count any scope
+        # resolved to; the first scope reaching the maximum keeps the
+        # winning policy number, the decision reason and its exception
+        # marker (a strict comparison never lets a later tie replace it).
+        if best_days is None or days > best_days:
+            best_days = days
+            best_policy_id = policy_id
+            best_reason = reason
+            best_is_exception = is_exception
+    return (
+        scope_evidence,
+        best_days,
+        best_policy_id,
+        best_reason,
+        best_is_exception,
+        hit_exceptions,
+    )
 
 
 _BACKUP_CONFLICT_MESSAGE = "backup conflict"
@@ -3343,7 +3466,64 @@ class RequestStore:
         """
         # Validate everything before touching the database: a rejected
         # call never reads or writes anything, and every validation
-        # failure carries the same fixed text.
+        # failure carries the same fixed text. The aggregate decision and
+        # its read-only trace share exactly one validation contract.
+        (
+            tenant_id,
+            subject_id,
+            normalized,
+            validated_rules,
+            validated_exceptions,
+            version,
+        ) = self._prepare_retention_inputs(
+            tenant_id, subject_id, scopes, rules, exceptions, version
+        )
+
+        if self._mem_conn is not None:
+            with self._write_lock:
+                return self._resolve_retention(
+                    tenant_id,
+                    subject_id,
+                    normalized,
+                    validated_rules,
+                    validated_exceptions,
+                    version,
+                )
+        return self._resolve_retention(
+            tenant_id,
+            subject_id,
+            normalized,
+            validated_rules,
+            validated_exceptions,
+            version,
+        )
+
+    @staticmethod
+    def _prepare_retention_inputs(
+        tenant_id: object,
+        subject_id: object,
+        scopes: object,
+        rules: object,
+        exceptions: object,
+        version: object,
+    ) -> tuple[
+        str,
+        str,
+        list[str],
+        dict[str, tuple[str, int, str]] | None,
+        dict[str, tuple[str, str, int, str]] | None,
+        int | None,
+    ]:
+        """Validate one retention call before storage is touched.
+
+        The aggregate decision and its read-only trace share this one
+        contract: non-blank string tenant and subject, an ordered
+        sequence of valid selectors, and exactly one catalog source --
+        the two call-time catalogs together or one non-boolean positive
+        published version alone. Every rejection carries the fixed
+        retention text, and a rejected call never reads or writes
+        anything.
+        """
         try:
             tenant_id = _require_scope_identity(tenant_id, "tenant_id")
             subject_id = _require_scope_identity(subject_id, "subject_id")
@@ -3370,18 +3550,7 @@ class RequestStore:
             validated_exceptions = _validate_retention_exceptions(
                 exceptions, validated_rules.keys()
             )
-
-        if self._mem_conn is not None:
-            with self._write_lock:
-                return self._resolve_retention(
-                    tenant_id,
-                    subject_id,
-                    normalized,
-                    validated_rules,
-                    validated_exceptions,
-                    version,
-                )
-        return self._resolve_retention(
+        return (
             tenant_id,
             subject_id,
             normalized,
@@ -3390,24 +3559,123 @@ class RequestStore:
             version,
         )
 
-    def _resolve_retention(
+    def resolve_retention_trace(
         self,
         tenant_id: str,
         subject_id: str,
-        normalized: list[str],
+        scopes: object,
+        rules: object = _RETENTION_SOURCE_UNSET,
+        exceptions: object = _RETENTION_SOURCE_UNSET,
+        version: int | None = None,
+    ) -> str:
+        """Return read-only per-scope evidence of a retention decision.
+
+        Storage-layer only; never routed over HTTP and never a health
+        command, a parsed table or a background scan. This entry decides
+        exactly what :meth:`resolve_retention` decides -- the same
+        tenant, subject, ordered scope sequence and the same exclusive
+        choice between the two call-time catalogs and one published
+        catalog version -- but instead of the aggregate-only result it
+        renders the decision evidence: one compact JSON line with
+        exactly one trailing newline and no presentation whitespace.
+
+        The first section identifies the query and the aggregate
+        verdict, with fields in order: ``catalog_source`` (``call_time``
+        for the call-time catalogs or ``published_version`` for a stored
+        version), ``subject_id`` (the queried subject), ``scopes`` (the
+        normalized scopes in normalized order), ``retention_days`` (the
+        effective integer day count), ``policy_id`` and ``reason`` (the
+        winning policy number and its reason, verbatim), and
+        ``exception`` (a boolean: whether the aggregate winner is a
+        subject exception). ``scope_evidence`` follows with one item per
+        normalized scope in normalized scope order; each item has in
+        order ``scope``, ``level`` (the matched selector level --
+        ``entry``, ``group`` or ``all``), ``policy_id``, ``exception``
+        (whether the scope winner is a subject exception) and
+        ``retention_days``. Strings stay verbatim, booleans stay
+        booleans and counts are integers; the text never contains a
+        float, a negative zero or a non-finite value. The caller's raw
+        scope sequence is never returned, only the normalized scopes.
+
+        Within one scope a subject exception outranks every ordinary
+        rule, entry outranks group outranks the whole-data default, and
+        ties at one precedence break on the policy number's Unicode
+        code point; the effective retention is the maximum over scopes
+        and a cross-scope tie keeps the first winner in normalized scope
+        order. The aggregate winner, reason and exception flag are all
+        that same winner's. Passing order and publication order never
+        change a per-scope result; repeated calls and rebuilt instances
+        return byte-identical text. The trace is strictly read-only: it
+        publishes nothing and never writes.
+
+        Validation, not-found and storage outcomes are identical to
+        :meth:`resolve_retention`: both catalog sources given, only one
+        catalog given, an illegal version, tenant, subject, scope or
+        catalog shape raises :class:`ValueError`; a missing or
+        cross-tenant version raises :class:`PolicyCatalogNotFound`
+        without revealing another tenant; a corrupt catalog, an
+        unreadable database or a failed snapshot raises the fixed-text
+        :class:`OSError` ``retention_policy_resolution_failed``. No
+        failure writes, and errors and logs never carry a tenant,
+        subject, scope, policy number, secret, SQL text or path.
+        """
+        (
+            tenant_id,
+            subject_id,
+            normalized,
+            validated_rules,
+            validated_exceptions,
+            version,
+        ) = self._prepare_retention_inputs(
+            tenant_id, subject_id, scopes, rules, exceptions, version
+        )
+
+        if self._mem_conn is not None:
+            with self._write_lock:
+                return self._resolve_retention_trace(
+                    tenant_id,
+                    subject_id,
+                    normalized,
+                    validated_rules,
+                    validated_exceptions,
+                    version,
+                )
+        return self._resolve_retention_trace(
+            tenant_id,
+            subject_id,
+            normalized,
+            validated_rules,
+            validated_exceptions,
+            version,
+        )
+
+    def _retention_snapshot(
+        self,
+        tenant_id: str,
+        subject_id: str,
         rules: dict[str, tuple[str, int, str]] | None,
         exceptions: dict[str, tuple[str, str, int, str]] | None,
         version: int | None,
-    ) -> dict[str, object]:
+    ) -> tuple[
+        dict[str, tuple[str, int, str]],
+        dict[str, tuple[str, str, int, str]],
+    ]:
+        """Read the chosen catalog and the subject's accepted rows.
+
+        The catalog version (when named) and the subject's accepted
+        requests come from one consistent snapshot inside a single
+        read-only transaction, so a concurrent publication, acceptance
+        or status advance can never contribute half a record. The
+        accepted rows only pin the snapshot: their shapes are still
+        verified, and a damaged row is record corruption. Returns the
+        resolved rule and exception maps; a missing/cross-tenant version
+        keeps :class:`PolicyCatalogNotFound` and every other failure
+        maps to the fixed retention text.
+        """
         conn = self._connect()
         catalog_snapshot = None
         try:
             try:
-                # One explicit read-only transaction for the whole
-                # resolution: the chosen catalog version and the
-                # subject's accepted rows come from one consistent
-                # snapshot, so a concurrent publication, acceptance or
-                # status advance can never contribute half a record.
                 conn.execute("BEGIN")
                 try:
                     if version is not None:
@@ -3494,65 +3762,29 @@ class RequestStore:
                 )
             ):
                 raise _retention_resolution_failure()
+        return rules, exceptions
 
-        best_days: int | None = None
-        best_policy_id = ""
-        best_reason = ""
-        hit_exceptions: list[dict[str, object]] = []
-        for scope in normalized:
-            # A candidate is (precedence, policy number, days, reason,
-            # is_exception); the winner of one catalog is the min by
-            # (precedence, policy number), so the passing order of the
-            # catalog never influences the outcome.
-            winner: tuple[int, str, int, str, bool] | None = None
-            for policy_id, (bound_subject, selector, days, reason) in (
-                exceptions.items()
-            ):
-                if bound_subject != subject_id:
-                    continue
-                if not _selector_covers(selector, scope):
-                    continue
-                candidate = (
-                    _SELECTOR_PRECEDENCE[_classify_selector(selector)[0]],
-                    policy_id,
-                    days,
-                    reason,
-                    True,
-                )
-                if winner is None or candidate[:2] < winner[:2]:
-                    winner = candidate
-            if winner is None:
-                for policy_id, (selector, days, reason) in rules.items():
-                    if not _selector_covers(selector, scope):
-                        continue
-                    candidate = (
-                        _SELECTOR_PRECEDENCE[_classify_selector(selector)[0]],
-                        policy_id,
-                        days,
-                        reason,
-                        False,
-                    )
-                    if winner is None or candidate[:2] < winner[:2]:
-                        winner = candidate
-            # The mandatory whole-data default rule covers every scope,
-            # so a winner always exists.
-            _, policy_id, days, reason, is_exception = winner
-            if is_exception:
-                hit_exceptions.append(
-                    {
-                        "subject": subject_id,
-                        "scope": scope,
-                        "retention_days": days,
-                        "reason": reason,
-                    }
-                )
-            # The effective retention is the largest day count any scope
-            # resolved to; the first scope reaching the maximum keeps
-            # the winning policy number and the decision reason.
-            if best_days is None or days > best_days:
-                best_days = days
-                best_policy_id = policy_id
-                best_reason = reason
+    def _resolve_retention(
+        self,
+        tenant_id: str,
+        subject_id: str,
+        normalized: list[str],
+        rules: dict[str, tuple[str, int, str]] | None,
+        exceptions: dict[str, tuple[str, str, int, str]] | None,
+        version: int | None,
+    ) -> dict[str, object]:
+        rules, exceptions = self._retention_snapshot(
+            tenant_id, subject_id, rules, exceptions, version
+        )
+
+        (
+            _scope_evidence,
+            best_days,
+            best_policy_id,
+            best_reason,
+            _best_is_exception,
+            hit_exceptions,
+        ) = _decide_retention_scopes(normalized, subject_id, rules, exceptions)
 
         result = {
             "retention_days": best_days,
@@ -3569,6 +3801,59 @@ class RequestStore:
             len(hit_exceptions),
         )
         return result
+
+    def _resolve_retention_trace(
+        self,
+        tenant_id: str,
+        subject_id: str,
+        normalized: list[str],
+        rules: dict[str, tuple[str, int, str]] | None,
+        exceptions: dict[str, tuple[str, str, int, str]] | None,
+        version: int | None,
+    ) -> str:
+        rules, exceptions = self._retention_snapshot(
+            tenant_id, subject_id, rules, exceptions, version
+        )
+
+        (
+            scope_evidence,
+            best_days,
+            best_policy_id,
+            best_reason,
+            best_is_exception,
+            _hit_exceptions,
+        ) = _decide_retention_scopes(normalized, subject_id, rules, exceptions)
+
+        # The aggregate exception flag belongs to the aggregate winner:
+        # an exception hit on a lower-day scope never marks a decision
+        # an ordinary maximum-day rule won.
+        payload = {
+            "catalog_source": (
+                _RETENTION_SOURCE_PUBLISHED_VERSION
+                if version is not None
+                else _RETENTION_SOURCE_CALL_TIME
+            ),
+            "subject_id": subject_id,
+            "scopes": normalized,
+            "retention_days": best_days,
+            "policy_id": best_policy_id,
+            "reason": best_reason,
+            "exception": best_is_exception,
+            "scope_evidence": scope_evidence,
+        }
+        text = (
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+            + "\n"
+        )
+        # Log only stable counts: no tenant, subject, scope, policy
+        # number, reason, credential, SQL or path ever reaches the log.
+        _log.info(
+            "retention trace resolved scopes=%s rules=%s exceptions=%s",
+            len(scope_evidence),
+            len(rules),
+            sum(1 for item in scope_evidence if item["exception"]),
+        )
+        return text
 
     def transition(
         self,
