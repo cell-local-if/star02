@@ -369,41 +369,54 @@ SQL or path in the error or the log.
 
 :meth:`RequestStore.resolve_retention` is the storage-layer retention
 policy resolution entry, never routed over HTTP. It takes a tenant, a
-subject identifier, an ordered sequence of business scope selectors, an
-ordinary rule catalog and a subject exception catalog -- both mappings
-keyed by their policy number -- and resolves the effective retention
-for the normalized scopes from those catalogs alone, reading the
-subject's already accepted requests from one consistent snapshot inside
-a single read-only transaction; it never creates a request, changes a
-status, an execution record, evidence or inspection bookkeeping, and
-never writes anything. The scope set only accepts an ordered element
-sequence: a bare string, a set, a mapping or a generator (any
-non-sequence iterator) is caller error. Every ordinary rule declares a
-selector, a non-boolean non-negative integer day count and a non-empty
-reason, and the catalog must hold at least the whole-data ``*``
-default; every exception binds a subject, a selector, a day count and a
-reason and only ever covers a matched scope of the same tenant and the
-same subject. Policy numbers are non-empty strings, unique across both
-catalogs within the tenant. Inside one scope a concrete entry rule
-beats a whole-collection rule, which beats the whole-data default; a
-hit subject exception beats every ordinary rule, and rules or
-exceptions reaching the same precedence are ordered by policy number
-Unicode code point, never by passing order. Each normalized scope is
-matched independently and the effective retention is the largest day
-count any scope resolved to. The result carries exactly
+subject identifier and an ordered sequence of business scope
+selectors, plus exactly one catalog source: the ordinary rule catalog
+and a subject exception catalog -- both mappings keyed by their policy
+number -- passed as arguments with the existing semantics when no
+version is named, or an optional non-boolean positive-integer
+``version`` naming one immutable published catalog version, in which
+case the catalogs are read from storage and the two passing catalog
+arguments must both be omitted; the two sources are never accepted
+together. It resolves the effective retention for the normalized
+scopes from the resolved catalog alone, reading the subject's already
+accepted requests and, when pinned, the fixed version's catalog rows
+from one consistent snapshot inside a single read-only transaction;
+the pinned decision traces to that concrete version and does not move
+when later versions are published. It never creates a request,
+publishes a version, changes a status, an execution record, evidence
+or inspection bookkeeping, and never writes anything. The scope set
+only accepts an ordered element sequence: a bare string, a set, a
+mapping or a generator (any non-sequence iterator) is caller error.
+Every ordinary rule declares a selector, a non-boolean non-negative
+integer day count and a non-empty reason, and the catalog must hold at
+least the whole-data ``*`` default; every exception binds a subject, a
+selector, a day count and a reason and only ever covers a matched
+scope of the same tenant and the same subject. Policy numbers are
+non-empty strings, unique across both catalogs within the tenant.
+Inside one scope a concrete entry rule beats a whole-collection rule,
+which beats the whole-data default; a hit subject exception beats
+every ordinary rule, and rules or exceptions reaching the same
+precedence are ordered by policy number Unicode code point, never by
+passing or publication order. Each normalized scope is matched
+independently and the effective retention is the largest day count
+any scope resolved to. The result carries exactly
 ``retention_days``, ``policy_id``, ``exceptions`` and ``reason``: the
 hit-exception list reports only the bound subject, the scope, the
-retention days and the reason, stably ordered by normalized scope, and
-the decision reason is the reason of the winning record that determined
-the maximum retention. A null, wrongly typed or out-of-range argument,
-rule or exception -- a missing default rule, a duplicated policy
-number, an illegal selector or a negative day count -- raises
-:class:`ValueError` before storage is touched; a storage outage, a
-corrupt accepted request record or an unreadable snapshot raises
-:class:`OSError`; every failure carries the fixed text
-``retention_policy_resolution_failed`` and never a partial result, a
-tenant, a subject, a scope, a policy number, SQL or a path in the
-error, the result or the log.
+retention days and the catalog's verbatim reason, stably ordered by
+normalized scope, and the decision reason is the reason of the winning
+record that determined the maximum retention. A null, wrongly typed or
+out-of-range argument, scope, passing catalog or named version -- a
+missing default rule, a duplicated policy number, an illegal selector,
+a negative day count, or both catalog sources supplied together --
+raises :class:`ValueError` before storage is touched; a named version
+that is missing or visible only to another tenant raises
+:class:`PolicyCatalogNotFound`; a storage outage, a corrupt accepted
+request or catalog record or an unreadable snapshot raises
+:class:`OSError`; every failure on this entry carries the fixed text
+``retention_policy_resolution_failed`` (catalog wording never leaks
+through it) and never a partial result, a tenant, a subject, a scope,
+a policy number, a version, SQL or a path in the error, the result or
+the log.
 
 :meth:`RequestStore.publish_policy_catalog`,
 :meth:`RequestStore.read_policy_catalog` and
@@ -1072,6 +1085,14 @@ def _retention_resolution_failure() -> OSError:
 def _retention_value_failure() -> ValueError:
     """Build the single retention-resolution validation error callers see."""
     return ValueError(_RETENTION_RESOLUTION_MESSAGE)
+
+
+# Sentinel distinguishing "catalog argument omitted" from an explicit
+# null (which is itself an illegal catalog shape). A version-based
+# resolution supplies neither catalog; a passing-catalog resolution
+# supplies both, and supplying any of them together with a version is
+# caller error.
+_RETENTION_CATALOG_UNSET = object()
 
 
 # Fixed, detail-free text for every policy-catalog versioning failure:
@@ -3239,44 +3260,59 @@ class RequestStore:
         tenant_id: str,
         subject_id: str,
         scopes: object,
-        rules: object,
-        exceptions: object,
+        rules: object = _RETENTION_CATALOG_UNSET,
+        exceptions: object = _RETENTION_CATALOG_UNSET,
+        version: object = None,
     ) -> dict[str, object]:
         """Resolve the effective retention for a subject's data scopes.
 
         Storage-layer only; never routed over HTTP and never a health
         command, a parsed table or a background scan. The caller
-        supplies the tenant, a subject identifier, an ordered sequence
-        of business scope selectors, an ordinary rule catalog and a
-        subject exception catalog; the entry normalizes the scopes,
-        reads the same tenant's already accepted requests for that same
-        subject from one consistent snapshot inside a single read-only
-        transaction, and resolves the retention from the catalogs
-        alone. It never creates a request, changes a status, an
-        execution record, evidence or inspection bookkeeping, and never
-        writes anything at all.
+        supplies the tenant, a subject identifier and an ordered
+        sequence of business scope selectors, plus exactly one catalog
+        source:
+
+        * the ordinary rule catalog and the subject exception catalog
+          passed as arguments (the existing input), when *version* is
+          omitted; or
+        * the optional *version* naming one immutable published
+          catalog version, in which case the rules and exceptions are
+          read from the database for that version and neither catalog
+          argument may be passed.
+
+        The two sources are never accepted together. The entry
+        normalizes the scopes, reads the same tenant's already accepted
+        requests for that same subject -- and, when a version is named,
+        that version's catalog rows -- from one consistent snapshot
+        inside a single read-only transaction, and resolves the
+        retention from the resolved catalog alone. It never creates a
+        request, publishes a version, changes a status, an execution
+        record, evidence or inspection bookkeeping, and never writes
+        anything at all.
 
         The scope set only accepts an ordered element sequence (a list
         or tuple): a bare string, a set, a mapping or a generator --
-        any non-sequence iterator -- is caller error. Both catalogs are
-        mappings keyed by their policy number, a non-empty string that
-        is unique across the two catalogs within the tenant. Every
-        ordinary rule declares exactly a selector, a day count and a
-        reason, and the catalog must hold at least the whole-data ``*``
-        default rule; every exception binds exactly a subject, a
-        selector, a day count and a reason, and only ever covers a
-        matched scope of the same tenant and the same subject. A
-        selector uses the business selector grammar, a day count is a
-        non-boolean non-negative integer, and a reason is a non-empty
-        string.
+        any non-sequence iterator -- is caller error. A passing
+        catalog's rules and exceptions are mappings keyed by their
+        policy number, a non-empty string that is unique across the two
+        catalogs within the tenant. Every ordinary rule declares
+        exactly a selector, a day count and a reason, and the catalog
+        must hold at least the whole-data ``*`` default rule; every
+        exception binds exactly a subject, a selector, a day count and
+        a reason, and only ever covers a matched scope of the same
+        tenant and the same subject. A selector uses the business
+        selector grammar, a day count is a non-boolean non-negative
+        integer, and a reason is a non-empty string. A named *version*
+        must be a non-boolean positive integer.
 
         Inside one scope a concrete entry rule beats a whole-collection
         rule, which beats the whole-data default; a hit subject
         exception beats every ordinary rule, and ordinary rules or
         exceptions reaching the same precedence are ordered by policy
-        number Unicode code point, never by passing order. Each
-        normalized scope is matched independently and the effective
-        retention is the largest day count any scope resolved to.
+        number Unicode code point, never by passing or publication
+        order. Each normalized scope is matched independently and the
+        effective retention is the largest day count any scope
+        resolved to.
 
         The result dictionary has exactly four keys, in order:
         ``retention_days`` (the effective integer day count),
@@ -3285,21 +3321,26 @@ class RequestStore:
         record that determined the maximum retention). Each hit
         exception reports exactly ``subject``, ``scope``,
         ``retention_days`` and ``reason``, stably ordered by normalized
-        scope; with no hit exception the list is empty. Every value is
-        an integer, a string, a list or a dictionary, and repeated
-        resolutions, rebuilt instances and concurrent read-only calls
-        with the same input and catalogs return the same dictionary.
+        scope and carrying the catalog's verbatim reason text; with no
+        hit exception the list is empty. Every value is an integer, a
+        string, a list or a dictionary, and repeated resolutions,
+        rebuilt instances and concurrent read-only calls with the same
+        tenant, subject, scopes and -- when named -- version return the
+        same dictionary.
 
-        A null, wrongly typed or out-of-range argument, rule or
-        exception -- a missing default rule, a duplicated policy
-        number, an illegal selector or a negative day count -- raises
+        A null, wrongly typed or out-of-range argument, scope, named
+        version or passing catalog -- a missing default rule, a
+        duplicated policy number, an illegal selector or a negative day
+        count, or both catalog sources supplied together -- raises
         :class:`ValueError` without touching storage, whether or not
-        any record exists. A storage outage, a corrupt accepted request
-        record or a snapshot read that cannot complete raises
-        :class:`OSError`. Every failure carries the fixed text
-        ``retention_policy_resolution_failed`` -- never a partial
-        result, and never a tenant, subject, scope, policy number, SQL
-        or path in the error or the log.
+        any record exists. A named version that is missing or visible
+        only to another tenant raises :class:`PolicyCatalogNotFound`,
+        never revealing whether another tenant holds it. A storage
+        outage, a corrupt accepted request or catalog record, or a
+        snapshot read that cannot complete raises :class:`OSError` with
+        the fixed text ``retention_policy_resolution_failed`` -- never
+        a partial result, and never a tenant, subject, scope, policy
+        number, version, SQL or path in the error or the log.
         """
         # Validate everything before touching the database: a rejected
         # call never reads or writes anything, and every validation
@@ -3310,6 +3351,43 @@ class RequestStore:
         except ValueError:
             raise _retention_value_failure() from None
         normalized = _normalize_retention_scopes(scopes)
+
+        catalog_passed = (
+            rules is not _RETENTION_CATALOG_UNSET
+            or exceptions is not _RETENTION_CATALOG_UNSET
+        )
+        if version is not None:
+            # A named version is a non-boolean positive integer; a
+            # boolean, a float, a string or a non-positive count is out
+            # of domain, all with the same fixed retention text.
+            if (
+                not isinstance(version, int)
+                or isinstance(version, bool)
+                or version < 1
+            ):
+                raise _retention_value_failure()
+            # The two catalog sources are mutually exclusive: naming a
+            # version while also passing either catalog argument is
+            # caller error, never a read that silently picks one source.
+            if catalog_passed:
+                raise _retention_value_failure()
+            if self._mem_conn is not None:
+                with self._write_lock:
+                    return self._resolve_retention_version(
+                        tenant_id, subject_id, normalized, version
+                    )
+            return self._resolve_retention_version(
+                tenant_id, subject_id, normalized, version
+            )
+
+        # No version: both catalogs must be supplied and validated with
+        # the existing passing-catalog semantics; a single omitted
+        # catalog is an illegal catalog shape, never an empty default.
+        if not catalog_passed or (
+            rules is _RETENTION_CATALOG_UNSET
+            or exceptions is _RETENTION_CATALOG_UNSET
+        ):
+            raise _retention_value_failure()
         validated_rules = _validate_retention_rules(rules)
         validated_exceptions = _validate_retention_exceptions(
             exceptions, validated_rules.keys()
@@ -3332,21 +3410,21 @@ class RequestStore:
             validated_exceptions,
         )
 
-    def _resolve_retention(
+    def _read_retention_request_rows(
         self,
         tenant_id: str,
         subject_id: str,
-        normalized: list[str],
-        rules: dict[str, tuple[str, int, str]],
-        exceptions: dict[str, tuple[str, str, int, str]],
-    ) -> dict[str, object]:
+    ) -> list[tuple[object, ...]]:
+        """Snapshot the subject's accepted request rows read-only.
+
+        The rows are read inside one explicit transaction so a
+        concurrent acceptance or status advance can never contribute
+        half a record; every storage fault is the fixed retention
+        :class:`OSError`.
+        """
         conn = self._connect()
         try:
             try:
-                # One explicit read-only transaction for the whole
-                # resolution: the subject's accepted rows are read from
-                # one consistent snapshot, so a concurrent acceptance or
-                # status advance can never contribute half a record.
                 conn.execute("BEGIN")
                 try:
                     rows = conn.execute(
@@ -3366,12 +3444,18 @@ class RequestStore:
                 raise _retention_resolution_failure() from None
         finally:
             self._release(conn)
+        return rows
 
+    @staticmethod
+    def _validate_retention_request_rows(rows: list[tuple[object, ...]]) -> None:
+        """Reject any corrupt accepted-request row in a retention snapshot.
+
+        Every persisted request the store itself wrote carries a
+        non-empty id, a non-empty current status and a JSON list of
+        non-empty scope strings; anything else is record corruption,
+        never a row to skip or fold into a result.
+        """
         for request_id, status, stored_json in rows:
-            # Every persisted request the store itself wrote carries a
-            # non-empty id, a non-empty current status and a JSON list
-            # of non-empty scope strings; anything else is record
-            # corruption, never a row to skip or fold into a result.
             if (
                 not isinstance(request_id, str)
                 or not request_id
@@ -3392,6 +3476,21 @@ class RequestStore:
             ):
                 raise _retention_resolution_failure()
 
+    @staticmethod
+    def _match_retention_policies(
+        normalized: list[str],
+        subject_id: str,
+        rules: dict[str, tuple[str, int, str]],
+        exceptions: dict[str, tuple[str, str, int, str]],
+    ) -> tuple[int | None, str, str, list[dict[str, object]]]:
+        """Resolve day count, winner and hit exceptions from catalog maps.
+
+        A pure function of the already normalized scopes and validated
+        catalog maps, so the same inputs give the same result whether
+        the catalog was passed by the caller or read as a fixed
+        version. Returns ``(best_days, best_policy_id, best_reason,
+        hit_exceptions)``.
+        """
         best_days: int | None = None
         best_policy_id = ""
         best_reason = ""
@@ -3450,7 +3549,21 @@ class RequestStore:
                 best_days = days
                 best_policy_id = policy_id
                 best_reason = reason
+        return best_days, best_policy_id, best_reason, hit_exceptions
 
+    def _render_retention_result(
+        self,
+        normalized: list[str],
+        subject_id: str,
+        rules: dict[str, tuple[str, int, str]],
+        exceptions: dict[str, tuple[str, str, int, str]],
+    ) -> dict[str, object]:
+        """Match policies, log stable counts and render the result dict."""
+        best_days, best_policy_id, best_reason, hit_exceptions = (
+            self._match_retention_policies(
+                normalized, subject_id, rules, exceptions
+            )
+        )
         result = {
             "retention_days": best_days,
             "policy_id": best_policy_id,
@@ -3466,6 +3579,89 @@ class RequestStore:
             len(hit_exceptions),
         )
         return result
+
+    def _resolve_retention(
+        self,
+        tenant_id: str,
+        subject_id: str,
+        normalized: list[str],
+        rules: dict[str, tuple[str, int, str]],
+        exceptions: dict[str, tuple[str, str, int, str]],
+    ) -> dict[str, object]:
+        rows = self._read_retention_request_rows(tenant_id, subject_id)
+        self._validate_retention_request_rows(rows)
+        return self._render_retention_result(
+            normalized, subject_id, rules, exceptions
+        )
+
+    def _resolve_retention_version(
+        self,
+        tenant_id: str,
+        subject_id: str,
+        normalized: list[str],
+        version: int,
+    ) -> dict[str, object]:
+        """Resolve retention against one immutable published catalog version.
+
+        The subject's accepted request rows and the named version's
+        catalog rows are read inside one read-only transaction, so the
+        decision traces to one consistent snapshot of one fixed,
+        immutable version and cannot move when a later version is
+        published. A missing or cross-tenant version raises
+        :class:`PolicyCatalogNotFound`; every other storage or catalog
+        corruption fault is translated to the fixed retention
+        :class:`OSError`, so catalog wording never leaks through this
+        entry.
+        """
+        conn = self._connect()
+        try:
+            try:
+                # One explicit read-only transaction spans both the
+                # request snapshot and the fixed catalog version, so
+                # the decision never mixes two snapshots and a
+                # concurrent publication cannot contribute a half-seen
+                # version.
+                conn.execute("BEGIN")
+                try:
+                    rows = conn.execute(
+                        "SELECT request_id, status, scopes_json FROM requests "
+                        "WHERE tenant_id = ? AND subject_id = ? "
+                        "ORDER BY created_at ASC, request_id ASC",
+                        (tenant_id, subject_id),
+                    ).fetchall()
+                    catalog_rows = self._fetch_policy_catalog_rows(
+                        conn, tenant_id, version
+                    )
+                    conn.execute("COMMIT")
+                except BaseException:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
+            except PolicyCatalogNotFound:
+                raise
+            except OSError:
+                # A malformed persisted version row is reported by the
+                # shared catalog reader with catalog wording; on this
+                # entry the only storage wording allowed is the fixed
+                # retention text.
+                raise _retention_resolution_failure() from None
+            except sqlite3.Error:
+                raise _retention_resolution_failure() from None
+        finally:
+            self._release(conn)
+
+        self._validate_retention_request_rows(rows)
+        try:
+            _payload, rules, exceptions = self._decode_policy_catalog_payload(
+                *catalog_rows
+            )
+        except OSError:
+            raise _retention_resolution_failure() from None
+        return self._render_retention_result(
+            normalized, subject_id, rules, exceptions
+        )
 
     def transition(
         self,
@@ -9888,32 +10084,9 @@ class RequestStore:
                 # concurrent publication.
                 conn.execute("BEGIN")
                 try:
-                    row = conn.execute(
-                        "SELECT version, effective_at, content_fingerprint "
-                        "FROM policy_catalog_versions WHERE tenant_id = ?"
-                        + (" AND version = ?" if version is not None else "")
-                        + " ORDER BY version DESC LIMIT 1",
-                        (tenant_id, version) if version is not None else (tenant_id,),
-                    ).fetchone()
-                    if row is None:
-                        conn.execute("ROLLBACK")
-                        raise PolicyCatalogNotFound(_POLICY_CATALOG_MESSAGE)
-                    resolved_version, effective_at, fingerprint = row
-                    self._validate_policy_version_row(
-                        resolved_version, effective_at, fingerprint
+                    catalog_rows = self._fetch_policy_catalog_rows(
+                        conn, tenant_id, version
                     )
-                    rule_rows = conn.execute(
-                        "SELECT seq, policy_id, selector, days, reason "
-                        "FROM policy_catalog_rules "
-                        "WHERE tenant_id = ? AND version = ? ORDER BY seq",
-                        (tenant_id, resolved_version),
-                    ).fetchall()
-                    exception_rows = conn.execute(
-                        "SELECT seq, policy_id, subject_id, selector, days, "
-                        "reason FROM policy_catalog_exceptions "
-                        "WHERE tenant_id = ? AND version = ? ORDER BY seq",
-                        (tenant_id, resolved_version),
-                    ).fetchall()
                     conn.execute("COMMIT")
                 except BaseException:
                     try:
@@ -9928,14 +10101,93 @@ class RequestStore:
         finally:
             self._release(conn)
 
+        payload, _rules, _exceptions = self._decode_policy_catalog_payload(
+            *catalog_rows
+        )
+        return payload
+
+    def _fetch_policy_catalog_rows(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        version: int | None,
+    ) -> tuple[
+        int,
+        str,
+        str,
+        list[tuple[object, ...]],
+        list[tuple[object, ...]],
+    ]:
+        """Read one visible version's rows inside an open read transaction.
+
+        The caller owns the transaction (and its rollback); this returns
+        ``(resolved_version, effective_at, fingerprint, rule_rows,
+        exception_rows)`` from one snapshot. A version missing or owned
+        by another tenant raises :class:`PolicyCatalogNotFound`; any
+        other storage fault propagates so the caller can translate it
+        into its own fixed-text error -- retention resolution must never
+        surface catalog wording.
+        """
+        row = conn.execute(
+            "SELECT version, effective_at, content_fingerprint "
+            "FROM policy_catalog_versions WHERE tenant_id = ?"
+            + (" AND version = ?" if version is not None else "")
+            + " ORDER BY version DESC LIMIT 1",
+            (tenant_id, version) if version is not None else (tenant_id,),
+        ).fetchone()
+        if row is None:
+            raise PolicyCatalogNotFound(_POLICY_CATALOG_MESSAGE)
+        resolved_version, effective_at, fingerprint = row
+        self._validate_policy_version_row(
+            resolved_version, effective_at, fingerprint
+        )
+        rule_rows = conn.execute(
+            "SELECT seq, policy_id, selector, days, reason "
+            "FROM policy_catalog_rules "
+            "WHERE tenant_id = ? AND version = ? ORDER BY seq",
+            (tenant_id, resolved_version),
+        ).fetchall()
+        exception_rows = conn.execute(
+            "SELECT seq, policy_id, subject_id, selector, days, "
+            "reason FROM policy_catalog_exceptions "
+            "WHERE tenant_id = ? AND version = ? ORDER BY seq",
+            (tenant_id, resolved_version),
+        ).fetchall()
+        return (
+            resolved_version,
+            effective_at,
+            fingerprint,
+            rule_rows,
+            exception_rows,
+        )
+
+    def _decode_policy_catalog_payload(
+        self,
+        resolved_version: int,
+        effective_at: str,
+        fingerprint: str,
+        rule_rows: list[tuple[object, ...]],
+        exception_rows: list[tuple[object, ...]],
+    ) -> tuple[
+        dict[str, object],
+        dict[str, tuple[str, int, str]],
+        dict[str, tuple[str, str, int, str]],
+    ]:
+        """Decode, verify and shape one version's rows off-transaction.
+
+        Returns ``(payload, rules_map, exceptions_map)`` with the maps in
+        the normalized tuple shapes retention resolution consumes. The
+        stored content must still hash to the version's committed
+        fingerprint; an out-of-band edit, a duplicate/missing sequence
+        number or a split rule set is catalog corruption -- never a
+        partially reconstructed catalog -- and raises the fixed catalog
+        :class:`OSError`, which a caller on another entry translates to
+        its own fixed text.
+        """
         rules, rule_ids = self._decode_policy_rules(rule_rows)
         exceptions, exception_ids, subjects = self._decode_policy_exceptions(
             exception_rows
         )
-        # The stored content must still hash to the version's committed
-        # fingerprint; an out-of-band edit, a duplicate/missing sequence
-        # number or a split rule set is catalog corruption, never a
-        # partially reconstructed catalog.
         rules_map = {
             policy_id: (rule["selector"], rule["days"], rule["reason"])
             for policy_id, rule in zip(rule_ids, rules)
@@ -9959,12 +10211,13 @@ class RequestStore:
         self._validate_decoded_policy_catalog(
             rules, rule_ids, exception_ids
         )
-        return {
+        payload = {
             "version": resolved_version,
             "effective_at": effective_at,
             "rules": rules,
             "exceptions": exceptions,
         }
+        return payload, rules_map, exceptions_map
 
     @staticmethod
     def _validate_decoded_policy_catalog(
