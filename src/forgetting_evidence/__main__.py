@@ -2,13 +2,18 @@ import json
 import signal
 import sys
 
-from .httpapi import DeferredRequestStore, build_server
+from .httpapi import (
+    AuthConfigError,
+    DeferredRequestStore,
+    build_server,
+    load_auth_config,
+)
 
 _USAGE = "usage: python -m forgetting_evidence health"
 _SERVE_USAGE = (
     "usage: python -m forgetting_evidence serve <database> <address> <port>\n"
     "       python -m forgetting_evidence serve --db <database> "
-    "--host <address> --port <port>"
+    "--host <address> --port <port> [--auth-file <auth-config>]"
 )
 
 _FLAG_ALIASES = {
@@ -18,6 +23,7 @@ _FLAG_ALIASES = {
     "--address": "host",
     "--bind": "host",
     "--port": "port",
+    "--auth-file": "auth_file",
 }
 _POSITIONAL_FIELDS = ("db", "host", "port")
 
@@ -72,13 +78,26 @@ def _run_serve(args: list[str]) -> int:
         print(_SERVE_USAGE, file=sys.stderr)
         return 2
 
+    # The auth configuration is read and validated exactly once, before
+    # the port is bound. A missing/unreadable file or any non-compliant
+    # configuration refuses startup: no socket is opened and the process
+    # exits with status 2 and the fixed marker only -- the path, tokens
+    # and configuration content are never printed.
+    auth = None
+    if parsed.get("auth_file"):
+        try:
+            auth = load_auth_config(parsed["auth_file"])
+        except AuthConfigError:
+            print("auth_config_invalid", file=sys.stderr)
+            return 2
+
     # The store opens (creating the file and required tables) at startup.
     # If the database cannot be created the service still binds: business
     # requests then answer 503 storage_unavailable and the store retries
     # initialization on the next request so a repaired path self-heals.
     store = DeferredRequestStore(parsed["db"])
     try:
-        server = build_server(store, parsed["host"], port)
+        server = build_server(store, parsed["host"], port, auth)
     except OSError:
         print("address_in_use", file=sys.stderr)
         return 1

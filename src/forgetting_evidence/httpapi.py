@@ -38,9 +38,26 @@ a trailing newline; the same idempotent request and every lookup return
 byte-identical bodies. Error responses are single-line JSON objects with
 exactly one key, ``error``, holding a stable error code:
 
-``invalid_request`` (400), ``idempotency_conflict`` (409),
-``not_found`` (404), ``method_not_allowed`` (405) and
-``storage_unavailable`` (503).
+``invalid_request`` (400), ``unauthorized`` (401), ``forbidden``
+(403), ``idempotency_conflict`` (409), ``not_found`` (404),
+``method_not_allowed`` (405) and ``storage_unavailable`` (503).
+
+Optional token authentication and role-based access control can be
+enabled by passing an auth configuration (see :func:`load_auth_config`)
+to :func:`build_server` / :func:`make_handler`. Without it the service
+keeps the unauthenticated contract described above. When enabled every
+matched business request must present ``Authorization: Bearer <token>``
+for a configured principal: a missing/malformed/unknown token answers
+``401 unauthorized`` and a principal lacking the role required by the
+endpoint, or acting on a tenant other than its own ``tenant_id``,
+answers ``403 forbidden``. ``POST /requests`` requires
+``request:submit`` and the target tenant is the body's ``tenant_id``;
+``GET /requests/{request_id}`` requires ``request:read`` and the target
+tenant follows the existing ``X-Tenant-Id``/query rule. Authentication
+runs after path/method routing (unknown paths stay 404, unsupported
+methods stay 405) but before payload validation and any storage access.
+Tokens, roles and the configuration never enter a response, a raised
+exception message, a log record, the database or any stored artifact.
 
 No subject, scope, idempotency key, database error text, SQL statement
 or filesystem path is ever placed in a response, a log record or a
@@ -59,16 +76,29 @@ from urllib.parse import parse_qs, urlsplit
 
 from .requests import IdempotencyConflict, RequestNotFound, RequestStore
 
-__all__ = ["build_server", "make_handler", "DeferredRequestStore"]
+__all__ = [
+    "build_server",
+    "make_handler",
+    "DeferredRequestStore",
+    "AuthConfig",
+    "AuthConfigError",
+    "load_auth_config",
+]
 
 _log = logging.getLogger(__name__)
 
 _COLLECTION_PATH = "/requests"
 _ITEM_PATH_PREFIX = "/requests/"
 _TENANT_HEADER = "X-Tenant-Id"
+_AUTHORIZATION_HEADER = "Authorization"
+_BEARER_PREFIX = "Bearer "
 
 # Reject oversized request bodies before they reach the database layer.
 _MAX_BODY_BYTES = 1 << 20  # 1 MiB
+
+_ROLE_SUBMIT = "request:submit"
+_ROLE_READ = "request:read"
+_ALLOWED_ROLES = frozenset({_ROLE_SUBMIT, _ROLE_READ})
 
 _UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
@@ -76,6 +106,8 @@ _UUID_RE = re.compile(
 )
 
 _INVALID_REQUEST = "invalid_request"
+_UNAUTHORIZED = "unauthorized"
+_FORBIDDEN = "forbidden"
 _NOT_FOUND = "not_found"
 _METHOD_NOT_ALLOWED = "method_not_allowed"
 _IDEMPOTENCY_CONFLICT = "idempotency_conflict"
@@ -88,6 +120,107 @@ class _BadRequest(Exception):
 
 class _StorageUnavailable(Exception):
     """Internal signal: the backing database cannot be opened or used."""
+
+
+class AuthConfigError(Exception):
+    """The auth configuration file is missing, unreadable or invalid.
+
+    The message is a fixed marker; it never quotes the offending token,
+    path or configuration content.
+    """
+
+
+class AuthConfig:
+    """Parsed, immutable bearer-token principals for RBAC.
+
+    Principals map a non-empty bearer token to their tenant id and a set
+    of roles. Tokens and roles are kept in process memory only and are
+    never logged or persisted by this module.
+    """
+
+    def __init__(self, principals: list[dict]):
+        # ``principals`` has already passed :func:`load_auth_config`; copy
+        # into an immutable token -> (tenant_id, frozenset(roles)) map.
+        by_token: dict[str, tuple[str, frozenset[str]]] = {}
+        for principal in principals:
+            by_token[principal["token"]] = (
+                principal["tenant_id"],
+                frozenset(principal["roles"]),
+            )
+        self._by_token = by_token
+
+    def authenticate(self, token: str) -> tuple[str, frozenset[str]] | None:
+        """Return ``(tenant_id, roles)`` for *token*, or ``None`` if unknown."""
+        return self._by_token.get(token)
+
+
+def load_auth_config(path: str) -> AuthConfig:
+    """Read and validate the auth configuration file once, at startup.
+
+    The file must be a UTF-8 JSON object with a ``principals`` array;
+    each principal is an object carrying non-empty ``token`` and
+    ``tenant_id`` strings plus a non-empty ``roles`` array of distinct
+    values drawn from ``request:submit`` and ``request:read``. Tokens
+    must be unique across principals. Any deviation -- including an
+    unreadable or non-UTF-8 file, malformed JSON, a missing ``principals``
+    key or a principal missing/typing-wrong one of the required keys --
+    raises :class:`AuthConfigError` so the caller can refuse to bind.
+    """
+    # Suppress exception chaining ("from None"): the underlying OSError
+    # carries the filesystem path and a decode/JSON error may quote file
+    # content, neither of which may reach a raised exception message.
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read()
+    except OSError:
+        raise AuthConfigError("auth_config_invalid") from None
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise AuthConfigError("auth_config_invalid") from None
+
+    principals = _validate_auth_config(parsed)
+    return AuthConfig(principals)
+
+
+def _validate_auth_config(parsed: object) -> list[dict]:
+    if not isinstance(parsed, dict) or "principals" not in parsed:
+        raise AuthConfigError("auth_config_invalid")
+    raw_principals = parsed["principals"]
+    if not isinstance(raw_principals, list):
+        raise AuthConfigError("auth_config_invalid")
+
+    principals: list[dict] = []
+    seen_tokens: set[str] = set()
+    for entry in raw_principals:
+        # Only the three specified keys are validated; their presence,
+        # types and value domains are mandatory.
+        if not isinstance(entry, dict) or not {
+            "token",
+            "tenant_id",
+            "roles",
+        } <= set(entry):
+            raise AuthConfigError("auth_config_invalid")
+        token = entry["token"]
+        tenant_id = entry["tenant_id"]
+        roles = entry["roles"]
+        if not isinstance(token, str) or not token:
+            raise AuthConfigError("auth_config_invalid")
+        if not isinstance(tenant_id, str) or not tenant_id:
+            raise AuthConfigError("auth_config_invalid")
+        if not isinstance(roles, list) or not roles:
+            raise AuthConfigError("auth_config_invalid")
+        if not all(isinstance(role, str) for role in roles):
+            raise AuthConfigError("auth_config_invalid")
+        if len(set(roles)) != len(roles) or not set(roles) <= _ALLOWED_ROLES:
+            raise AuthConfigError("auth_config_invalid")
+        if token in seen_tokens:
+            raise AuthConfigError("auth_config_invalid")
+        seen_tokens.add(token)
+        principals.append(
+            {"token": token, "tenant_id": tenant_id, "roles": roles}
+        )
+    return principals
 
 
 class DeferredRequestStore:
@@ -214,17 +347,27 @@ def build_server(
     store,
     host: str = "127.0.0.1",
     port: int = 8080,
+    auth: AuthConfig | None = None,
 ) -> ThreadingHTTPServer:
-    """Build (but do not start) the threaded HTTP server bound to *host*:*port*."""
-    handler = make_handler(store)
+    """Build (but do not start) the threaded HTTP server bound to *host*:*port*.
+
+    With *auth* ``None`` (the default) the server keeps its
+    unauthenticated contract; pass a loaded :class:`AuthConfig` to
+    require bearer-token authentication and RBAC on the business
+    endpoints.
+    """
+    handler = make_handler(store, auth)
     server = ThreadingHTTPServer((host, port), handler)
     # Worker threads must not keep the process alive on shutdown.
     server.daemon_threads = True
     return server
 
 
-def make_handler(store: RequestStore) -> type[BaseHTTPRequestHandler]:
-    """Build a handler class closed over *store*."""
+def make_handler(
+    store: RequestStore,
+    auth: AuthConfig | None = None,
+) -> type[BaseHTTPRequestHandler]:
+    """Build a handler class closed over *store* and optional *auth*."""
 
     class _DeletionRequestHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -304,6 +447,56 @@ def make_handler(store: RequestStore) -> type[BaseHTTPRequestHandler]:
                     405, _METHOD_NOT_ALLOWED, allowed=allowed, headless=headless
                 )
 
+        # -- authentication / authorization ----------------------------
+
+        def _authorize(self, required_role: str) -> tuple[str, frozenset[str]] | None:
+            """Authenticate the bearer token and check *required_role*.
+
+            Returns the principal's ``(tenant_id, roles)`` on success.
+            Replies ``401 unauthorized`` for a missing, malformed or
+            unknown credential and ``403 forbidden`` when the role is
+            absent; returns ``None`` in either case. No token material is
+            ever logged or quoted in the response.
+            """
+            if auth is None:
+                # Unauthenticated deployment: no principal and no gate.
+                return ("", frozenset())
+            header = self.headers.get(_AUTHORIZATION_HEADER)
+            if header is None or not header.startswith(_BEARER_PREFIX):
+                self._auth_rejected(401, _UNAUTHORIZED)
+                return None
+            token = header[len(_BEARER_PREFIX) :]
+            if not token:
+                self._auth_rejected(401, _UNAUTHORIZED)
+                return None
+            principal = auth.authenticate(token)
+            if principal is None:
+                self._auth_rejected(401, _UNAUTHORIZED)
+                return None
+            tenant_id, roles = principal
+            if required_role not in roles:
+                self._auth_rejected(403, _FORBIDDEN)
+                return None
+            return tenant_id, roles
+
+        def _auth_rejected(self, status: int, code: str) -> None:
+            # A rejected POST has not consumed its request body, so the
+            # connection cannot serve another pipelined request; close it
+            # after the error to keep keep-alive framing intact.
+            if self.command == "POST":
+                self.close_connection = True
+            self._reply_error(status, code)
+
+        def _tenant_allowed(
+            self, principal_tenant: str, target_tenant: str
+        ) -> bool:
+            if auth is None:
+                return True
+            if target_tenant != principal_tenant:
+                self._reply_error(403, _FORBIDDEN)
+                return False
+            return True
+
         def _handle_post(self) -> None:
             kind, _ = self._route()
             if kind is None:
@@ -312,8 +505,16 @@ def make_handler(store: RequestStore) -> type[BaseHTTPRequestHandler]:
             if kind != "collection":
                 self._reply_error(405, _METHOD_NOT_ALLOWED, allowed="GET")
                 return
+            # Authentication precedes payload validation and storage.
+            principal = self._authorize(_ROLE_SUBMIT)
+            if principal is None:
+                return
             payload = self._read_json_object()
             tenant_id = _require_string(payload, "tenant_id")
+            # The body's tenant is the authorization target; a principal
+            # may only submit for its own tenant.
+            if not self._tenant_allowed(principal[0], tenant_id):
+                return
             subject_id = _require_string(payload, "subject_id")
             idempotency_key = _require_string(payload, "idempotency_key")
             scopes = _require_scopes(payload)
@@ -351,18 +552,42 @@ def make_handler(store: RequestStore) -> type[BaseHTTPRequestHandler]:
             if kind != "item":
                 self._reply_error(405, _METHOD_NOT_ALLOWED, allowed="POST")
                 return
+            # Authentication precedes request-id validation and storage.
+            principal = self._authorize(_ROLE_READ)
+            if principal is None:
+                return
             assert segment is not None
-            try:
-                request_id = _normalize_request_id(segment)
-            except _BadRequest:
-                # Unknown and malformed ids share one outcome.
-                self._reply_error(404, _NOT_FOUND)
-                return
-            try:
-                tenant_id = self._tenant_id()
-            except _BadRequest:
-                self._reply_error(400, _INVALID_REQUEST)
-                return
+            if auth is not None:
+                # With auth enabled the full authorization -- including
+                # resolving the target tenant and matching it -- completes
+                # before request-id syntax is even inspected, so a foreign
+                # principal cannot reach id validation or storage.
+                try:
+                    tenant_id = self._tenant_id()
+                except _BadRequest:
+                    self._reply_error(400, _INVALID_REQUEST)
+                    return
+                if not self._tenant_allowed(principal[0], tenant_id):
+                    return
+                try:
+                    request_id = _normalize_request_id(segment)
+                except _BadRequest:
+                    # Unknown and malformed ids share one outcome.
+                    self._reply_error(404, _NOT_FOUND)
+                    return
+            else:
+                # Unauthenticated contract keeps its historical order:
+                # request-id shape is checked before the tenant header.
+                try:
+                    request_id = _normalize_request_id(segment)
+                except _BadRequest:
+                    self._reply_error(404, _NOT_FOUND)
+                    return
+                try:
+                    tenant_id = self._tenant_id()
+                except _BadRequest:
+                    self._reply_error(400, _INVALID_REQUEST)
+                    return
             try:
                 receipt = store.get(tenant_id, request_id)
             except RequestNotFound:
@@ -472,6 +697,11 @@ def make_handler(store: RequestStore) -> type[BaseHTTPRequestHandler]:
                 if allowed is not None:
                     self.send_header("Allow", allowed)
                 self.send_header("Content-Length", str(len(body)))
+                if self.close_connection:
+                    # Tell the client explicitly when a request left an
+                    # unread body (e.g. an auth rejection before parsing)
+                    # so it does not pipeline another request.
+                    self.send_header("Connection", "close")
                 self.end_headers()
                 if not headless:
                     self.wfile.write(body)
