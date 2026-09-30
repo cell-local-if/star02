@@ -38,13 +38,25 @@ a trailing newline; the same idempotent request and every lookup return
 byte-identical bodies. Error responses are single-line JSON objects with
 exactly one key, ``error``, holding a stable error code:
 
-``invalid_request`` (400), ``idempotency_conflict`` (409),
-``not_found`` (404), ``method_not_allowed`` (405) and
-``storage_unavailable`` (503).
+``invalid_request`` (400), ``unauthorized`` (401), ``forbidden``
+(403), ``idempotency_conflict`` (409), ``not_found`` (404),
+``method_not_allowed`` (405) and ``storage_unavailable`` (503).
 
-No subject, scope, idempotency key, database error text, SQL statement
-or filesystem path is ever placed in a response, a log record or a
-raised exception message.
+The server optionally runs behind bearer-token authentication and
+RBAC (see :mod:`forgetting_evidence.auth`). Without a configuration
+the historical unauthenticated contract is unchanged. With one, only
+matched business routes ask for credentials -- unknown paths still
+answer 404 and unsupported methods 405 -- and authentication, role
+and tenant-scope checks run before any payload validation or storage
+access. ``POST /requests`` requires ``request:submit`` and the body
+``tenant_id`` must equal the principal's tenant; ``GET`` requires
+``request:read`` and the resolved tenant (``X-Tenant-Id`` header when
+non-empty, else the last non-empty ``tenant_id`` query parameter)
+must equal the principal's tenant.
+
+No subject, scope, idempotency key, database error text, SQL statement,
+filesystem path, token or auth-configuration value is ever placed in a
+response, a log record or a raised exception message.
 """
 
 from __future__ import annotations
@@ -57,6 +69,7 @@ import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
+from .auth import AuthConfig, ROLE_READ, ROLE_SUBMIT
 from .requests import IdempotencyConflict, RequestNotFound, RequestStore
 
 __all__ = ["build_server", "make_handler", "DeferredRequestStore"]
@@ -66,6 +79,7 @@ _log = logging.getLogger(__name__)
 _COLLECTION_PATH = "/requests"
 _ITEM_PATH_PREFIX = "/requests/"
 _TENANT_HEADER = "X-Tenant-Id"
+_AUTHORIZATION_HEADER = "Authorization"
 
 # Reject oversized request bodies before they reach the database layer.
 _MAX_BODY_BYTES = 1 << 20  # 1 MiB
@@ -80,6 +94,8 @@ _NOT_FOUND = "not_found"
 _METHOD_NOT_ALLOWED = "method_not_allowed"
 _IDEMPOTENCY_CONFLICT = "idempotency_conflict"
 _STORAGE_UNAVAILABLE = "storage_unavailable"
+_UNAUTHORIZED = "unauthorized"
+_FORBIDDEN = "forbidden"
 
 
 class _BadRequest(Exception):
@@ -214,17 +230,27 @@ def build_server(
     store,
     host: str = "127.0.0.1",
     port: int = 8080,
+    auth: AuthConfig | None = None,
 ) -> ThreadingHTTPServer:
-    """Build (but do not start) the threaded HTTP server bound to *host*:*port*."""
-    handler = make_handler(store)
+    """Build (but do not start) the threaded HTTP server bound to *host*:*port*.
+
+    With *auth* unset the server keeps the historical unauthenticated
+    contract; with an :class:`~forgetting_evidence.auth.AuthConfig`
+    every matched business request is authenticated and authorized
+    before any payload validation or storage access.
+    """
+    handler = make_handler(store, auth)
     server = ThreadingHTTPServer((host, port), handler)
     # Worker threads must not keep the process alive on shutdown.
     server.daemon_threads = True
     return server
 
 
-def make_handler(store: RequestStore) -> type[BaseHTTPRequestHandler]:
-    """Build a handler class closed over *store*."""
+def make_handler(
+    store: RequestStore,
+    auth: AuthConfig | None = None,
+) -> type[BaseHTTPRequestHandler]:
+    """Build a handler class closed over *store* and optional *auth*."""
 
     class _DeletionRequestHandler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -312,8 +338,24 @@ def make_handler(store: RequestStore) -> type[BaseHTTPRequestHandler]:
             if kind != "collection":
                 self._reply_error(405, _METHOD_NOT_ALLOWED, allowed="GET")
                 return
+            # Authentication and RBAC precede all payload validation and
+            # storage access; only matched business routes reach here, so
+            # unknown paths (404) and unsupported verbs (405) never ask
+            # for credentials.
+            if auth is not None:
+                principal = self._authorize(ROLE_SUBMIT)
+                if principal is None:
+                    # Consume the rejected request's framed body so a
+                    # keep-alive socket stays in sync; only an absent,
+                    # malformed or oversized Content-Length forces the
+                    # connection closed.
+                    self._drain_body_after_error()
+                    return
             payload = self._read_json_object()
             tenant_id = _require_string(payload, "tenant_id")
+            if auth is not None and tenant_id != principal.tenant_id:
+                self._reply_error(403, _FORBIDDEN)
+                return
             subject_id = _require_string(payload, "subject_id")
             idempotency_key = _require_string(payload, "idempotency_key")
             scopes = _require_scopes(payload)
@@ -351,6 +393,22 @@ def make_handler(store: RequestStore) -> type[BaseHTTPRequestHandler]:
             if kind != "item":
                 self._reply_error(405, _METHOD_NOT_ALLOWED, allowed="POST")
                 return
+            # Auth precedes payload validation and storage access on
+            # matched business routes only: credential, role and the
+            # target-tenant scope are all settled before the request id
+            # is validated or the store is touched.
+            if auth is not None:
+                principal = self._authorize(ROLE_READ)
+                if principal is None:
+                    return
+                try:
+                    tenant_id = self._tenant_id()
+                except _BadRequest:
+                    self._reply_error(400, _INVALID_REQUEST)
+                    return
+                if tenant_id != principal.tenant_id:
+                    self._reply_error(403, _FORBIDDEN)
+                    return
             assert segment is not None
             try:
                 request_id = _normalize_request_id(segment)
@@ -358,11 +416,12 @@ def make_handler(store: RequestStore) -> type[BaseHTTPRequestHandler]:
                 # Unknown and malformed ids share one outcome.
                 self._reply_error(404, _NOT_FOUND)
                 return
-            try:
-                tenant_id = self._tenant_id()
-            except _BadRequest:
-                self._reply_error(400, _INVALID_REQUEST)
-                return
+            if auth is None:
+                try:
+                    tenant_id = self._tenant_id()
+                except _BadRequest:
+                    self._reply_error(400, _INVALID_REQUEST)
+                    return
             try:
                 receipt = store.get(tenant_id, request_id)
             except RequestNotFound:
@@ -383,6 +442,24 @@ def make_handler(store: RequestStore) -> type[BaseHTTPRequestHandler]:
             self._reply_receipt(200, receipt)
 
         # -- input parsing ---------------------------------------------
+
+        def _authorize(self, required_role: str):
+            """Authenticate the bearer token and enforce *required_role*.
+
+            Returns the matched principal, or ``None`` after writing
+            ``401 {"error":"unauthorized"}`` (missing/malformed
+            credential or unknown token) or ``403
+            {"error":"forbidden"}`` (role missing). Token material is
+            never logged or reflected.
+            """
+            principal = auth.principal(self.headers.get(_AUTHORIZATION_HEADER))
+            if principal is None:
+                self._reply_error(401, _UNAUTHORIZED)
+                return None
+            if required_role not in principal.roles:
+                self._reply_error(403, _FORBIDDEN)
+                return None
+            return principal
 
         def _tenant_id(self) -> str:
             header = self.headers.get(_TENANT_HEADER)
@@ -408,6 +485,13 @@ def make_handler(store: RequestStore) -> type[BaseHTTPRequestHandler]:
             return parsed
 
         def _read_body(self) -> bytes:
+            length = self._content_length()
+            try:
+                return self.rfile.read(length)
+            except OSError:
+                raise _BadRequest("unreadable body")
+
+        def _content_length(self) -> int:
             raw_length = self.headers.get("Content-Length")
             if raw_length is None:
                 raise _BadRequest("missing content length")
@@ -420,10 +504,23 @@ def make_handler(store: RequestStore) -> type[BaseHTTPRequestHandler]:
                 # connection so keep-alive cannot desync the next request.
                 self.close_connection = True
                 raise _BadRequest("body too large")
+            return length
+
+        def _drain_body_after_error(self) -> None:
+            """Consume a rejected request's framed body.
+
+            Keeps a reused connection aligned with the next request.
+            A missing, malformed or oversized Content-Length (or a
+            client that hangs mid-body) instead drops the connection;
+            the error response has already been written.
+            """
             try:
-                return self.rfile.read(length)
+                length = self._content_length()
+                self.rfile.read(length)
+            except _BadRequest:
+                self.close_connection = True
             except OSError:
-                raise _BadRequest("unreadable body")
+                self.close_connection = True
 
         # -- responses --------------------------------------------------
 

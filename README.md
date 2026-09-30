@@ -14,7 +14,18 @@ PYTHONPATH=src python3 -m forgetting_evidence health
 PYTHONPATH=src python3 -m forgetting_evidence serve ./data/evidence.db 0.0.0.0 8080
 # 也可使用命名参数
 PYTHONPATH=src python3 -m forgetting_evidence serve --db ./data/evidence.db --host 0.0.0.0 --port 8080
+# 可选：启用 Bearer 令牌鉴权与 RBAC（--auth-file 可与位置参数或命名参数任意组合）
+PYTHONPATH=src python3 -m forgetting_evidence serve --db ./data/evidence.db --host 0.0.0.0 --port 8080 --auth-file ./auth.json
 ```
+
+可选令牌鉴权与 RBAC（仅 HTTP，不影响存储层；未提供 `--auth-file` 时维持完全相同的无鉴权契约）：
+
+- 鉴权配置在启动时读取一次，为 UTF-8 JSON 对象：`{"principals":[{"token":"...","tenant_id":"...","roles":["request:submit","request:read"]}]}`。`token` 与 `tenant_id` 为非空字符串；`roles` 为非空数组，元素互异且只能取 `request:submit`、`request:read`。令牌重复或任何配置不合规（文件缺失/不可读、非 UTF-8、JSON 损坏、形状或值域非法）时**不绑定端口**，标准错误输出固定的 `auth_config_invalid`，进程以状态码 2 结束；配置内容与令牌绝不输出。
+- 启用后，已匹配业务路径的请求必须携带 `Authorization: Bearer <已配置令牌>`：缺少授权头、授权头畸形或令牌未配置返回 `401 {"error":"unauthorized"}`；令牌有效但角色不足，或目标租户不是其 `tenant_id`，返回 `403 {"error":"forbidden"}`。
+- `POST /requests` 要求 `request:submit`，目标租户取请求体 `tenant_id`；`GET /requests/{request_id}` 要求 `request:read`，目标租户沿用 `X-Tenant-Id` 非空时优先、否则取最后一个非空 `tenant_id` 查询参数的规则。鉴权与授权先于已匹配路径的载荷校验与存储访问；未知路径仍为 404、不支持的方法仍为 405，且不索取凭据。
+- 成功请求的受理、同键幂等重放（同主体同范围集合返回首次字节一致回执）与回执查询语义不变；同键冲突、缺请求或跨租户、存储故障仍依次为 409 `idempotency_conflict`、404 `not_found`、503 `storage_unavailable`。
+- 鉴权配置只存在于启动进程内存：令牌、角色与配置绝不写入数据库、状态、执行、回执、审计事件、锚点或证据包，也不进入响应、异常或日志；重启后的授权结果只由同一份配置决定。
+
 
 业务入口（HTTP 仅两个）：
 
@@ -145,6 +156,8 @@ HTTP 错误响应均为只含 `error` 字段的单行 JSON，使用稳定错误�
 | HTTP | error |
 | --- | --- |
 | 400 | `invalid_request`（非法 JSON、空值/非字符串、空范围或重复范围） |
+| 401 | `unauthorized`（仅启用鉴权时：缺少/畸形授权头、令牌未配置） |
+| 403 | `forbidden`（仅启用鉴权时：角色不足或目标租户非本主体租户） |
 | 404 | `not_found`（缺失请求、非法编号、跨租户查询、未知路径） |
 | 405 | `method_not_allowed`（不支持的请求方法；HTTP 不提供状态推进端点） |
 | 409 | `idempotency_conflict`（同键不同主体或范围集合） |

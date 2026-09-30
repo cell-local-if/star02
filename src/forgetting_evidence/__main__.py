@@ -2,13 +2,14 @@ import json
 import signal
 import sys
 
+from .auth import AuthConfigError, load_auth_config
 from .httpapi import DeferredRequestStore, build_server
 
 _USAGE = "usage: python -m forgetting_evidence health"
 _SERVE_USAGE = (
     "usage: python -m forgetting_evidence serve <database> <address> <port>\n"
     "       python -m forgetting_evidence serve --db <database> "
-    "--host <address> --port <port>"
+    "--host <address> --port <port> [--auth-file <config>]"
 )
 
 _FLAG_ALIASES = {
@@ -18,8 +19,10 @@ _FLAG_ALIASES = {
     "--address": "host",
     "--bind": "host",
     "--port": "port",
+    "--auth-file": "auth_file",
 }
 _POSITIONAL_FIELDS = ("db", "host", "port")
+_OPTIONAL_FIELDS = ("auth_file",)
 
 
 def _parse_serve_args(args: list[str]) -> dict[str, str] | None:
@@ -45,16 +48,19 @@ def _parse_serve_args(args: list[str]) -> dict[str, str] | None:
         else:
             positionals.append(token)
         index += 1
-    if positionals and values:
-        # Avoid ambiguity when both styles are mixed.
-        return None
     if positionals:
         if len(positionals) != 3:
             return None
-        values = dict(zip(_POSITIONAL_FIELDS, positionals))
+        # Named required fields stay exclusive with positionals; the
+        # optional --auth-file may accompany either invocation style.
+        if any(values.get(field) for field in _POSITIONAL_FIELDS):
+            return None
+        values.update(dict(zip(_POSITIONAL_FIELDS, positionals)))
     missing = [field for field in _POSITIONAL_FIELDS if not values.get(field)]
     if missing:
         return None
+    for field in _OPTIONAL_FIELDS:
+        values.setdefault(field, "")
     return values
 
 
@@ -72,13 +78,25 @@ def _run_serve(args: list[str]) -> int:
         print(_SERVE_USAGE, file=sys.stderr)
         return 2
 
+    # The auth configuration is read and validated exactly once at
+    # startup, before the store is opened and before any port is bound.
+    # A missing or non-compliant file fails startup with the fixed code
+    # and exit status 2; the offending content is never printed.
+    auth = None
+    if parsed["auth_file"]:
+        try:
+            auth = load_auth_config(parsed["auth_file"])
+        except AuthConfigError as error:
+            print(str(error), file=sys.stderr)
+            return 2
+
     # The store opens (creating the file and required tables) at startup.
     # If the database cannot be created the service still binds: business
     # requests then answer 503 storage_unavailable and the store retries
     # initialization on the next request so a repaired path self-heals.
     store = DeferredRequestStore(parsed["db"])
     try:
-        server = build_server(store, parsed["host"], port)
+        server = build_server(store, parsed["host"], port, auth=auth)
     except OSError:
         print("address_in_use", file=sys.stderr)
         return 1
