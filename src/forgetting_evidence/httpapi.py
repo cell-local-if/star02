@@ -306,6 +306,12 @@ class DeferredRequestStore:
         # machine it is never routed over HTTP.
         return self._ready().claim_next(tenant_id, worker_id, lease_seconds)
 
+    def claim_next_global(self, worker_id, lease_seconds):
+        # Cross-tenant fair claiming for a shared worker pool is
+        # storage-layer only; like the rest of the execution orchestration
+        # it is never routed over HTTP.
+        return self._ready().claim_next_global(worker_id, lease_seconds)
+
     def finish_claim(self, tenant_id, request_id, claim_token, result):
         return self._ready().finish_claim(
             tenant_id, request_id, claim_token, result
