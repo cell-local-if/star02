@@ -78,6 +78,35 @@ Execution orchestration lives on the same store, storage-layer only:
   any storage fault is the fixed-text :class:`OSError`
   ``execution_lease_migration_failed``.
 
+Scoped deletion tombstones track the per-adapter outcome of an
+executing request, storage-layer only like the rest of the
+orchestration and never routed over HTTP:
+
+* :meth:`RequestStore.record_deletion_tombstones` registers adapter
+  results under a live lease. Each item carries exactly ``adapter_id``,
+  ``scope``, ``operation_id``, ``outcome`` and ``proof_digest``: the
+  scope must be one of the request's normalized scopes, the outcome is
+  ``deleted`` or ``absent``, and the proof digest is a 64-character
+  lowercase hexadecimal commitment -- the raw object and the proof body
+  are never stored. Replaying the identical list returns the first
+  settled ``recorded_at`` and digest; an operation number bound to
+  different content, a contradictory outcome for the same scope, or an
+  operation number already used by another request or tenant raises
+  :class:`TombstoneConflict` and leaves the ledger unchanged.
+* :meth:`RequestStore.finish_scoped_claim` finishes the live claim with
+  ``completed`` or ``failed``. ``completed`` lands only when every
+  normalized scope is covered by exactly one tombstone: the terminal
+  status, the scope-completion ``evidence_digest`` (SHA-256 over the
+  tombstone contents ordered by normalized scope then operation number)
+  and the execution record commit atomically, while a missing,
+  duplicated or superfluous coverage raises
+  :class:`TombstoneUnavailable`. ``failed`` requires no coverage.
+  Repeating the call under the still-live lease returns the first
+  settled result.
+* :meth:`RequestStore.get_deletion_tombstones` returns the recorded
+  tombstones ordered by normalized scope then ``adapter_id`` together
+  with the first settled ``recorded_at`` and the ``evidence_digest``.
+
 Deletion receipts close the lifecycle with an externally verifiable
 record, storage-layer only like the rest of the orchestration:
 
@@ -487,6 +516,8 @@ __all__ = [
     "BackupConflict",
     "PolicyCatalogConflict",
     "PolicyCatalogNotFound",
+    "TombstoneConflict",
+    "TombstoneUnavailable",
 ]
 
 _log = logging.getLogger(__name__)
@@ -596,6 +627,28 @@ class PolicyCatalogNotFound(Exception):
     tenant; both share one detail-free outcome, so another tenant's
     catalog history can never be probed and the version sequence never
     advances for a failed lookup.
+    """
+
+
+class TombstoneConflict(Exception):
+    """Raised when a tombstone registration contradicts the ledger.
+
+    An operation number is already bound to different content, to
+    another request or to another tenant, or the same adapter scope
+    already holds a different outcome. The fixed message never
+    identifies which condition applied, and a rejected registration
+    never changes the ledger.
+    """
+
+
+class TombstoneUnavailable(Exception):
+    """Raised when a scoped claim cannot complete for lack of coverage.
+
+    The request exists, is visible to the tenant and holds a live
+    lease, but its normalized scopes are not each covered by exactly
+    one tombstone: a scope is missing, duplicated or carries a
+    superfluous record. The fixed message never identifies which
+    condition applied, and no terminal state is written.
     """
 
 
@@ -803,6 +856,54 @@ CREATE TABLE IF NOT EXISTS lease_migration_items (
     outcome        TEXT NOT NULL,
     PRIMARY KEY (batch_id, seq),
     UNIQUE (tenant_id, request_id)
+);
+"""
+
+# Scoped deletion tombstones, one row per adapter outcome registered
+# under a live lease. The primary key makes one adapter outcome per
+# normalized scope of a request: re-registering the identical row is an
+# idempotent replay, while a different outcome, proof or operation
+# number for the same scope is a ledger contradiction. Only the
+# 64-character lowercase hexadecimal proof commitment is stored -- the
+# raw object and the proof body never enter the database. Rows are
+# inserted once and never updated or deleted by the store.
+_TOMBSTONE_TABLE = """
+CREATE TABLE IF NOT EXISTS deletion_tombstones (
+    tenant_id    TEXT NOT NULL,
+    request_id   TEXT NOT NULL,
+    scope        TEXT NOT NULL,
+    adapter_id   TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    outcome      TEXT NOT NULL,
+    proof_digest TEXT NOT NULL,
+    recorded_at  TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, request_id, scope, adapter_id)
+);
+"""
+
+# An operation number belongs to exactly one tombstone across every
+# tenant and request: reusing it elsewhere -- even by another tenant --
+# is a ledger conflict, never a silent alias.
+_TOMBSTONE_OPERATION_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_deletion_tombstones_operation
+    ON deletion_tombstones(operation_id);
+"""
+
+# Scoped-claim finishes, at most one row per request. The row is
+# written in the same transaction as the terminal status, the execution
+# record and (for ``completed``) the scope-completion evidence digest,
+# so a repeated finish under the still-live lease replays the first
+# settled result instead of re-finishing. ``evidence_digest`` is NULL
+# for a ``failed`` finish, which requires no tombstone coverage. Rows
+# are inserted once and never updated or deleted by the store.
+_TOMBSTONE_FINISH_TABLE = """
+CREATE TABLE IF NOT EXISTS deletion_tombstone_finishes (
+    tenant_id       TEXT NOT NULL,
+    request_id      TEXT NOT NULL,
+    result          TEXT NOT NULL,
+    evidence_digest TEXT,
+    finished_at     TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, request_id)
 );
 """
 
@@ -1125,6 +1226,19 @@ def _policy_catalog_failure() -> OSError:
 def _policy_catalog_value_failure() -> ValueError:
     """Build the single catalog validation error callers ever see."""
     return ValueError(_POLICY_CATALOG_MESSAGE)
+
+
+# Fixed, detail-free text for every deletion-tombstone failure: an
+# unreadable or unwritable store, a corrupt tombstone or finish record,
+# or a commit that cannot land. It never embeds a tenant, a subject, a
+# scope, an adapter, an operation number, a credential, SQL text or a
+# filesystem path, and a half-written registration is never visible.
+_DELETION_TOMBSTONE_MESSAGE = "deletion_tombstone_failed"
+
+
+def _deletion_tombstone_failure() -> OSError:
+    """Build the single tombstone storage error callers ever see."""
+    return OSError(_DELETION_TOMBSTONE_MESSAGE)
 
 
 # The lost concurrent-publication outcome and the missing/foreign version
@@ -1794,6 +1908,111 @@ def _claim_conflict() -> ClaimConflict:
     return ClaimConflict(_CLAIM_CONFLICT_MESSAGE)
 
 
+# The only outcomes a deletion tombstone may record: the adapter deleted
+# the scoped object, or the object was already absent.
+_TOMBSTONE_OUTCOMES = frozenset({"deleted", "absent"})
+
+# The exact field set of one tombstone registration item. Nothing else
+# is accepted: the raw object and the proof body never reach the store.
+_TOMBSTONE_ITEM_FIELDS = frozenset(
+    {"adapter_id", "scope", "operation_id", "outcome", "proof_digest"}
+)
+
+# Fixed, detail-free texts for the two tombstone domain rejections.
+# Neither identifies which condition applied, so the outcomes can never
+# be used to probe the ledger, another request or another tenant.
+_TOMBSTONE_CONFLICT_MESSAGE = "tombstone conflict"
+_TOMBSTONE_UNAVAILABLE_MESSAGE = "tombstone unavailable"
+
+
+def _tombstone_conflict() -> TombstoneConflict:
+    """Build the single, detail-free tombstone conflict callers see."""
+    return TombstoneConflict(_TOMBSTONE_CONFLICT_MESSAGE)
+
+
+def _tombstone_unavailable() -> TombstoneUnavailable:
+    """Build the single, detail-free coverage error callers ever see."""
+    return TombstoneUnavailable(_TOMBSTONE_UNAVAILABLE_MESSAGE)
+
+
+def _normalize_tombstone_items(value: object) -> list[dict[str, str]]:
+    """Validate the tombstone list handed to record_deletion_tombstones.
+
+    A non-empty list is required; every element must be a mapping with
+    exactly the five tombstone fields, non-empty string ``adapter_id``,
+    ``scope`` and ``operation_id``, an outcome of ``deleted`` or
+    ``absent`` and a 64-character lowercase hexadecimal proof digest.
+    Within one list the (scope, adapter) pair and the operation number
+    must each be distinct. Every malformed shape raises the same
+    :class:`ValueError` before storage is touched.
+    """
+    message = (
+        "tombstones must be a non-empty list of records with exactly "
+        "adapter_id, scope, operation_id, outcome and proof_digest"
+    )
+    if not isinstance(value, list) or not value:
+        raise ValueError(message)
+    items: list[dict[str, str]] = []
+    seen_scopes: set[tuple[str, str]] = set()
+    seen_operations: set[str] = set()
+    for entry in value:
+        if not isinstance(entry, Mapping) or set(entry) != _TOMBSTONE_ITEM_FIELDS:
+            raise ValueError(message)
+        adapter_id = entry["adapter_id"]
+        scope = entry["scope"]
+        operation_id = entry["operation_id"]
+        outcome = entry["outcome"]
+        proof_digest = entry["proof_digest"]
+        if (
+            not isinstance(adapter_id, str)
+            or not adapter_id
+            or not isinstance(scope, str)
+            or not scope
+            or not isinstance(operation_id, str)
+            or not operation_id
+            or not isinstance(outcome, str)
+            or outcome not in _TOMBSTONE_OUTCOMES
+            or not _is_chain_hash(proof_digest)
+        ):
+            raise ValueError(message)
+        scope_key = (scope, adapter_id)
+        if scope_key in seen_scopes or operation_id in seen_operations:
+            raise ValueError(message)
+        seen_scopes.add(scope_key)
+        seen_operations.add(operation_id)
+        items.append(
+            {
+                "adapter_id": adapter_id,
+                "scope": scope,
+                "operation_id": operation_id,
+                "outcome": outcome,
+                "proof_digest": proof_digest,
+            }
+        )
+    return items
+
+
+def _request_scopes_or_tombstone_failure(scopes_json: object) -> list[str]:
+    """Decode a request's persisted normalized scopes for tombstone work.
+
+    The persisted value was written by the store itself; anything that
+    does not decode to a non-empty list of non-empty strings means the
+    record was altered out of band and is reported as storage
+    corruption, never partially used.
+    """
+    try:
+        scopes = json.loads(scopes_json) if isinstance(scopes_json, str) else None
+    except (ValueError, TypeError):
+        scopes = None
+    if (
+        not isinstance(scopes, list)
+        or not scopes
+        or not all(isinstance(scope, str) and scope for scope in scopes)
+    ):
+        raise _deletion_tombstone_failure()
+    return scopes
+
+
 def _require_nonempty_str(value: object, field: str) -> str:
     if not isinstance(value, str) or not value:
         raise ValueError(f"{field} must be a non-empty string")
@@ -2123,6 +2342,25 @@ def _attempt_digest(
         encoded = str(field).encode("utf-8")
         digest.update(struct.pack(">Q", len(encoded)))
         digest.update(encoded)
+    return digest.hexdigest()
+
+
+def _tombstone_evidence_digest(rows: list[tuple[str, str, str, str, str]]) -> str:
+    """Commit to a set of deletion tombstones.
+
+    Each row is ``(scope, operation_id, adapter_id, outcome,
+    proof_digest)``; the rows are ordered by normalized scope then
+    operation number and every field is length-prefixed with the same
+    encoding as the audit chain, so no concatenation can be re-parsed
+    two ways. The preimage never contains a tenant, a request id, a
+    subject, a raw object or a proof body.
+    """
+    digest = hashlib.sha256()
+    for scope, operation_id, adapter_id, outcome, proof_digest in sorted(rows):
+        for field in (scope, operation_id, adapter_id, outcome, proof_digest):
+            encoded = field.encode("utf-8")
+            digest.update(struct.pack(">Q", len(encoded)))
+            digest.update(encoded)
     return digest.hexdigest()
 
 
@@ -2806,6 +3044,9 @@ class RequestStore:
                 conn.execute(_LEGACY_LEASE_TABLE)
                 conn.execute(_LEASE_MIGRATION_BATCH_TABLE)
                 conn.execute(_LEASE_MIGRATION_ITEM_TABLE)
+                conn.execute(_TOMBSTONE_TABLE)
+                conn.execute(_TOMBSTONE_OPERATION_INDEX)
+                conn.execute(_TOMBSTONE_FINISH_TABLE)
                 conn.execute(_RECEIPT_TABLE)
                 conn.execute(_RECEIPT_KEY_TABLE)
                 conn.execute(_RECEIPT_KEY_FINGERPRINT_INDEX)
@@ -4705,6 +4946,553 @@ class RequestStore:
                 }
             )
         return attempts
+
+    # -- scoped deletion tombstones ------------------------------------
+
+    def record_deletion_tombstones(
+        self,
+        tenant_id: str,
+        request_id: str,
+        claim_token: str,
+        tombstones: object,
+    ) -> dict[str, str]:
+        """Register per-adapter deletion outcomes under the live lease.
+
+        The token must identify the request's current, unexpired,
+        unreleased lease for the same tenant; an unknown, expired,
+        already-released or cross-tenant token -- as well as a request
+        whose claim already finished -- raises :class:`ClaimConflict`
+        and changes nothing. Every item must carry exactly
+        ``adapter_id``, ``scope``, ``operation_id``, ``outcome`` and
+        ``proof_digest``: the scope must be one of the request's
+        normalized scopes, the outcome ``deleted`` or ``absent`` and the
+        proof digest 64 lowercase hexadecimal characters; the raw object
+        and the proof body are never stored. The whole list commits in
+        one transaction. Replaying the identical list returns the first
+        settled ``recorded_at`` and digest; an operation number bound to
+        different content, a contradictory outcome for the same adapter
+        scope, or an operation number already used by another request or
+        tenant raises :class:`TombstoneConflict` and leaves the ledger
+        unchanged. Invalid arguments raise :class:`ValueError` without
+        writing; unknown or cross-tenant ids raise
+        :class:`RequestNotFound`; every storage fault is the fixed-text
+        :class:`OSError` ``deletion_tombstone_failed``.
+        """
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        request_id = _require_identifier(request_id)
+        claim_token = _require_nonempty_str(claim_token, "claim_token")
+        items = _normalize_tombstone_items(tombstones)
+
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                except sqlite3.Error:
+                    raise _deletion_tombstone_failure() from None
+                try:
+                    record = self._record_deletion_tombstones_locked(
+                        conn, tenant_id, request_id, claim_token, items
+                    )
+                    conn.execute("COMMIT")
+                except (RequestNotFound, ClaimConflict, TombstoneConflict, ValueError):
+                    # Domain rejections carry no engine text; ensure the
+                    # shared in-memory connection leaves the transaction.
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
+                except OSError:
+                    # The fixed-text tombstone failure; never leave the
+                    # shared connection inside the aborted transaction.
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
+                except sqlite3.Error:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise _deletion_tombstone_failure() from None
+            finally:
+                self._release(conn)
+        _log.info("deletion tombstones recorded request_id=%s", request_id)
+        return record
+
+    def _record_deletion_tombstones_locked(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        request_id: str,
+        claim_token: str,
+        items: list[dict[str, str]],
+    ) -> dict[str, str]:
+        attempt_number, attempt_result = self._live_lease_locked(
+            conn, tenant_id, request_id, claim_token
+        )
+        row = conn.execute(
+            "SELECT status, scopes_json FROM requests "
+            "WHERE tenant_id = ? AND request_id = ?",
+            (tenant_id, request_id),
+        ).fetchone()
+        if row is None:
+            # Defensive: a live token always names an existing request.
+            raise RequestNotFound("request not found")
+        status, scopes_json = row
+        if attempt_result is not None or status != _STATUS_PROCESSING:
+            # The claim already settled; the ledger is closed for it.
+            raise _claim_conflict()
+        scopes = _request_scopes_or_tombstone_failure(scopes_json)
+        scope_set = set(scopes)
+        for item in items:
+            if item["scope"] not in scope_set:
+                raise ValueError(
+                    "tombstone scope must be one of the request's "
+                    "normalized scopes"
+                )
+
+        recorded_at = _utc_now_rfc3339()
+        settled_ats: list[str] = []
+        inserted = False
+        for item in items:
+            existing = conn.execute(
+                "SELECT tenant_id, request_id, scope, adapter_id, outcome, "
+                "proof_digest, recorded_at FROM deletion_tombstones "
+                "WHERE operation_id = ?",
+                (item["operation_id"],),
+            ).fetchone()
+            if existing is not None:
+                if existing[:6] != (
+                    tenant_id,
+                    request_id,
+                    item["scope"],
+                    item["adapter_id"],
+                    item["outcome"],
+                    item["proof_digest"],
+                ):
+                    # The operation number is already bound elsewhere --
+                    # different content, another request or another
+                    # tenant all share the one detail-free outcome.
+                    raise _tombstone_conflict()
+                # Identical re-registration: the idempotent replay keeps
+                # the first settled record.
+                settled_ats.append(existing[6])
+                continue
+            clash = conn.execute(
+                "SELECT 1 FROM deletion_tombstones "
+                "WHERE tenant_id = ? AND request_id = ? "
+                "AND scope = ? AND adapter_id = ?",
+                (tenant_id, request_id, item["scope"], item["adapter_id"]),
+            ).fetchone()
+            if clash is not None:
+                # The adapter scope already holds a different outcome.
+                raise _tombstone_conflict()
+            try:
+                conn.execute(
+                    "INSERT INTO deletion_tombstones ("
+                    "tenant_id, request_id, scope, adapter_id, "
+                    "operation_id, outcome, proof_digest, recorded_at"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        tenant_id,
+                        request_id,
+                        item["scope"],
+                        item["adapter_id"],
+                        item["operation_id"],
+                        item["outcome"],
+                        item["proof_digest"],
+                        recorded_at,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                # A concurrent writer committed a conflicting row first.
+                raise _tombstone_conflict() from None
+            inserted = True
+        # A pure replay reports the first settlement; any new row is
+        # stamped with this transaction's commit time.
+        settled = recorded_at if inserted else min(settled_ats)
+        digest = _tombstone_evidence_digest(
+            [
+                (
+                    item["scope"],
+                    item["operation_id"],
+                    item["adapter_id"],
+                    item["outcome"],
+                    item["proof_digest"],
+                )
+                for item in items
+            ]
+        )
+        return {
+            "request_id": request_id,
+            "recorded_at": settled,
+            "evidence_digest": digest,
+        }
+
+    def finish_scoped_claim(
+        self,
+        tenant_id: str,
+        request_id: str,
+        claim_token: str,
+        result: str,
+    ) -> dict[str, str]:
+        """Finish the live claim with a tombstone-checked ``result``.
+
+        ``result`` must be ``completed`` or ``failed``. The token must
+        identify the request's current, unexpired, unreleased lease for
+        the same tenant; an unknown, expired, already-released or
+        cross-tenant token raises :class:`ClaimConflict` and changes
+        nothing. ``completed`` lands only when every normalized scope of
+        the request is covered by exactly one tombstone: the terminal
+        status, its chain event, the scope-completion
+        ``evidence_digest`` and the execution record commit in one
+        transaction, while a missing, duplicated or superfluous coverage
+        raises :class:`TombstoneUnavailable` and changes nothing.
+        ``failed`` requires no coverage. Repeating the call under the
+        still-live lease returns the first settled result. Returns the
+        status record (``request_id``, ``status``, ``created_at``).
+        Invalid arguments raise :class:`ValueError` without writing;
+        unknown or cross-tenant ids raise :class:`RequestNotFound`;
+        every storage fault is the fixed-text :class:`OSError`
+        ``deletion_tombstone_failed``.
+        """
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        request_id = _require_identifier(request_id)
+        result = _require_result(result)
+        claim_token = _require_nonempty_str(claim_token, "claim_token")
+
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                except sqlite3.Error:
+                    raise _deletion_tombstone_failure() from None
+                try:
+                    receipt = self._finish_scoped_claim_locked(
+                        conn, tenant_id, request_id, claim_token, result
+                    )
+                    conn.execute("COMMIT")
+                except (
+                    InvalidStatusTransition,
+                    RequestNotFound,
+                    ClaimConflict,
+                    TombstoneUnavailable,
+                ):
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
+                except OSError:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
+                except sqlite3.Error:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise _deletion_tombstone_failure() from None
+            finally:
+                self._release(conn)
+        _log.info(
+            "scoped claim finished request_id=%s status=%s",
+            request_id,
+            receipt["status"],
+        )
+        return receipt
+
+    def _finish_scoped_claim_locked(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        request_id: str,
+        claim_token: str,
+        result: str,
+    ) -> dict[str, str]:
+        attempt_number, attempt_result = self._live_lease_locked(
+            conn, tenant_id, request_id, claim_token
+        )
+        row = conn.execute(
+            "SELECT status, created_at, scopes_json FROM requests "
+            "WHERE tenant_id = ? AND request_id = ?",
+            (tenant_id, request_id),
+        ).fetchone()
+        if row is None:
+            # Defensive: a live token always names an existing request.
+            raise RequestNotFound("request not found")
+        current_status, created_at, scopes_json = row
+
+        settled = conn.execute(
+            "SELECT result, evidence_digest FROM deletion_tombstone_finishes "
+            "WHERE tenant_id = ? AND request_id = ?",
+            (tenant_id, request_id),
+        ).fetchone()
+        if settled is not None:
+            # The claim already finished through this entry point: the
+            # repeat under the still-live lease replays the first
+            # settled result and changes nothing.
+            first_result, first_digest = settled
+            if first_result not in _TERMINAL_RESULTS or (
+                first_digest is not None and not _is_chain_hash(first_digest)
+            ):
+                raise _deletion_tombstone_failure()
+            return {
+                "request_id": request_id,
+                "status": first_result,
+                "created_at": created_at,
+            }
+
+        if attempt_result is not None:
+            # The claim was finished through the plain entry point.
+            raise _claim_conflict()
+        if current_status != _STATUS_PROCESSING:
+            raise _claim_conflict()
+
+        evidence_digest: str | None = None
+        if result == _STATUS_COMPLETED:
+            scopes = _request_scopes_or_tombstone_failure(scopes_json)
+            entries = self._load_tombstone_entries_locked(
+                conn, tenant_id, request_id
+            )
+            per_scope: dict[str, int] = {}
+            for entry in entries:
+                per_scope[entry[0]] = per_scope.get(entry[0], 0) + 1
+            # Exactly one tombstone per normalized scope: a missing,
+            # duplicated or superfluous coverage can never complete.
+            if set(per_scope) != set(scopes) or any(
+                count != 1 for count in per_scope.values()
+            ):
+                raise _tombstone_unavailable()
+            evidence_digest = _tombstone_evidence_digest(entries)
+
+        # The terminal status, its chain event, the execution record and
+        # the finish ledger row land in this one transaction; the token
+        # stays live so a repeat replays the first settled result.
+        try:
+            completed_at = self._persist_status_change(
+                conn, tenant_id, request_id, _STATUS_PROCESSING, result
+            )
+        except OSError:
+            raise _deletion_tombstone_failure() from None
+        cursor = conn.execute(
+            "UPDATE claim_attempts SET result = ?, completed_at = ? "
+            "WHERE tenant_id = ? AND request_id = ? AND attempt_number = ? "
+            "AND result IS NULL",
+            (result, completed_at, tenant_id, request_id, attempt_number),
+        )
+        if cursor.rowcount != 1:
+            raise _claim_conflict()
+        conn.execute(
+            "INSERT INTO deletion_tombstone_finishes ("
+            "tenant_id, request_id, result, evidence_digest, finished_at"
+            ") VALUES (?, ?, ?, ?, ?)",
+            (tenant_id, request_id, result, evidence_digest, completed_at),
+        )
+        return {
+            "request_id": request_id,
+            "status": result,
+            "created_at": created_at,
+        }
+
+    def _live_lease_locked(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        request_id: str,
+        claim_token: str,
+    ) -> tuple[int, str | None]:
+        """Resolve the presented token to its live lease.
+
+        Mirrors :meth:`_finish_claim_locked`'s credential resolution: a
+        token issued to another tenant or request looks exactly like an
+        unknown or released one, and an unknown or cross-tenant request
+        id raises :class:`RequestNotFound` with stable precedence.
+        Returns ``(attempt_number, attempt_result)`` for the lease's
+        attempt; the caller decides whether an already-settled attempt
+        is a conflict or a replay.
+        """
+        presented = hashlib.sha256(claim_token.encode("utf-8")).hexdigest()
+        owner = conn.execute(
+            "SELECT tenant_id, request_id, attempt_number FROM claim_tokens "
+            "WHERE token_hash = ? LIMIT 1",
+            (presented,),
+        ).fetchone()
+        if owner is None:
+            exists = conn.execute(
+                "SELECT 1 FROM requests WHERE tenant_id = ? AND request_id = ?",
+                (tenant_id, request_id),
+            ).fetchone()
+            if exists is None:
+                raise RequestNotFound("request not found")
+            raise _claim_conflict()
+        if (owner[0], owner[1]) != (tenant_id, request_id):
+            raise _claim_conflict()
+        attempt = conn.execute(
+            "SELECT result, lease_expires_at FROM claim_attempts "
+            "WHERE tenant_id = ? AND request_id = ? AND attempt_number = ?",
+            (tenant_id, request_id, owner[2]),
+        ).fetchone()
+        if attempt is None:
+            # Defensive: a live token always names its attempt.
+            raise _claim_conflict()
+        if _utc_now_rfc3339() > attempt[1]:
+            # The lease has expired; the holder no longer owns the request.
+            raise _claim_conflict()
+        return owner[2], attempt[0]
+
+    def _load_tombstone_entries_locked(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        request_id: str,
+    ) -> list[tuple[str, str, str, str, str]]:
+        """Read the request's tombstones as validated digest entries.
+
+        Every row was written by the store itself; a malformed field
+        means the ledger was altered out of band and is reported as
+        storage corruption, never partially used.
+        """
+        rows = conn.execute(
+            "SELECT scope, adapter_id, operation_id, outcome, proof_digest "
+            "FROM deletion_tombstones "
+            "WHERE tenant_id = ? AND request_id = ?",
+            (tenant_id, request_id),
+        ).fetchall()
+        entries: list[tuple[str, str, str, str, str]] = []
+        for scope, adapter_id, operation_id, outcome, proof_digest in rows:
+            if (
+                not isinstance(scope, str)
+                or not scope
+                or not isinstance(adapter_id, str)
+                or not adapter_id
+                or not isinstance(operation_id, str)
+                or not operation_id
+                or not isinstance(outcome, str)
+                or outcome not in _TOMBSTONE_OUTCOMES
+                or not _is_chain_hash(proof_digest)
+            ):
+                raise _deletion_tombstone_failure()
+            entries.append((scope, operation_id, adapter_id, outcome, proof_digest))
+        return entries
+
+    def get_deletion_tombstones(
+        self,
+        tenant_id: str,
+        request_id: str,
+    ) -> dict[str, object]:
+        """Return the request's deletion tombstones and their digest.
+
+        The ``tombstones`` list is ordered by normalized scope then
+        ``adapter_id``; each entry carries exactly ``adapter_id``,
+        ``scope``, ``operation_id``, ``outcome``, ``proof_digest`` and
+        its ``recorded_at``. The top-level ``recorded_at`` is the first
+        settled registration time (``None`` when nothing is recorded)
+        and ``evidence_digest`` the scope-completion commitment over the
+        current tombstones (``None`` when empty). Invalid, unknown and
+        cross-tenant ids raise :class:`RequestNotFound`; a non-string or
+        empty tenant raises :class:`ValueError`; a corrupt record raises
+        the fixed-text :class:`OSError` ``deletion_tombstone_failed``.
+        """
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        request_id = _require_identifier(request_id)
+        if self._mem_conn is not None:
+            with self._write_lock:
+                return self._get_deletion_tombstones(tenant_id, request_id)
+        return self._get_deletion_tombstones(tenant_id, request_id)
+
+    def _get_deletion_tombstones(
+        self, tenant_id: str, request_id: str
+    ) -> dict[str, object]:
+        conn = self._connect()
+        try:
+            try:
+                # Resolve ownership first: an empty ledger must not
+                # distinguish "missing" from "foreign record".
+                owner = conn.execute(
+                    "SELECT 1 FROM requests WHERE tenant_id = ? AND request_id = ?",
+                    (tenant_id, request_id),
+                ).fetchone()
+                if owner is None:
+                    raise RequestNotFound("request not found")
+                rows = conn.execute(
+                    "SELECT scope, adapter_id, operation_id, outcome, "
+                    "proof_digest, recorded_at FROM deletion_tombstones "
+                    "WHERE tenant_id = ? AND request_id = ? "
+                    "ORDER BY scope, adapter_id",
+                    (tenant_id, request_id),
+                ).fetchall()
+                settled = conn.execute(
+                    "SELECT result, evidence_digest "
+                    "FROM deletion_tombstone_finishes "
+                    "WHERE tenant_id = ? AND request_id = ?",
+                    (tenant_id, request_id),
+                ).fetchone()
+            except RequestNotFound:
+                raise
+            except sqlite3.Error:
+                raise _deletion_tombstone_failure() from None
+        finally:
+            self._release(conn)
+
+        tombstones: list[dict[str, str]] = []
+        entries: list[tuple[str, str, str, str, str]] = []
+        recorded_ats: list[str] = []
+        for scope, adapter_id, operation_id, outcome, proof_digest, recorded_at in rows:
+            if (
+                not isinstance(scope, str)
+                or not scope
+                or not isinstance(adapter_id, str)
+                or not adapter_id
+                or not isinstance(operation_id, str)
+                or not operation_id
+                or not isinstance(outcome, str)
+                or outcome not in _TOMBSTONE_OUTCOMES
+                or not _is_chain_hash(proof_digest)
+                or not isinstance(recorded_at, str)
+                or not recorded_at
+            ):
+                raise _deletion_tombstone_failure()
+            tombstones.append(
+                {
+                    "adapter_id": adapter_id,
+                    "scope": scope,
+                    "operation_id": operation_id,
+                    "outcome": outcome,
+                    "proof_digest": proof_digest,
+                    "recorded_at": recorded_at,
+                }
+            )
+            entries.append((scope, operation_id, adapter_id, outcome, proof_digest))
+            recorded_ats.append(recorded_at)
+        evidence_digest = _tombstone_evidence_digest(entries) if entries else None
+        if settled is not None:
+            finished_result, finished_digest = settled
+            if finished_result not in _TERMINAL_RESULTS or (
+                finished_digest is not None
+                and not _is_chain_hash(finished_digest)
+            ):
+                raise _deletion_tombstone_failure()
+            if (
+                finished_result == _STATUS_COMPLETED
+                and finished_digest != evidence_digest
+            ):
+                # The settled completion commitment must match the
+                # ledger it was computed from; a divergence means the
+                # record was altered out of band.
+                raise _deletion_tombstone_failure()
+        return {
+            "request_id": request_id,
+            "tombstones": tombstones,
+            "recorded_at": min(recorded_ats) if recorded_ats else None,
+            "evidence_digest": evidence_digest,
+        }
 
     def reconcile_execution(
         self,
