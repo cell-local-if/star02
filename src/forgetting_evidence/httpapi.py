@@ -1,6 +1,6 @@
-"""HTTP layer for deletion-request acceptance and lookup.
+"""HTTP layer for deletion-request acceptance, lookup and observation.
 
-The service exposes exactly two business endpoints:
+The service exposes four read/accept endpoints:
 
 * ``POST /requests`` -- accept a deletion request for a tenant. The JSON
   body must carry non-empty ``tenant_id``, ``subject_id`` and
@@ -11,12 +11,27 @@ The service exposes exactly two business endpoints:
   (or a ``tenant_id`` query parameter). The receipt is the record frozen
   at acceptance time and always reports ``accepted``; it never changes
   when the request's status subsequently advances.
+* ``GET /requests/{request_id}/status`` -- return the request's current
+  status as a single line of JSON with exactly ``request_id``, ``status``
+  and ``created_at`` (in that order); ``status`` reflects the latest
+  persisted transition while ``created_at`` stays the original
+  acceptance time.
+* ``GET /requests/{request_id}/execution-log`` -- return the request id
+  and its execution ``attempts`` in attempt order. Each attempt carries
+  exactly ``attempt_number`` (from 1), ``claimed_at``,
+  ``lease_expires_at``, ``result`` and ``completed_at``; the last two are
+  ``null`` for an attempt that has not finished and hold the persisted
+  ``completed``/``failed`` result and completion time once it has. No
+  lease credential, worker identity, subject, scope or other request
+  field is ever returned.
 
-Status advancement (:meth:`RequestStore.transition`), current-status
-lookup (:meth:`RequestStore.get_status`), the execution orchestration
-(:meth:`RequestStore.claim_next`, :meth:`RequestStore.finish_claim`,
-:meth:`RequestStore.renew_lease`,
-:meth:`RequestStore.get_execution_log`,
+The two observation endpoints are strictly read-only: they never advance
+status, create an attempt or write any bookkeeping, and their output is
+rebuilt from persisted rows so it is identical after a restart.
+
+Status advancement (:meth:`RequestStore.transition`), the execution
+orchestration (:meth:`RequestStore.claim_next`,
+:meth:`RequestStore.finish_claim`, :meth:`RequestStore.renew_lease`,
 :meth:`RequestStore.reconcile_execution`,
 :meth:`RequestStore.reconcile_batch`,
 :meth:`RequestStore.migrate_execution_leases`) and the deletion receipts
@@ -28,15 +43,22 @@ lookup (:meth:`RequestStore.get_status`), the execution orchestration
 :meth:`RequestStore.rotate_anchor_key`) and the read-only batched
 audit inspection (:meth:`RequestStore.audit_inspection` and
 :meth:`RequestStore.audit_inspection_summary`) exist only on
-the storage layer and are deliberately not exposed over HTTP: this
-service still opens only request acceptance and the acceptance-receipt
-lookup.
+the storage layer and stay deliberately unexposed; the two read-only
+storage lookups that the observation endpoints present --
+:meth:`RequestStore.get_status` and
+:meth:`RequestStore.get_execution_log` -- are the only state-machine or
+execution methods reachable over HTTP. Request acceptance, the
+acceptance-receipt lookup and those two observation views are all the
+service opens.
 
-Success responses are a single line of JSON with exactly
-``request_id``, ``status`` and ``created_at`` (in that order) followed by
-a trailing newline; the same idempotent request and every lookup return
-byte-identical bodies. Error responses are single-line JSON objects with
-exactly one key, ``error``, holding a stable error code:
+Success responses for acceptance, receipt lookup and the current-status
+view are a single line of JSON with exactly ``request_id``, ``status``
+and ``created_at`` (in that order) followed by a trailing newline; the
+same idempotent request and every receipt lookup return byte-identical
+bodies. The execution-log view is a single JSON line with exactly
+``request_id`` and ``attempts`` (in that order) plus a trailing newline.
+Error responses are single-line JSON objects with exactly one key,
+``error``, holding a stable error code:
 
 ``invalid_request`` (400), ``unauthorized`` (401), ``forbidden``
 (403), ``idempotency_conflict`` (409), ``not_found`` (404),
@@ -52,10 +74,12 @@ for a configured principal: a missing/malformed/unknown token answers
 endpoint, or acting on a tenant other than its own ``tenant_id``,
 answers ``403 forbidden``. ``POST /requests`` requires
 ``request:submit`` and the target tenant is the body's ``tenant_id``;
-``GET /requests/{request_id}`` requires ``request:read`` and the target
-tenant follows the existing ``X-Tenant-Id``/query rule. Authentication
-runs after path/method routing (unknown paths stay 404, unsupported
-methods stay 405) but before payload validation and any storage access.
+``GET /requests/{request_id}`` and both read-only observation views
+(``/status`` and ``/execution-log``) require ``request:read`` and the
+target tenant follows the existing ``X-Tenant-Id``/query rule.
+Authentication runs after path/method routing (unknown paths stay 404,
+unsupported methods stay 405) but before payload validation and any
+storage access.
 Tokens, roles and the configuration never enter a response, a raised
 exception message, a log record, the database or any stored artifact.
 
@@ -89,6 +113,8 @@ _log = logging.getLogger(__name__)
 
 _COLLECTION_PATH = "/requests"
 _ITEM_PATH_PREFIX = "/requests/"
+_STATUS_RESOURCE = "status"
+_EXECUTION_LOG_RESOURCE = "execution-log"
 _TENANT_HEADER = "X-Tenant-Id"
 _AUTHORIZATION_HEADER = "Authorization"
 _BEARER_PREFIX = "Bearer "
@@ -120,6 +146,12 @@ class _BadRequest(Exception):
 
 class _StorageUnavailable(Exception):
     """Internal signal: the backing database cannot be opened or used."""
+
+
+# Sentinel returned by a storage read once the matching error reply has
+# already been sent; an empty execution log is a legitimate result, so
+# ``None`` cannot mark failure.
+_READ_FAILED = object()
 
 
 class AuthConfigError(Exception):
@@ -388,10 +420,22 @@ def make_handler(
             if path == _COLLECTION_PATH:
                 return "collection", None
             if path.startswith(_ITEM_PATH_PREFIX):
-                segment = path[len(_ITEM_PATH_PREFIX) :]
-                # Empty or nested segments do not name a request.
-                if segment and "/" not in segment:
-                    return "item", segment
+                remainder = path[len(_ITEM_PATH_PREFIX) :]
+                if not remainder:
+                    return None, None
+                head, separator, tail = remainder.partition("/")
+                # An empty leading segment never names a request.
+                if not head:
+                    return None, None
+                if not separator:
+                    return "item", head
+                # Exactly one trailing segment naming a known read-only
+                # sub-resource is routable; anything deeper stays unknown.
+                if tail and "/" not in tail:
+                    if tail == _STATUS_RESOURCE:
+                        return "status", head
+                    if tail == _EXECUTION_LOG_RESOURCE:
+                        return "execution_log", head
             return None, None
 
         # -- method entry points --------------------------------------
@@ -549,14 +593,52 @@ def make_handler(
             if kind is None:
                 self._reply_error(404, _NOT_FOUND)
                 return
-            if kind != "item":
+            if kind == "collection":
                 self._reply_error(405, _METHOD_NOT_ALLOWED, allowed="POST")
                 return
+            assert segment is not None
+            if kind == "item":
+                self._handle_record_read(segment, store.get, self._reply_receipt)
+            elif kind == "status":
+                self._handle_record_read(
+                    segment, store.get_status, self._reply_receipt
+                )
+            elif kind == "execution_log":
+                self._handle_execution_log(segment)
+            else:  # pragma: no cover - routing never yields another kind
+                self._reply_error(404, _NOT_FOUND)
+
+        def _handle_record_read(self, segment, read, reply) -> None:
+            resolved = self._resolve_read_scope(segment)
+            if resolved is None:
+                return
+            tenant_id, request_id = resolved
+            record = self._perform_read(read, tenant_id, request_id)
+            if record is _READ_FAILED:
+                return
+            reply(200, record)
+
+        def _handle_execution_log(self, segment: str) -> None:
+            resolved = self._resolve_read_scope(segment)
+            if resolved is None:
+                return
+            tenant_id, request_id = resolved
+            attempts = self._perform_read(
+                store.get_execution_log, tenant_id, request_id
+            )
+            if attempts is _READ_FAILED:
+                return
+            self._reply_execution_log(request_id, attempts)
+
+        def _resolve_read_scope(self, segment: str) -> tuple[str, str] | None:
+            """Authorize and resolve ``(tenant_id, request_id)`` for a read.
+
+            Returns ``None`` after sending the appropriate error reply.
+            """
             # Authentication precedes request-id validation and storage.
             principal = self._authorize(_ROLE_READ)
             if principal is None:
-                return
-            assert segment is not None
+                return None
             if auth is not None:
                 # With auth enabled the full authorization -- including
                 # resolving the target tenant and matching it -- completes
@@ -566,15 +648,15 @@ def make_handler(
                     tenant_id = self._tenant_id()
                 except _BadRequest:
                     self._reply_error(400, _INVALID_REQUEST)
-                    return
+                    return None
                 if not self._tenant_allowed(principal[0], tenant_id):
-                    return
+                    return None
                 try:
                     request_id = _normalize_request_id(segment)
                 except _BadRequest:
                     # Unknown and malformed ids share one outcome.
                     self._reply_error(404, _NOT_FOUND)
-                    return
+                    return None
             else:
                 # Unauthenticated contract keeps its historical order:
                 # request-id shape is checked before the tenant header.
@@ -582,30 +664,34 @@ def make_handler(
                     request_id = _normalize_request_id(segment)
                 except _BadRequest:
                     self._reply_error(404, _NOT_FOUND)
-                    return
+                    return None
                 try:
                     tenant_id = self._tenant_id()
                 except _BadRequest:
                     self._reply_error(400, _INVALID_REQUEST)
-                    return
+                    return None
+            return tenant_id, request_id
+
+        def _perform_read(self, read, tenant_id: str, request_id: str):
+            """Run a read-only store call, mapping every fault to a reply.
+
+            Returns :data:`_READ_FAILED` once the error response has been
+            sent; a legitimate empty result is never confused with it.
+            """
             try:
-                receipt = store.get(tenant_id, request_id)
+                return read(tenant_id, request_id)
             except RequestNotFound:
                 # Missing ids and cross-tenant lookups are indistinguishable.
                 self._reply_error(404, _NOT_FOUND)
-                return
             except ValueError:
                 self._reply_error(400, _INVALID_REQUEST)
-                return
             except _StorageUnavailable:
                 _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
                 self._reply_error(503, _STORAGE_UNAVAILABLE)
-                return
             except (sqlite3.Error, RuntimeError, OSError):
                 _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
                 self._reply_error(503, _STORAGE_UNAVAILABLE)
-                return
-            self._reply_receipt(200, receipt)
+            return _READ_FAILED
 
         # -- input parsing ---------------------------------------------
 
@@ -670,6 +756,51 @@ def make_handler(
                 + "\n"
             ).encode("utf-8")
             self._write_body(status, body)
+
+        def _reply_execution_log(
+            self, request_id: str, attempts: list
+        ) -> None:
+            # Defence in depth on top of the store's own strict validation:
+            # a malformed or credential-bearing record must never be
+            # serialised, so any shape deviation is treated as storage
+            # corruption (503 via the guard), never as a partial response.
+            if not isinstance(attempts, list):
+                raise RuntimeError("malformed execution log from store")
+            clean_attempts: list[dict] = []
+            for index, attempt in enumerate(attempts, start=1):
+                if not isinstance(attempt, dict):
+                    raise RuntimeError("malformed execution log from store")
+                if set(attempt) != {
+                    "attempt_number",
+                    "claimed_at",
+                    "lease_expires_at",
+                    "result",
+                    "completed_at",
+                }:
+                    raise RuntimeError("malformed execution log from store")
+                if attempt["attempt_number"] != index:
+                    raise RuntimeError("malformed execution log from store")
+                clean_attempts.append(
+                    {
+                        "attempt_number": attempt["attempt_number"],
+                        "claimed_at": attempt["claimed_at"],
+                        "lease_expires_at": attempt["lease_expires_at"],
+                        "result": attempt["result"],
+                        "completed_at": attempt["completed_at"],
+                    }
+                )
+            body = (
+                json.dumps(
+                    {
+                        "request_id": request_id,
+                        "attempts": clean_attempts,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+            self._write_body(200, body)
 
         def _reply_error(
             self,

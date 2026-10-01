@@ -135,8 +135,8 @@ class HttpAcceptanceTests(unittest.TestCase):
 
     def test_get_remains_frozen_after_storage_layer_transition(self):
         # Advancing state happens only on the storage layer; the HTTP
-        # lookup must keep serving the byte-identical accepted receipt and
-        # no status endpoint must appear.
+        # lookup must keep serving the byte-identical accepted receipt,
+        # while the read-only status view tracks the current state.
         _, _, post_data = self._submit()
         receipt = json.loads(post_data)
         self.store.transition(
@@ -152,7 +152,7 @@ class HttpAcceptanceTests(unittest.TestCase):
             )["status"],
             "completed",
         )
-        # ...but the HTTP query is unchanged from acceptance.
+        # ...but the HTTP receipt query is unchanged from acceptance.
         status, _, data = self._request(
             "GET",
             f"/requests/{receipt['request_id']}",
@@ -161,6 +161,29 @@ class HttpAcceptanceTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(data, post_data)
         self.assertEqual(json.loads(data)["status"], "accepted")
+        # The read-only status view reports the current state while
+        # preserving the original acceptance time and field order.
+        status, _, status_data = self._request(
+            "GET",
+            f"/requests/{receipt['request_id']}/status",
+            headers={"X-Tenant-Id": "tenant-a"},
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(status_data.endswith(b"\n"))
+        self.assertEqual(status_data.count(b"\n"), 1)
+        self.assertTrue(status_data.startswith(b'{"request_id":"'))
+        current = json.loads(status_data)
+        self.assertEqual(
+            list(current), ["request_id", "status", "created_at"]
+        )
+        self.assertEqual(
+            current,
+            {
+                "request_id": receipt["request_id"],
+                "status": "completed",
+                "created_at": receipt["created_at"],
+            },
+        )
         # Idempotent POST replay is likewise the frozen accepted receipt.
         replay_status, _, replay_data = self._submit(
             {
@@ -172,14 +195,6 @@ class HttpAcceptanceTests(unittest.TestCase):
         )
         self.assertEqual(replay_status, 200)
         self.assertEqual(replay_data, post_data)
-        # No status route is exposed: a status sub-resource is 404.
-        status, _, data = self._request(
-            "GET",
-            f"/requests/{receipt['request_id']}/status",
-            headers={"X-Tenant-Id": "tenant-a"},
-        )
-        self.assertEqual(status, 404)
-        self.assertEqual(data, b'{"error":"not_found"}\n')
         # PATCH/PUT to advance state over HTTP stay 405.
         for method in ("PATCH", "PUT"):
             status, _, _ = self._request(
