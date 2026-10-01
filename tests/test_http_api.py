@@ -172,10 +172,18 @@ class HttpAcceptanceTests(unittest.TestCase):
         )
         self.assertEqual(replay_status, 200)
         self.assertEqual(replay_data, post_data)
-        # No status route is exposed: a status sub-resource is 404.
+        # The status sub-resource now exists and reports the live state,
+        # while an unknown sub-resource still resolves to no route.
         status, _, data = self._request(
             "GET",
             f"/requests/{receipt['request_id']}/status",
+            headers={"X-Tenant-Id": "tenant-a"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(data)["status"], "completed")
+        status, _, data = self._request(
+            "GET",
+            f"/requests/{receipt['request_id']}/unknown-sub-resource",
             headers={"X-Tenant-Id": "tenant-a"},
         )
         self.assertEqual(status, 404)
