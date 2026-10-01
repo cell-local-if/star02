@@ -4425,7 +4425,199 @@ class RequestStore:
         if row is None:
             return None
         request_id, current_status = row
+        return self._insert_claim_locked(
+            conn,
+            tenant_id,
+            request_id,
+            current_status,
+            claimed_at,
+            lease_expires_at,
+        )
 
+    def claim_next_global(
+        self,
+        worker_id: str,
+        lease_seconds: int,
+    ) -> dict[str, object] | None:
+        """Atomically claim the next request across all tenants, fairly.
+
+        Candidates are the same as :meth:`claim_next` in every tenant:
+        ``accepted`` requests and ``processing`` requests whose latest
+        lease has expired without converging. Scheduling first compares
+        each candidate tenant's count of currently leased tasks (an open,
+        unexpired, unreleased attempt) and picks the tenant with the
+        fewest; ties -- and the choice within the winning tenant -- are
+        broken by the tenant's earliest acceptance time, then request id.
+        At most one request is claimed per call, inside a single
+        transaction, so concurrent callers can never hold two live leases
+        for the same request and a rebuilt store keeps computing the fair
+        order from persisted state alone.
+
+        Returns ``None`` when nothing is claimable. On success returns
+        exactly ``tenant_id``, ``request_id``, an unpredictable
+        ``claim_token`` (returned once, never persisted) and the UTC
+        RFC3339 ``lease_expires_at``. The worker identity is validated but
+        never stored, logged or returned. The returned tenant and token
+        feed straight into :meth:`renew_lease`, :meth:`finish_claim`,
+        tombstone registration and the scoped finish. Invalid arguments
+        raise :class:`ValueError` without writing; every storage fault is
+        a fixed-text :class:`OSError`.
+        """
+        # Validate everything before touching the database. worker_id is
+        # deliberately not persisted: it is authorised here only.
+        worker_id = _require_nonempty_str(worker_id, "worker_id")
+        lease_seconds = _require_lease_seconds(lease_seconds)
+
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                except sqlite3.Error:
+                    raise _storage_failure() from None
+                claim: dict[str, object] | None = None
+                try:
+                    claim = self._claim_next_global_locked(conn, lease_seconds)
+                    conn.execute("COMMIT")
+                except OSError:
+                    # A fixed-text storage failure raised after the helper
+                    # rolled back; the second rollback is a harmless no-op
+                    # that guarantees the (possibly shared) connection is
+                    # never left inside an aborted transaction.
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
+                except sqlite3.Error:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise _storage_failure() from None
+            finally:
+                self._release(conn)
+        if claim is None:
+            _log.info("global claim found no candidate")
+            return None
+        _log.info(
+            "global claim acquired tenant_id=%s request_id=%s attempt=%s",
+            claim["tenant_id"],
+            claim["request_id"],
+            claim["_attempt_number"],
+        )
+        # Strip internal bookkeeping; the caller sees only the contract.
+        return {
+            "tenant_id": claim["tenant_id"],
+            "request_id": claim["request_id"],
+            "claim_token": claim["claim_token"],
+            "lease_expires_at": claim["lease_expires_at"],
+        }
+
+    def _claim_next_global_locked(
+        self,
+        conn: sqlite3.Connection,
+        lease_seconds: int,
+    ) -> dict[str, object] | None:
+        now_dt = datetime.now(timezone.utc)
+        claimed_at = _format_rfc3339(now_dt)
+        lease_expires_at = _format_rfc3339(
+            now_dt + timedelta(seconds=lease_seconds)
+        )
+        # The candidate predicate mirrors _claim_next_locked exactly, only
+        # without the tenant filter: accepted requests, plus processing
+        # requests whose attempt history proves a genuine expired lease.
+        # Fairness is computed from persisted state alone: the ORDER BY
+        # counts, per candidate's tenant, the requests holding an open,
+        # unexpired, unreleased attempt (a live lease), and the tenant
+        # with the fewest live leases wins; ties and the pick within the
+        # winning tenant fall to acceptance time, then request id. BEGIN
+        # IMMEDIATE plus the write lock make the read-then-claim atomic,
+        # so two workers can never both win the same request.
+        row = conn.execute(
+            "SELECT r.tenant_id, r.request_id, r.status "
+            "FROM requests r "
+            "WHERE ( "
+            "  r.status = ? "
+            "  OR ( "
+            "    r.status = ? "
+            "    AND EXISTS ( "
+            "      SELECT 1 FROM claim_attempts c "
+            "      WHERE c.tenant_id = r.tenant_id "
+            "        AND c.request_id = r.request_id "
+            "    ) "
+            "    AND ? > ( "
+            "      SELECT c.lease_expires_at FROM claim_attempts c "
+            "      WHERE c.tenant_id = r.tenant_id "
+            "        AND c.request_id = r.request_id "
+            "      ORDER BY c.attempt_number DESC LIMIT 1 "
+            "    ) "
+            "    AND ( "
+            "      SELECT c.result FROM claim_attempts c "
+            "      WHERE c.tenant_id = r.tenant_id "
+            "        AND c.request_id = r.request_id "
+            "      ORDER BY c.attempt_number DESC LIMIT 1 "
+            "    ) IS NULL "
+            "    AND NOT EXISTS ( "
+            "      SELECT 1 FROM claim_attempts c "
+            "      WHERE c.tenant_id = r.tenant_id "
+            "        AND c.request_id = r.request_id "
+            "        AND c.result IS NULL AND c.completed_at IS NULL "
+            "        AND ? <= c.lease_expires_at "
+            "    ) "
+            "  ) "
+            ") "
+            "ORDER BY ( "
+            "  SELECT COUNT(*) FROM requests r2 "
+            "  WHERE r2.tenant_id = r.tenant_id "
+            "  AND EXISTS ( "
+            "    SELECT 1 FROM claim_attempts c "
+            "    WHERE c.tenant_id = r2.tenant_id "
+            "      AND c.request_id = r2.request_id "
+            "      AND c.result IS NULL AND c.completed_at IS NULL "
+            "      AND ? <= c.lease_expires_at "
+            "  ) "
+            ") ASC, r.created_at ASC, r.request_id ASC LIMIT 1",
+            (
+                _STATUS_ACCEPTED,
+                _STATUS_PROCESSING,
+                claimed_at,
+                claimed_at,
+                claimed_at,
+            ),
+        ).fetchone()
+        if row is None:
+            return None
+        tenant_id, request_id, current_status = row
+        claim = self._insert_claim_locked(
+            conn,
+            tenant_id,
+            request_id,
+            current_status,
+            claimed_at,
+            lease_expires_at,
+        )
+        claim["tenant_id"] = tenant_id
+        return claim
+
+    def _insert_claim_locked(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        request_id: str,
+        current_status: str,
+        claimed_at: str,
+        lease_expires_at: str,
+    ) -> dict[str, object]:
+        """Persist the lease for an already-selected claim candidate.
+
+        Shared by :meth:`_claim_next_locked` and
+        :meth:`_claim_next_global_locked` so both entries write identical
+        state: the next attempt row, a fresh token that supersedes any
+        previous one, and -- for a first claim only -- the atomic
+        accepted-to-processing transition with its chain event. Runs
+        inside the caller's transaction.
+        """
         attempt_row = conn.execute(
             "SELECT COALESCE(MAX(attempt_number), 0) + 1 "
             "FROM claim_attempts WHERE tenant_id = ? AND request_id = ?",
