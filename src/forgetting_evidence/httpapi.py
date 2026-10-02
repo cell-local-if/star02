@@ -1,6 +1,7 @@
-"""HTTP layer for deletion-request acceptance, lookup and observation.
+"""HTTP layer for deletion-request acceptance, lookup, observation and
+single-request reconciliation.
 
-The service exposes five business endpoints:
+The service exposes six business endpoints:
 
 * ``POST /requests`` -- accept a deletion request for a tenant. The JSON
   body must carry non-empty ``tenant_id``, ``subject_id`` and
@@ -35,17 +36,31 @@ The service exposes five business endpoints:
   and ``completed_at``. An unfinished attempt has ``null`` ``result`` and
   ``completed_at``; a finished attempt carries its stored ``completed``
   or ``failed`` result and completion time.
+* ``POST /requests/{request_id}/reconcile`` -- reconcile exactly one
+  request's execution record against its persisted state by calling the
+  storage layer's :meth:`RequestStore.reconcile_execution`. The endpoint
+  takes no business parameters: a missing ``Content-Length`` or a length
+  of zero means there is no body; any other body answers 400. On success
+  it answers 200 with the same single-line JSON shape as the status
+  read -- exactly ``request_id``, ``status`` and ``created_at`` --
+  rendering the current record after reconciliation. Repeating the call
+  never changes a stable terminal state, historical attempts or existing
+  timestamps; concurrent calls leave the unique outcome to the store's
+  atomic commit. No subject, scope, idempotency key, worker, lease
+  credential or attempt detail is ever exposed.
 
 The observation endpoints never advance state, create an attempt or
 write any bookkeeping; they only read persisted rows, so their answers
 match the persisted records after a restart. They never expose a lease
 credential, worker identity, subject, scope or any other request field.
+Only the single-request reconcile endpoint may converge execution state,
+through the storage layer's existing atomic semantics; no batch
+reconciliation is exposed over HTTP.
 
 Status advancement (:meth:`RequestStore.transition`), the execution
 orchestration (:meth:`RequestStore.claim_next`,
 :meth:`RequestStore.finish_claim`, :meth:`RequestStore.renew_lease`,
 :meth:`RequestStore.transfer_claim`,
-:meth:`RequestStore.reconcile_execution`,
 :meth:`RequestStore.reconcile_batch`,
 :meth:`RequestStore.migrate_execution_leases`) and the deletion receipts
 (:meth:`RequestStore.generate_receipt`,
@@ -58,18 +73,21 @@ audit inspection (:meth:`RequestStore.audit_inspection` and
 :meth:`RequestStore.audit_inspection_summary`) exist only on
 the storage layer and are deliberately not exposed over HTTP: over HTTP
 the service opens request acceptance, the acceptance-receipt lookup, the
-read-only tenant-scoped listing and the two read-only observation reads
-described above. The current-status
-lookup (:meth:`RequestStore.get_status`), the tenant-scoped listing
-(:meth:`RequestStore.list_requests`) and the execution log
-(:meth:`RequestStore.get_execution_log`) back the read-only
-endpoints but remain storage-layer methods as well.
+read-only tenant-scoped listing, the two read-only observation reads and
+the single-request execution reconciliation described above. The
+current-status lookup (:meth:`RequestStore.get_status`), the
+tenant-scoped listing (:meth:`RequestStore.list_requests`), the
+execution log (:meth:`RequestStore.get_execution_log`) and the
+single-request reconciliation
+(:meth:`RequestStore.reconcile_execution`) back their HTTP endpoints but
+remain storage-layer methods as well.
 
 Success responses are a single line of JSON followed by a trailing
-newline. Acceptance, receipt lookup and the status read render exactly
-``request_id``, ``status`` and ``created_at`` (in that order); the same
-idempotent request and every lookup return byte-identical bodies. The
-execution-log read renders exactly ``request_id`` and ``attempts``. The
+newline. Acceptance, receipt lookup, the status read and a successful
+reconcile render exactly ``request_id``, ``status`` and ``created_at``
+(in that order); the same idempotent request and every lookup return
+byte-identical bodies. The execution-log read renders exactly
+``request_id`` and ``attempts``. The
 listing read renders exactly ``items`` and ``next_cursor``, each item
 rendering exactly ``request_id``, ``status`` and ``created_at``.
 Error responses are single-line JSON objects with exactly one key,
@@ -90,9 +108,12 @@ endpoint, or acting on a tenant other than its own ``tenant_id``,
 answers ``403 forbidden``. ``POST /requests`` requires
 ``request:submit`` and the target tenant is the body's ``tenant_id``;
 each of the four GET endpoints requires ``request:read`` and the target
-tenant follows the existing ``X-Tenant-Id``/query rule. Authentication
-runs after path/method routing (unknown paths stay 404, unsupported
-methods stay 405) but before payload validation and any storage access.
+tenant follows the existing ``X-Tenant-Id``/query rule; the
+single-request reconciliation ``POST /requests/{request_id}/reconcile``
+requires ``request:reconcile`` and its target tenant follows the same
+existing ``X-Tenant-Id``/query rule. Authentication runs after
+path/method routing (unknown paths stay 404, unsupported methods stay
+405) but before payload validation and any storage access.
 Tokens, roles and the configuration never enter a response, a raised
 exception message, a log record, the database or any stored artifact.
 
@@ -128,6 +149,7 @@ _COLLECTION_PATH = "/requests"
 _ITEM_PATH_PREFIX = "/requests/"
 _STATUS_RESOURCE = "status"
 _EXECUTION_LOG_RESOURCE = "execution-log"
+_RECONCILE_RESOURCE = "reconcile"
 _TENANT_HEADER = "X-Tenant-Id"
 _AUTHORIZATION_HEADER = "Authorization"
 _BEARER_PREFIX = "Bearer "
@@ -137,7 +159,8 @@ _MAX_BODY_BYTES = 1 << 20  # 1 MiB
 
 _ROLE_SUBMIT = "request:submit"
 _ROLE_READ = "request:read"
-_ALLOWED_ROLES = frozenset({_ROLE_SUBMIT, _ROLE_READ})
+_ROLE_RECONCILE = "request:reconcile"
+_ALLOWED_ROLES = frozenset({_ROLE_SUBMIT, _ROLE_READ, _ROLE_RECONCILE})
 
 # Terminal attempt results, mirrored from the execution state machine so a
 # corrupt or substituted store can never serialise another value.
@@ -214,11 +237,12 @@ def load_auth_config(path: str) -> AuthConfig:
     The file must be a UTF-8 JSON object with a ``principals`` array;
     each principal is an object carrying non-empty ``token`` and
     ``tenant_id`` strings plus a non-empty ``roles`` array of distinct
-    values drawn from ``request:submit`` and ``request:read``. Tokens
-    must be unique across principals. Any deviation -- including an
-    unreadable or non-UTF-8 file, malformed JSON, a missing ``principals``
-    key or a principal missing/typing-wrong one of the required keys --
-    raises :class:`AuthConfigError` so the caller can refuse to bind.
+    values drawn from ``request:submit``, ``request:read`` and
+    ``request:reconcile``. Tokens must be unique across principals. Any
+    deviation -- including an unreadable or non-UTF-8 file, malformed
+    JSON, a missing ``principals`` key or a principal missing/typing-wrong
+    one of the required keys -- raises :class:`AuthConfigError` so the
+    caller can refuse to bind.
     """
     # Suppress exception chaining ("from None"): the underlying OSError
     # carries the filesystem path and a decode/JSON error may quote file
@@ -372,8 +396,8 @@ class DeferredRequestStore:
         return self._ready().get_execution_log(tenant_id, request_id)
 
     def reconcile_execution(self, tenant_id, request_id):
-        # Execution reconciliation is storage-layer only; like the rest of
-        # the execution orchestration it is never routed over HTTP.
+        # Backs the POST /requests/{request_id}/reconcile endpoint; the
+        # store's atomic commit decides the unique reconciliation outcome.
         return self._ready().reconcile_execution(tenant_id, request_id)
 
     def reconcile_batch(self, tenant_id, cursor=None, limit=None):
@@ -470,8 +494,9 @@ def make_handler(
                     return "item", segment
                 # The two read-only observability sub-resources live under
                 # a request id: /requests/{id}/status and
-                # /requests/{id}/execution-log. Deeper nesting or any other
-                # suffix stays an unknown path (404).
+                # /requests/{id}/execution-log, alongside the single
+                # reconciliation action /requests/{id}/reconcile. Deeper
+                # nesting or any other suffix stays an unknown path (404).
                 if "/" in segment:
                     item_id, suffix = segment.split("/", 1)
                     if item_id and "/" not in suffix:
@@ -479,6 +504,8 @@ def make_handler(
                             return "status", item_id
                         if suffix == _EXECUTION_LOG_RESOURCE:
                             return "execution_log", item_id
+                        if suffix == _RECONCILE_RESOURCE:
+                            return "reconcile", item_id
             return None, None
 
         # -- method entry points --------------------------------------
@@ -531,8 +558,14 @@ def make_handler(
             else:
                 # The collection accepts POST (acceptance) and GET (the
                 # tenant-scoped listing); the item and both read-only
-                # sub-resources are GET-only.
-                allowed = "GET, POST" if kind == "collection" else "GET"
+                # sub-resources are GET-only; the reconcile action is
+                # POST-only.
+                if kind == "collection":
+                    allowed = "GET, POST"
+                elif kind == "reconcile":
+                    allowed = "POST"
+                else:
+                    allowed = "GET"
                 self._reply_error(
                     405, _METHOD_NOT_ALLOWED, allowed=allowed, headless=headless
                 )
@@ -588,9 +621,13 @@ def make_handler(
             return True
 
         def _handle_post(self) -> None:
-            kind, _ = self._route()
+            kind, segment = self._route()
             if kind is None:
                 self._reply_error(404, _NOT_FOUND)
+                return
+            if kind == "reconcile":
+                assert segment is not None
+                self._serve_reconcile(segment)
                 return
             if kind != "collection":
                 self._reply_error(405, _METHOD_NOT_ALLOWED, allowed="GET")
@@ -644,6 +681,12 @@ def make_handler(
                 # requests; read-only like the item observations.
                 self._serve_list()
                 return
+            if kind == "reconcile":
+                # The reconciliation action is POST-only.
+                self._reply_error(
+                    405, _METHOD_NOT_ALLOWED, allowed="POST"
+                )
+                return
             # item (acceptance receipt), status and execution_log are the
             # three GET-only reads; authorization/tenant/id resolution and
             # the resulting error ordering are shared by all of them.
@@ -662,13 +705,23 @@ def make_handler(
         def _resolve_read(self, segment: str) -> tuple[str, str] | None:
             """Authorize and resolve ``(tenant_id, request_id)`` for a GET.
 
+            Thin wrapper over :meth:`_resolve_tenant_request` for the
+            ``request:read`` role.
+            """
+            return self._resolve_tenant_request(segment, _ROLE_READ)
+
+        def _resolve_tenant_request(
+            self, segment: str, required_role: str
+        ) -> tuple[str, str] | None:
+            """Authorize and resolve ``(tenant_id, request_id)``.
+
             Returns ``None`` after already replying. Authentication runs
             before request-id validation and storage; with auth enabled the
             full tenant authorization completes before the id shape is even
             inspected, while the unauthenticated contract keeps its
             historical id-shape-before-tenant order.
             """
-            principal = self._authorize(_ROLE_READ)
+            principal = self._authorize(required_role)
             if principal is None:
                 return None
             if auth is not None:
@@ -763,6 +816,53 @@ def make_handler(
                 self._reply_error(503, _STORAGE_UNAVAILABLE)
                 return
             self._reply_execution_log(request_id, attempts)
+
+        def _serve_reconcile(self, segment: str) -> None:
+            # The single-request reconcile shares the read endpoints'
+            # authorization and tenant/id resolution: authentication first,
+            # then the tenant (header or query) and its match against the
+            # principal, then request-id syntax. The reconcile-specific
+            # empty-body gate runs only afterwards, so a wrong credential
+            # never gets to probe ids or payload shape.
+            resolved = self._resolve_tenant_request(segment, _ROLE_RECONCILE)
+            if resolved is None:
+                return
+            tenant_id, request_id = resolved
+            try:
+                self._read_empty_body()
+            except _BadRequest:
+                # A rejected body has been consumed (or the connection is
+                # marked for close when it cannot be) before the error.
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            try:
+                record = store.reconcile_execution(tenant_id, request_id)
+            except RequestNotFound:
+                # Missing ids and cross-tenant lookups are indistinguishable.
+                self._reply_error(404, _NOT_FOUND)
+                return
+            except ValueError:
+                # Defence in depth: the HTTP resolution above is
+                # authoritative, but a rejected store call converges
+                # nothing and maps to the same client error.
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            except _StorageUnavailable:
+                _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
+                self._reply_error(503, _STORAGE_UNAVAILABLE)
+                return
+            except (sqlite3.Error, RuntimeError, OSError):
+                # A failed atomic commit or a corrupt execution record
+                # surfaces as fixed-text RuntimeError/OSError; sqlite text
+                # (locks, malformed images, paths) must never reach the
+                # client, and the store guarantees no half-converged row.
+                _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
+                self._reply_error(503, _STORAGE_UNAVAILABLE)
+                return
+            # The reconciled record has the identical fixed shape and
+            # field order as the status read: request_id, status,
+            # created_at, nothing else.
+            self._reply_status(record)
 
         def _serve_list(self) -> None:
             # The tenant-scoped listing shares the read endpoints'
@@ -891,6 +991,47 @@ def make_handler(
                 return self.rfile.read(length)
             except OSError:
                 raise _BadRequest("unreadable body")
+
+        def _read_empty_body(self) -> None:
+            """Require an absent or empty body on a parameterless POST.
+
+            A missing ``Content-Length`` (and no transfer coding) or a
+            declared length of zero means there is no body; anything else
+            is a client error. A bounded non-empty body is drained first so
+            the connection can still serve the next request; an unbounded,
+            malformed or unreadable framing closes the connection instead
+            of risking a desync.
+            """
+            # A coded body (chunked or any other transfer coding) is never
+            # an empty body and cannot be drained safely here; reject it
+            # regardless of any accompanying Content-Length.
+            if self.headers.get("Transfer-Encoding") is not None:
+                self.close_connection = True
+                raise _BadRequest("body must be empty")
+            raw_length = self.headers.get("Content-Length")
+            if raw_length is None:
+                return
+            try:
+                length = int(raw_length)
+            except (TypeError, ValueError):
+                self.close_connection = True
+                raise _BadRequest("invalid content length")
+            if length < 0:
+                self.close_connection = True
+                raise _BadRequest("invalid content length")
+            if length == 0:
+                return
+            if length > _MAX_BODY_BYTES:
+                # Leave the oversized tail unread and close the
+                # connection so keep-alive cannot desync the next request.
+                self.close_connection = True
+                raise _BadRequest("body must be empty")
+            try:
+                self.rfile.read(length)
+            except OSError:
+                self.close_connection = True
+                raise _BadRequest("unreadable body")
+            raise _BadRequest("body must be empty")
 
         # -- responses --------------------------------------------------
 
