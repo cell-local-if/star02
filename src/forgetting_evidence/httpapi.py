@@ -1,6 +1,6 @@
 """HTTP layer for deletion-request acceptance, lookup and observation.
 
-The service exposes four business endpoints:
+The service exposes five business endpoints:
 
 * ``POST /requests`` -- accept a deletion request for a tenant. The JSON
   body must carry non-empty ``tenant_id``, ``subject_id`` and
@@ -24,11 +24,22 @@ The service exposes four business endpoints:
   and ``completed_at``. An unfinished attempt has ``null`` ``result`` and
   ``completed_at``; a finished attempt carries its stored ``completed``
   or ``failed`` result and completion time.
+* ``GET /requests/{request_id}/deletion-tombstones`` -- read-only
+  observation of the request's settled deletion tombstones. The
+  single-line JSON body carries exactly ``request_id``, ``tombstones``,
+  ``recorded_at`` and ``evidence_digest`` in that order; tombstones are
+  ordered by normalized scope then ``adapter_id`` and each entry carries
+  exactly ``adapter_id``, ``scope``, ``operation_id``, ``outcome``,
+  ``proof_digest`` and ``recorded_at``. The top-level ``recorded_at`` is
+  the earliest registration time and ``evidence_digest`` the
+  scope-completion commitment over the current tombstones; both are
+  ``null`` when nothing is recorded.
 
-The two observation endpoints never advance state, create an attempt or
-write any bookkeeping; they only read persisted rows, so their answers
-match the persisted records after a restart. They never expose a lease
-credential, worker identity, subject, scope or any other request field.
+The observation endpoints never advance state, create an attempt,
+register a tombstone or write any bookkeeping; they only read persisted
+rows, so their answers match the persisted records after a restart. They
+never expose a lease credential, worker identity, subject, raw scope
+payload, proof body, idempotency key or any other request field.
 
 Status advancement (:meth:`RequestStore.transition`), the execution
 orchestration (:meth:`RequestStore.claim_next`,
@@ -46,16 +57,19 @@ audit inspection (:meth:`RequestStore.audit_inspection` and
 :meth:`RequestStore.audit_inspection_summary`) exist only on
 the storage layer and are deliberately not exposed over HTTP: over HTTP
 the service opens request acceptance, the acceptance-receipt lookup and
-the two read-only observation reads described above. The current-status
-lookup (:meth:`RequestStore.get_status`) and the execution log
-(:meth:`RequestStore.get_execution_log`) back the two observation
+the three read-only observation reads described above. The current-status
+lookup (:meth:`RequestStore.get_status`), the execution log
+(:meth:`RequestStore.get_execution_log`) and the tombstone ledger read
+(:meth:`RequestStore.get_deletion_tombstones`) back the observation
 endpoints but remain storage-layer methods as well.
 
 Success responses are a single line of JSON followed by a trailing
 newline. Acceptance, receipt lookup and the status read render exactly
 ``request_id``, ``status`` and ``created_at`` (in that order); the same
 idempotent request and every lookup return byte-identical bodies. The
-execution-log read renders exactly ``request_id`` and ``attempts``.
+execution-log read renders exactly ``request_id`` and ``attempts``; the
+tombstone read renders exactly ``request_id``, ``tombstones``,
+``recorded_at`` and ``evidence_digest``.
 Error responses are single-line JSON objects with exactly one key,
 ``error``, holding a stable error code:
 
@@ -73,7 +87,7 @@ for a configured principal: a missing/malformed/unknown token answers
 endpoint, or acting on a tenant other than its own ``tenant_id``,
 answers ``403 forbidden``. ``POST /requests`` requires
 ``request:submit`` and the target tenant is the body's ``tenant_id``;
-each of the three GET endpoints requires ``request:read`` and the target
+each of the four GET endpoints requires ``request:read`` and the target
 tenant follows the existing ``X-Tenant-Id``/query rule. Authentication
 runs after path/method routing (unknown paths stay 404, unsupported
 methods stay 405) but before payload validation and any storage access.
@@ -112,6 +126,7 @@ _COLLECTION_PATH = "/requests"
 _ITEM_PATH_PREFIX = "/requests/"
 _STATUS_RESOURCE = "status"
 _EXECUTION_LOG_RESOURCE = "execution-log"
+_DELETION_TOMBSTONES_RESOURCE = "deletion-tombstones"
 _TENANT_HEADER = "X-Tenant-Id"
 _AUTHORIZATION_HEADER = "Authorization"
 _BEARER_PREFIX = "Bearer "
@@ -126,6 +141,11 @@ _ALLOWED_ROLES = frozenset({_ROLE_SUBMIT, _ROLE_READ})
 # Terminal attempt results, mirrored from the execution state machine so a
 # corrupt or substituted store can never serialise another value.
 _TERMINAL_RESULTS = frozenset({"completed", "failed"})
+
+# Tombstone outcomes and digest shapes, mirrored from the storage layer so
+# a corrupt or substituted store can never serialise another value.
+_TOMBSTONE_OUTCOMES = frozenset({"deleted", "absent"})
+_HEX_DIGITS = frozenset("0123456789abcdef")
 
 _UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
@@ -323,6 +343,11 @@ class DeferredRequestStore:
         # endpoint; strictly read-only, like get_status.
         return self._ready().get_execution_log(tenant_id, request_id)
 
+    def get_deletion_tombstones(self, tenant_id, request_id):
+        # Serves the read-only GET /requests/{request_id}/deletion-tombstones
+        # endpoint; strictly read-only, like get_status.
+        return self._ready().get_deletion_tombstones(tenant_id, request_id)
+
     def reconcile_execution(self, tenant_id, request_id):
         # Execution reconciliation is storage-layer only; like the rest of
         # the execution orchestration it is never routed over HTTP.
@@ -369,6 +394,15 @@ def _normalize_request_id(value: str) -> str:
     # Accept upper-case spellings but look the store up under the same
     # canonical form uuid4() rows were written with.
     return value.lower()
+
+
+def _is_chain_hash(value: object) -> bool:
+    """Mirror of the storage layer's lowercase hex digest shape check."""
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(char in _HEX_DIGITS for char in value)
+    )
 
 
 def build_server(
@@ -420,10 +454,11 @@ def make_handler(
                 # Empty or nested segments do not name a request.
                 if segment and "/" not in segment:
                     return "item", segment
-                # The two read-only observability sub-resources live under
-                # a request id: /requests/{id}/status and
-                # /requests/{id}/execution-log. Deeper nesting or any other
-                # suffix stays an unknown path (404).
+                # The read-only observability sub-resources live under
+                # a request id: /requests/{id}/status,
+                # /requests/{id}/execution-log and
+                # /requests/{id}/deletion-tombstones. Deeper nesting or
+                # any other suffix stays an unknown path (404).
                 if "/" in segment:
                     item_id, suffix = segment.split("/", 1)
                     if item_id and "/" not in suffix:
@@ -431,6 +466,8 @@ def make_handler(
                             return "status", item_id
                         if suffix == _EXECUTION_LOG_RESOURCE:
                             return "execution_log", item_id
+                        if suffix == _DELETION_TOMBSTONES_RESOURCE:
+                            return "deletion_tombstones", item_id
             return None, None
 
         # -- method entry points --------------------------------------
@@ -481,7 +518,7 @@ def make_handler(
             if kind is None:
                 self._reply_error(404, _NOT_FOUND, headless=headless)
             else:
-                # Only the collection accepts POST; the item and both
+                # Only the collection accepts POST; the item and the
                 # read-only sub-resources are GET-only.
                 allowed = "POST" if kind == "collection" else "GET"
                 self._reply_error(
@@ -593,9 +630,10 @@ def make_handler(
             if kind == "collection":
                 self._reply_error(405, _METHOD_NOT_ALLOWED, allowed="POST")
                 return
-            # item (acceptance receipt), status and execution_log are the
-            # three GET-only reads; authorization/tenant/id resolution and
-            # the resulting error ordering are shared by all of them.
+            # item (acceptance receipt), status, execution_log and
+            # deletion_tombstones are the four GET-only reads;
+            # authorization/tenant/id resolution and the resulting error
+            # ordering are shared by all of them.
             assert segment is not None
             resolved = self._resolve_read(segment)
             if resolved is None:
@@ -605,8 +643,10 @@ def make_handler(
                 self._serve_receipt(tenant_id, request_id)
             elif kind == "status":
                 self._serve_status(tenant_id, request_id)
-            else:
+            elif kind == "execution_log":
                 self._serve_execution_log(tenant_id, request_id)
+            else:
+                self._serve_deletion_tombstones(tenant_id, request_id)
 
         def _resolve_read(self, segment: str) -> tuple[str, str] | None:
             """Authorize and resolve ``(tenant_id, request_id)`` for a GET.
@@ -712,6 +752,28 @@ def make_handler(
                 self._reply_error(503, _STORAGE_UNAVAILABLE)
                 return
             self._reply_execution_log(request_id, attempts)
+
+        def _serve_deletion_tombstones(
+            self, tenant_id: str, request_id: str
+        ) -> None:
+            try:
+                record = store.get_deletion_tombstones(tenant_id, request_id)
+            except RequestNotFound:
+                self._reply_error(404, _NOT_FOUND)
+                return
+            except ValueError:
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            except _StorageUnavailable:
+                _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
+                self._reply_error(503, _STORAGE_UNAVAILABLE)
+                return
+            except (sqlite3.Error, RuntimeError, OSError):
+                # Corrupt tombstone rows surface as fixed-text OSErrors.
+                _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
+                self._reply_error(503, _STORAGE_UNAVAILABLE)
+                return
+            self._reply_deletion_tombstones(record)
 
         # -- input parsing ---------------------------------------------
 
@@ -852,6 +914,102 @@ def make_handler(
                 "lease_expires_at": lease_expires_at,
                 "result": result,
                 "completed_at": completed_at,
+            }
+
+        def _reply_deletion_tombstones(self, record: dict[str, object]) -> None:
+            if not isinstance(record, dict) or set(record) != {
+                "request_id",
+                "tombstones",
+                "recorded_at",
+                "evidence_digest",
+            }:
+                raise RuntimeError("malformed tombstone record from store")
+            request_id = record["request_id"]
+            tombstones = record["tombstones"]
+            recorded_at = record["recorded_at"]
+            evidence_digest = record["evidence_digest"]
+            if not isinstance(request_id, str) or not request_id:
+                raise RuntimeError("malformed tombstone record from store")
+            if not isinstance(tombstones, list):
+                raise RuntimeError("malformed tombstone record from store")
+            if recorded_at is not None and (
+                not isinstance(recorded_at, str) or not recorded_at
+            ):
+                raise RuntimeError("malformed tombstone record from store")
+            if evidence_digest is not None and not _is_chain_hash(
+                evidence_digest
+            ):
+                raise RuntimeError("malformed tombstone record from store")
+            rendered = [self._project_tombstone(entry) for entry in tombstones]
+            # The store orders by normalized scope then adapter_id; a
+            # substitute that breaks the contract must not be serialised.
+            ordering = [(entry["scope"], entry["adapter_id"]) for entry in rendered]
+            if ordering != sorted(ordering):
+                raise RuntimeError("malformed tombstone record from store")
+            # An empty ledger commits to nothing: both top-level fields
+            # are null exactly when no tombstone is recorded.
+            if not rendered and (
+                recorded_at is not None or evidence_digest is not None
+            ):
+                raise RuntimeError("malformed tombstone record from store")
+            body = (
+                json.dumps(
+                    {
+                        "request_id": request_id,
+                        "tombstones": rendered,
+                        "recorded_at": recorded_at,
+                        "evidence_digest": evidence_digest,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+            self._write_body(200, body)
+
+        def _project_tombstone(self, tombstone: object) -> dict[str, str]:
+            # Whitelist and re-render every field: even a store substitute
+            # that returned extra keys could not leak a subject, raw scope
+            # payload, proof body, credential or idempotency key into the
+            # body. Types and value domains are re-checked so a corrupt
+            # row never serialises into a partially-formed record.
+            allowed = {
+                "adapter_id",
+                "scope",
+                "operation_id",
+                "outcome",
+                "proof_digest",
+                "recorded_at",
+            }
+            if not isinstance(tombstone, dict) or set(tombstone) != allowed:
+                raise RuntimeError("malformed tombstone from store")
+            adapter_id = tombstone["adapter_id"]
+            scope = tombstone["scope"]
+            operation_id = tombstone["operation_id"]
+            outcome = tombstone["outcome"]
+            proof_digest = tombstone["proof_digest"]
+            recorded_at = tombstone["recorded_at"]
+            if (
+                not isinstance(adapter_id, str)
+                or not adapter_id
+                or not isinstance(scope, str)
+                or not scope
+                or not isinstance(operation_id, str)
+                or not operation_id
+                or not isinstance(outcome, str)
+                or outcome not in _TOMBSTONE_OUTCOMES
+                or not _is_chain_hash(proof_digest)
+                or not isinstance(recorded_at, str)
+                or not recorded_at
+            ):
+                raise RuntimeError("malformed tombstone from store")
+            return {
+                "adapter_id": adapter_id,
+                "scope": scope,
+                "operation_id": operation_id,
+                "outcome": outcome,
+                "proof_digest": proof_digest,
+                "recorded_at": recorded_at,
             }
 
         def _reply_error(
