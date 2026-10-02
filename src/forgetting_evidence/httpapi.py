@@ -64,6 +64,7 @@ orchestration (:meth:`RequestStore.claim_next`,
 :meth:`RequestStore.reconcile_batch`,
 :meth:`RequestStore.migrate_execution_leases`) and the deletion receipts
 (:meth:`RequestStore.generate_receipt`,
+:meth:`RequestStore.get_receipt`,
 :meth:`RequestStore.verify_receipt`,
 :meth:`RequestStore.rotate_receipt_key`) and the anchor capability
 (:meth:`RequestStore.verify_chain`,
