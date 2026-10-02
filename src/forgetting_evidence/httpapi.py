@@ -1,11 +1,22 @@
 """HTTP layer for deletion-request acceptance, lookup and observation.
 
-The service exposes four business endpoints:
+The service exposes five business endpoints:
 
 * ``POST /requests`` -- accept a deletion request for a tenant. The JSON
   body must carry non-empty ``tenant_id``, ``subject_id`` and
   ``idempotency_key`` strings plus a non-empty ``scopes`` array of
   distinct non-empty strings.
+* ``GET /requests`` -- the tenant-scoped, paginated listing of accepted
+  requests. The tenant follows the existing ``X-Tenant-Id``/query rule;
+  the optional ``status`` (comma-separated distinct lifecycle statuses),
+  ``created_from`` (inclusive) and ``created_to`` (exclusive) RFC3339 UTC
+  bounds, ``cursor`` and ``limit`` (1..1000, default 100) query
+  parameters filter and page the result. The single-line JSON body
+  carries exactly ``items`` and ``next_cursor``; each item carries
+  exactly ``request_id``, ``status`` and ``created_at`` in ascending
+  acceptance order, and ``next_cursor`` is the opaque continuation value
+  or ``null`` at the end of the listing. Any other query parameter, a
+  duplicated ``status`` value or a malformed filter answers 400.
 * ``GET /requests/{request_id}`` -- return the accepted request's
   receipt, scoped to the tenant identified by the ``X-Tenant-Id`` header
   (or a ``tenant_id`` query parameter). The receipt is the record frozen
@@ -25,7 +36,7 @@ The service exposes four business endpoints:
   ``completed_at``; a finished attempt carries its stored ``completed``
   or ``failed`` result and completion time.
 
-The two observation endpoints never advance state, create an attempt or
+The observation endpoints never advance state, create an attempt or
 write any bookkeeping; they only read persisted rows, so their answers
 match the persisted records after a restart. They never expose a lease
 credential, worker identity, subject, scope or any other request field.
@@ -45,17 +56,21 @@ orchestration (:meth:`RequestStore.claim_next`,
 audit inspection (:meth:`RequestStore.audit_inspection` and
 :meth:`RequestStore.audit_inspection_summary`) exist only on
 the storage layer and are deliberately not exposed over HTTP: over HTTP
-the service opens request acceptance, the acceptance-receipt lookup and
-the two read-only observation reads described above. The current-status
-lookup (:meth:`RequestStore.get_status`) and the execution log
-(:meth:`RequestStore.get_execution_log`) back the two observation
+the service opens request acceptance, the acceptance-receipt lookup, the
+read-only tenant-scoped listing and the two read-only observation reads
+described above. The current-status
+lookup (:meth:`RequestStore.get_status`), the tenant-scoped listing
+(:meth:`RequestStore.list_requests`) and the execution log
+(:meth:`RequestStore.get_execution_log`) back the read-only
 endpoints but remain storage-layer methods as well.
 
 Success responses are a single line of JSON followed by a trailing
 newline. Acceptance, receipt lookup and the status read render exactly
 ``request_id``, ``status`` and ``created_at`` (in that order); the same
 idempotent request and every lookup return byte-identical bodies. The
-execution-log read renders exactly ``request_id`` and ``attempts``.
+execution-log read renders exactly ``request_id`` and ``attempts``. The
+listing read renders exactly ``items`` and ``next_cursor``, each item
+rendering exactly ``request_id``, ``status`` and ``created_at``.
 Error responses are single-line JSON objects with exactly one key,
 ``error``, holding a stable error code:
 
@@ -73,7 +88,7 @@ for a configured principal: a missing/malformed/unknown token answers
 endpoint, or acting on a tenant other than its own ``tenant_id``,
 answers ``403 forbidden``. ``POST /requests`` requires
 ``request:submit`` and the target tenant is the body's ``tenant_id``;
-each of the three GET endpoints requires ``request:read`` and the target
+each of the four GET endpoints requires ``request:read`` and the target
 tenant follows the existing ``X-Tenant-Id``/query rule. Authentication
 runs after path/method routing (unknown paths stay 404, unsupported
 methods stay 405) but before payload validation and any storage access.
@@ -126,6 +141,17 @@ _ALLOWED_ROLES = frozenset({_ROLE_SUBMIT, _ROLE_READ})
 # Terminal attempt results, mirrored from the execution state machine so a
 # corrupt or substituted store can never serialise another value.
 _TERMINAL_RESULTS = frozenset({"completed", "failed"})
+
+# The request lifecycle statuses the tenant-scoped listing accepts in its
+# ``status`` filter and may serialise in an item.
+_REQUEST_STATUSES = frozenset({"accepted", "processing", "completed", "failed"})
+
+# The query parameters the GET /requests listing understands; anything
+# else is an invalid request.
+_LIST_QUERY_PARAMS = frozenset(
+    {"tenant_id", "status", "created_from", "created_to", "cursor", "limit"}
+)
+_LIST_LIMIT_RE = re.compile(r"^[0-9]+$")
 
 _UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
@@ -293,6 +319,20 @@ class DeferredRequestStore:
     def get_status(self, tenant_id, request_id):
         # Serves the read-only GET /requests/{request_id}/status endpoint.
         return self._ready().get_status(tenant_id, request_id)
+
+    def list_requests(
+        self,
+        tenant_id,
+        statuses=None,
+        created_from=None,
+        created_to=None,
+        cursor=None,
+        limit=None,
+    ):
+        # Serves the read-only GET /requests tenant-scoped listing.
+        return self._ready().list_requests(
+            tenant_id, statuses, created_from, created_to, cursor, limit
+        )
 
     def transition(self, tenant_id, request_id, target_status):
         # Storage-layer only; not routed over HTTP, but proxied so this
@@ -481,9 +521,10 @@ def make_handler(
             if kind is None:
                 self._reply_error(404, _NOT_FOUND, headless=headless)
             else:
-                # Only the collection accepts POST; the item and both
-                # read-only sub-resources are GET-only.
-                allowed = "POST" if kind == "collection" else "GET"
+                # The collection accepts POST (acceptance) and GET (the
+                # tenant-scoped listing); the item and both read-only
+                # sub-resources are GET-only.
+                allowed = "GET, POST" if kind == "collection" else "GET"
                 self._reply_error(
                     405, _METHOD_NOT_ALLOWED, allowed=allowed, headless=headless
                 )
@@ -591,7 +632,9 @@ def make_handler(
                 self._reply_error(404, _NOT_FOUND)
                 return
             if kind == "collection":
-                self._reply_error(405, _METHOD_NOT_ALLOWED, allowed="POST")
+                # The tenant-scoped, paginated listing of accepted
+                # requests; read-only like the item observations.
+                self._serve_list()
                 return
             # item (acceptance receipt), status and execution_log are the
             # three GET-only reads; authorization/tenant/id resolution and
@@ -712,6 +755,91 @@ def make_handler(
                 self._reply_error(503, _STORAGE_UNAVAILABLE)
                 return
             self._reply_execution_log(request_id, attempts)
+
+        def _serve_list(self) -> None:
+            # The tenant-scoped listing shares the read endpoints'
+            # authorization and tenant resolution: authentication first,
+            # then the tenant (header or query) and its match against the
+            # principal, then query-parameter validation, then storage.
+            principal = self._authorize(_ROLE_READ)
+            if principal is None:
+                return
+            try:
+                tenant_id = self._tenant_id()
+            except _BadRequest:
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            if not self._tenant_allowed(principal[0], tenant_id):
+                return
+            try:
+                filters = self._list_filters()
+            except _BadRequest:
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            try:
+                page = store.list_requests(tenant_id, **filters)
+            except ValueError:
+                # The store's fixed-text listing ValueError covers every
+                # invalid filter, limit or cursor shape.
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            except _StorageUnavailable:
+                _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
+                self._reply_error(503, _STORAGE_UNAVAILABLE)
+                return
+            except (sqlite3.Error, RuntimeError, OSError):
+                # Corrupt persisted rows surface as fixed-text OSErrors.
+                _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
+                self._reply_error(503, _STORAGE_UNAVAILABLE)
+                return
+            self._reply_listing(page)
+
+        def _list_filters(self) -> dict[str, object]:
+            """Validate the listing query string into store arguments.
+
+            Only ``tenant_id``, ``status``, ``created_from``,
+            ``created_to``, ``cursor`` and ``limit`` may appear, each at
+            most once (``tenant_id`` keeps its historical
+            header-or-query resolution in ``_tenant_id``). ``status`` is
+            a comma-separated list of distinct lifecycle statuses. Every
+            other shape is a bad request; the store re-validates the
+            values themselves as defence in depth.
+            """
+            params = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+            if not set(params) <= _LIST_QUERY_PARAMS:
+                raise _BadRequest("unknown query parameter")
+            filters: dict[str, object] = {}
+            for name in ("status", "created_from", "created_to", "cursor", "limit"):
+                values = params.get(name)
+                if values is None:
+                    continue
+                if len(values) != 1:
+                    raise _BadRequest(f"duplicate {name}")
+                value = values[0]
+                if name == "status":
+                    filters["statuses"] = self._parse_status_filter(value)
+                elif name == "limit":
+                    # Far more digits than the 1..1000 domain can ever
+                    # hold is a bad request, not a storage fault (and an
+                    # unbounded digit string must never reach int()).
+                    if not _LIST_LIMIT_RE.match(value) or len(value) > 10:
+                        raise _BadRequest("invalid limit")
+                    filters["limit"] = int(value)
+                elif not value:
+                    raise _BadRequest(f"invalid {name}")
+                else:
+                    filters[name] = value
+            return filters
+
+        def _parse_status_filter(self, value: str) -> list[str]:
+            if not value:
+                raise _BadRequest("invalid status")
+            statuses = value.split(",")
+            if any(status not in _REQUEST_STATUSES for status in statuses):
+                raise _BadRequest("invalid status")
+            if len(set(statuses)) != len(statuses):
+                raise _BadRequest("duplicate status")
+            return statuses
 
         # -- input parsing ---------------------------------------------
 
@@ -853,6 +981,59 @@ def make_handler(
                 "result": result,
                 "completed_at": completed_at,
             }
+
+        def _reply_listing(self, page: object) -> None:
+            # Whitelist and re-render every field: even a store substitute
+            # that returned extra keys could not leak a subject, a scope,
+            # an idempotency key or any other request field into the body.
+            # Shapes and types are re-checked so a corrupt page never
+            # serialises into a partially-formed record.
+            if not isinstance(page, dict) or set(page) != {"items", "next_cursor"}:
+                raise RuntimeError("malformed listing from store")
+            items = page["items"]
+            next_cursor = page["next_cursor"]
+            if not isinstance(items, list):
+                raise RuntimeError("malformed listing from store")
+            if next_cursor is not None and (
+                not isinstance(next_cursor, str) or not next_cursor
+            ):
+                raise RuntimeError("malformed listing from store")
+            rendered_items: list[dict[str, str]] = []
+            for item in items:
+                if not isinstance(item, dict) or set(item) != {
+                    "request_id",
+                    "status",
+                    "created_at",
+                }:
+                    raise RuntimeError("malformed listing from store")
+                request_id = item["request_id"]
+                status = item["status"]
+                created_at = item["created_at"]
+                if (
+                    not isinstance(request_id, str)
+                    or not request_id
+                    or not isinstance(status, str)
+                    or status not in _REQUEST_STATUSES
+                    or not isinstance(created_at, str)
+                    or not created_at
+                ):
+                    raise RuntimeError("malformed listing from store")
+                rendered_items.append(
+                    {
+                        "request_id": request_id,
+                        "status": status,
+                        "created_at": created_at,
+                    }
+                )
+            body = (
+                json.dumps(
+                    {"items": rendered_items, "next_cursor": next_cursor},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+            self._write_body(200, body)
 
         def _reply_error(
             self,

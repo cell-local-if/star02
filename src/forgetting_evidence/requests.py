@@ -16,6 +16,14 @@ Two read shapes are offered deliberately:
   but with the request's current status. The ``created_at`` field always
   stays the original acceptance time.
 
+Alongside them, :meth:`RequestStore.list_requests` is the tenant-scoped
+*listing* query: a read-only, paginated sweep of the tenant's accepted
+records in ascending ``(created_at, request_id)`` order, with optional
+status and acceptance-time filters and an opaque continuation cursor
+bound to the tenant and the normalized filters. Each page carries
+exactly ``items`` and ``next_cursor``; each item carries exactly
+``request_id``, ``status`` and ``created_at``.
+
 Status advances through :meth:`RequestStore.transition` along the fixed
 lifecycle ``accepted -> processing -> {completed, failed}`` and
 ``accepted -> failed``. ``completed`` and ``failed`` are terminal.
@@ -1241,6 +1249,25 @@ def _deletion_tombstone_failure() -> OSError:
     return OSError(_DELETION_TOMBSTONE_MESSAGE)
 
 
+# Fixed, detail-free text for every tenant-scoped request-listing failure:
+# an empty tenant, an out-of-domain status, time bound, limit or cursor, a
+# cursor replayed across tenants or across filter settings, an unreadable
+# store or a corrupt persisted record. It never embeds a tenant, a subject,
+# a scope, an idempotency key, a request id, SQL text or a filesystem path,
+# and a partial page is never returned.
+_REQUEST_LISTING_MESSAGE = "request_listing_failed"
+
+
+def _request_listing_failure() -> OSError:
+    """Build the single listing storage error callers ever see."""
+    return OSError(_REQUEST_LISTING_MESSAGE)
+
+
+def _request_listing_value_failure() -> ValueError:
+    """Build the single listing validation error callers ever see."""
+    return ValueError(_REQUEST_LISTING_MESSAGE)
+
+
 # The lost concurrent-publication outcome and the missing/foreign version
 # outcome share the single fixed catalog text so neither outcome can be
 # probed for details it should not reveal.
@@ -1878,6 +1905,203 @@ def _decode_cursor(value: object, prefix: str = _CURSOR_PREFIX) -> tuple[str, in
     ):
         raise ValueError("cursor is not valid")
     return batch_id, position
+
+
+# Tenant-scoped request listing. A page sweeps the tenant's accepted
+# records in stable (created_at, request_id) order; the default and the
+# upper bound keep a single call bounded without letting a caller ask for
+# an unbounded read.
+_DEFAULT_LIST_LIMIT = 100
+_MAX_LIST_LIMIT = 1000
+# The canonical status order a listing filter normalizes to; it is also
+# the complete domain a status value may be drawn from.
+_LISTING_STATUSES = (
+    _STATUS_ACCEPTED,
+    _STATUS_PROCESSING,
+    _STATUS_COMPLETED,
+    _STATUS_FAILED,
+)
+_LISTING_STATUS_SET = frozenset(_LISTING_STATUSES)
+# Listing cursors share the opaque envelope of the other cursors (fixed
+# version prefix plus base64url JSON) but carry their own version prefix,
+# so a reconcile, inspection or migration cursor presented to the listing
+# entry point (or vice versa) is an unknown format and is rejected as
+# caller error before storage is touched. The payload binds the tenant
+# and the normalized filter settings alongside the resume position, so a
+# cursor replayed under a different tenant or filter is caller error too.
+_LIST_CURSOR_PREFIX = "rl1."
+# Strict RFC3339 shape for the listing time bounds: date, "T", time, an
+# optional fractional part and an explicit offset. Leap-second and
+# calendar validation is left to the parser below.
+_LISTING_TIMESTAMP_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
+)
+
+
+def _normalize_listing_statuses(value: object) -> tuple[str, ...]:
+    """Validate the optional status filter and return its canonical order.
+
+    ``None`` selects every status. Anything else must be a sequence of
+    distinct values drawn from the four lifecycle statuses; the canonical
+    tuple follows the fixed lifecycle order so two spellings of the same
+    filter normalize identically. Every malformed shape raises the fixed
+    listing :class:`ValueError` before storage is touched.
+    """
+    if value is None:
+        return _LISTING_STATUSES
+    if isinstance(value, (str, bytes)) or isinstance(value, Mapping):
+        raise _request_listing_value_failure()
+    try:
+        items = list(value)  # type: ignore[arg-type]
+    except TypeError:
+        raise _request_listing_value_failure() from None
+    if not items:
+        raise _request_listing_value_failure()
+    if any(
+        not isinstance(item, str) or item not in _LISTING_STATUS_SET
+        for item in items
+    ):
+        raise _request_listing_value_failure()
+    if len(set(items)) != len(items):
+        raise _request_listing_value_failure()
+    selected = set(items)
+    return tuple(status for status in _LISTING_STATUSES if status in selected)
+
+
+def _parse_listing_timestamp(value: object) -> str | None:
+    """Parse an RFC3339 UTC timestamp into the store's canonical form.
+
+    Returns ``None`` when the value is not a well-formed RFC3339 UTC
+    timestamp. Only a zero offset (``Z`` or an explicit ``+00:00`` style
+    spelling) names a UTC instant; the canonical form carries fixed-width
+    microseconds so it sorts lexicographically against the stored
+    ``created_at`` values.
+    """
+    if not isinstance(value, str) or not _LISTING_TIMESTAMP_RE.match(value):
+        return None
+    try:
+        moment = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if moment.utcoffset() != timedelta(0):
+        return None
+    return _format_rfc3339(moment)
+
+
+def _require_listing_timestamp(value: object) -> str:
+    """Validate one listing time bound, canonicalizing it for comparison."""
+    parsed = _parse_listing_timestamp(value)
+    if parsed is None:
+        raise _request_listing_value_failure()
+    return parsed
+
+
+def _require_listing_limit(value: object) -> int:
+    """Validate a listing limit: a non-boolean int in 1..1000."""
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 1 <= value <= _MAX_LIST_LIMIT
+    ):
+        raise _request_listing_value_failure()
+    return value
+
+
+def _encode_list_cursor(
+    tenant_id: str,
+    statuses: tuple[str, ...],
+    created_from: str | None,
+    created_to: str | None,
+    last_created_at: str,
+    last_request_id: str,
+) -> str:
+    """Render the opaque cursor resuming a listing after its last item."""
+    payload = json.dumps(
+        {
+            "v": 1,
+            "t": tenant_id,
+            "f": list(statuses),
+            "from": created_from,
+            "to": created_to,
+            "c": last_created_at,
+            "r": last_request_id,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return _LIST_CURSOR_PREFIX + base64.urlsafe_b64encode(payload).decode("ascii")
+
+
+def _decode_list_cursor(
+    value: object,
+) -> tuple[str, tuple[str, ...], str | None, str | None, str, str]:
+    """Parse and strictly validate an opaque listing cursor.
+
+    Every malformed value -- non-string, empty, wrong prefix, bad
+    base64url, foreign JSON shape, wrong types -- raises the fixed
+    listing :class:`ValueError` identically, so the cursor format can
+    never be probed through distinguishable failures. The returned tuple
+    is the bound tenant, the normalized status filter, the two normalized
+    time bounds and the (created_at, request_id) resume position.
+    """
+    if not isinstance(value, str) or not value.startswith(_LIST_CURSOR_PREFIX):
+        raise _request_listing_value_failure()
+    body = value[len(_LIST_CURSOR_PREFIX) :]
+    if (
+        not body
+        or len(body) % 4 != 0
+        or any(char not in _B64URL_CHARS and char != "=" for char in body)
+    ):
+        raise _request_listing_value_failure()
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(body.encode("ascii")))
+    except (ValueError, binascii.Error):
+        raise _request_listing_value_failure() from None
+    if not isinstance(payload, dict) or set(payload) != {
+        "v",
+        "t",
+        "f",
+        "from",
+        "to",
+        "c",
+        "r",
+    }:
+        raise _request_listing_value_failure()
+    version = payload["v"]
+    tenant_id = payload["t"]
+    statuses = payload["f"]
+    created_from = payload["from"]
+    created_to = payload["to"]
+    last_created_at = payload["c"]
+    last_request_id = payload["r"]
+    if (
+        # bool is a subclass of int and 1.0 == 1: only the exact integer
+        # version 1 names the known cursor format.
+        not isinstance(version, int)
+        or isinstance(version, bool)
+        or version != 1
+        or not isinstance(tenant_id, str)
+        or not tenant_id
+        or not isinstance(last_created_at, str)
+        or not last_created_at
+        or not isinstance(last_request_id, str)
+        or not last_request_id
+    ):
+        raise _request_listing_value_failure()
+    normalized_statuses = _normalize_listing_statuses(statuses)
+    normalized_from = (
+        None if created_from is None else _require_listing_timestamp(created_from)
+    )
+    normalized_to = (
+        None if created_to is None else _require_listing_timestamp(created_to)
+    )
+    return (
+        tenant_id,
+        normalized_statuses,
+        normalized_from,
+        normalized_to,
+        last_created_at,
+        last_request_id,
+    )
 
 
 def _require_lease_seconds(value: object) -> int:
@@ -3472,6 +3696,164 @@ class RequestStore:
             "status": row[1],
             "created_at": row[2],
         }
+
+    def list_requests(
+        self,
+        tenant_id: str,
+        statuses: object = None,
+        created_from: object = None,
+        created_to: object = None,
+        cursor: object = None,
+        limit: object = None,
+    ) -> dict[str, object]:
+        """Return one page of the tenant's accepted requests.
+
+        The page is read from a single consistent snapshot in ascending
+        ``(created_at, request_id)`` order and carries exactly ``items``
+        and ``next_cursor``; each item carries exactly ``request_id``,
+        ``status`` and ``created_at``. ``statuses`` restricts the page to
+        distinct values drawn from ``accepted``, ``processing``,
+        ``completed`` and ``failed`` (default: all); ``created_from`` and
+        ``created_to`` are RFC3339 UTC bounds, the first inclusive and
+        the second exclusive. ``limit`` defaults to 100 and only accepts
+        a non-boolean integer in 1..1000. ``cursor`` is the opaque
+        continuation value from a previous page: it binds the same tenant
+        and the same normalized filter settings and resumes strictly
+        after the last item of the page that issued it; when the listing
+        is exhausted ``next_cursor`` is ``None``.
+
+        An empty tenant, an out-of-domain status, time bound or limit, a
+        malformed cursor, or a cursor replayed under a different tenant
+        or different filter settings raises the fixed-text
+        :class:`ValueError` ``request_listing_failed`` without touching
+        storage. A storage fault or a corrupt persisted record raises the
+        fixed-text :class:`OSError` ``request_listing_failed`` and no
+        partial page is ever returned. The read never advances state and
+        never exposes a subject, a scope or an idempotency key.
+        """
+        if not isinstance(tenant_id, str) or not tenant_id:
+            raise _request_listing_value_failure()
+        normalized_statuses = _normalize_listing_statuses(statuses)
+        normalized_from = (
+            None if created_from is None else _require_listing_timestamp(created_from)
+        )
+        normalized_to = (
+            None if created_to is None else _require_listing_timestamp(created_to)
+        )
+        resolved_limit = _DEFAULT_LIST_LIMIT if limit is None else limit
+        resolved_limit = _require_listing_limit(resolved_limit)
+        position: tuple[str, str] | None = None
+        if cursor is not None:
+            (
+                cursor_tenant,
+                cursor_statuses,
+                cursor_from,
+                cursor_to,
+                last_created_at,
+                last_request_id,
+            ) = _decode_list_cursor(cursor)
+            # A cursor only resumes the exact listing that issued it: the
+            # same tenant and the same normalized filter settings.
+            if (cursor_tenant, cursor_statuses, cursor_from, cursor_to) != (
+                tenant_id,
+                normalized_statuses,
+                normalized_from,
+                normalized_to,
+            ):
+                raise _request_listing_value_failure()
+            position = (last_created_at, last_request_id)
+        if self._mem_conn is not None:
+            with self._write_lock:
+                return self._list_requests(
+                    tenant_id,
+                    normalized_statuses,
+                    normalized_from,
+                    normalized_to,
+                    position,
+                    resolved_limit,
+                )
+        return self._list_requests(
+            tenant_id,
+            normalized_statuses,
+            normalized_from,
+            normalized_to,
+            position,
+            resolved_limit,
+        )
+
+    def _list_requests(
+        self,
+        tenant_id: str,
+        statuses: tuple[str, ...],
+        created_from: str | None,
+        created_to: str | None,
+        position: tuple[str, str] | None,
+        limit: int,
+    ) -> dict[str, object]:
+        # The whole tenant snapshot is read unfiltered in one SELECT -- a
+        # single consistent snapshot -- so that every persisted record is
+        # validated before any filtering: a corrupt row can never be
+        # silently skipped by a filter clause and masquerade as a
+        # complete (but partial) listing.
+        conn = self._connect()
+        try:
+            try:
+                rows = conn.execute(
+                    "SELECT request_id, status, created_at FROM requests "
+                    "WHERE tenant_id = ? "
+                    "ORDER BY created_at ASC, request_id ASC",
+                    (tenant_id,),
+                ).fetchall()
+            except sqlite3.Error:
+                raise _request_listing_failure() from None
+        finally:
+            self._release(conn)
+        matched: list[dict[str, str]] = []
+        wanted = set(statuses)
+        for row in rows:
+            request_id, status, created_at = row
+            if (
+                not isinstance(request_id, str)
+                or not request_id
+                or not isinstance(status, str)
+                or status not in _LISTING_STATUS_SET
+                or _parse_listing_timestamp(created_at) is None
+            ):
+                # A corrupt persisted record fails the whole listing; a
+                # partial list is never returned.
+                raise _request_listing_failure()
+            if status not in wanted:
+                continue
+            if created_from is not None and created_at < created_from:
+                # Inclusive lower bound.
+                continue
+            if created_to is not None and created_at >= created_to:
+                # Exclusive upper bound.
+                continue
+            if position is not None and (created_at, request_id) <= position:
+                # Resume strictly after the last item of the previous
+                # page in the same (created_at, request_id) order.
+                continue
+            matched.append(
+                {
+                    "request_id": request_id,
+                    "status": status,
+                    "created_at": created_at,
+                }
+            )
+        items = matched[:limit]
+        next_cursor: str | None = None
+        if len(matched) > limit:
+            last = items[-1]
+            next_cursor = _encode_list_cursor(
+                tenant_id,
+                statuses,
+                created_from,
+                created_to,
+                last["created_at"],
+                last["request_id"],
+            )
+        return {"items": items, "next_cursor": next_cursor}
 
     def resolve_scopes(
         self,

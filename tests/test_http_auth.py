@@ -481,11 +481,6 @@ class HttpAuthTests(unittest.TestCase):
         self.assertEqual(status, 405)
         self.assertEqual(data, METHOD_NOT_ALLOWED)
         status, _, data = self._request(
-            "GET", "/requests", headers=self._bearer("tok-read-a")
-        )
-        self.assertEqual(status, 405)
-        self.assertEqual(data, METHOD_NOT_ALLOWED)
-        status, _, data = self._request(
             "POST", "/requests/00000000-0000-4000-8000-000000000000"
         )
         self.assertEqual(status, 405)
