@@ -509,6 +509,7 @@ import threading
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime, timedelta, timezone
+from urllib.request import pathname2url
 
 __all__ = [
     "RequestStore",
@@ -3186,6 +3187,176 @@ def _render_audit_bundle(
         ],
     }
     return json.dumps(bundle, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+
+def _open_readonly_connection(db_path: str) -> sqlite3.Connection:
+    """Open *db_path* strictly read-only, never creating it.
+
+    The ``mode=ro`` URI opens an existing database file for reads only:
+    the engine neither creates a missing file/directory nor takes any
+    write lock, so the off-box export command can never mutate a record,
+    the schema, journal bookkeeping or evidence files. A missing path,
+    a non-database file or an unreadable store all surface as a
+    :class:`sqlite3.Error` on connect or first use, which the caller
+    maps to the fixed-text storage failure.
+    """
+    uri = "file:" + pathname2url(os.path.abspath(db_path)) + "?mode=ro"
+    try:
+        conn = sqlite3.connect(
+            uri,
+            uri=True,
+            timeout=_BUSY_TIMEOUT_MS / 1000,
+            check_same_thread=False,
+        )
+    except sqlite3.Error:
+        raise _storage_failure() from None
+    conn.isolation_level = None  # explicit transaction control
+    try:
+        conn.execute(f"PRAGMA busy_timeout = {_BUSY_TIMEOUT_MS}")
+    except sqlite3.Error:
+        conn.close()
+        raise _storage_failure() from None
+    return conn
+
+
+def export_existing_audit_bundle(
+    db_path: object,
+    tenant_id: object,
+    request_id: object,
+) -> str:
+    """Export one settled chain from an *existing* database, read-only.
+
+    This is the library-side of the off-box handoff command, separate
+    from :meth:`RequestStore.export_audit_bundle`: it never constructs a
+    :class:`RequestStore`, never creates the database or its parent
+    directories, never writes a record, the schema, inspection
+    bookkeeping or an evidence file, and it never receives anchor
+    secret material -- sealing secrets stay with the recipient who runs
+    the offline verification. The whole snapshot is read in one
+    read-only transaction and assessed against the same structural
+    full-chain criteria as the inspection sweep before anything is
+    rendered.
+
+    A non-string/empty *db_path* or *tenant_id* raises
+    :class:`ValueError` before the filesystem is touched; a null,
+    non-string, empty, unknown or cross-tenant *request_id* raises
+    :class:`RequestNotFound` with one detail-free outcome; an
+    un-anchored chain, damaged or structurally untrusted evidence
+    raises :class:`AuditBundleUnavailable`; a missing or unreadable
+    store raises the fixed-text :class:`OSError`. The exported text is
+    byte-identical to :meth:`RequestStore.export_audit_bundle` at the
+    same chain head and authenticated off-box by
+    :meth:`RequestStore.verify_audit_bundle`.
+    """
+    if not isinstance(db_path, str) or not db_path:
+        raise ValueError("storage path must be a non-empty string")
+    tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+    request_id = _require_identifier(request_id)
+
+    conn = _open_readonly_connection(db_path)
+    try:
+        try:
+            # One explicit read-only transaction over a read-only
+            # connection: the request row and every piece of audit
+            # evidence come from a single consistent snapshot, and
+            # mode=ro makes a write physically impossible.
+            conn.execute("BEGIN")
+            try:
+                owner = conn.execute(
+                    "SELECT status, chain_hash FROM requests "
+                    "WHERE tenant_id = ? AND request_id = ?",
+                    (tenant_id, request_id),
+                ).fetchone()
+                if owner is None:
+                    # Identical outcome for unknown ids and
+                    # cross-tenant lookups.
+                    raise RequestNotFound("request not found")
+                status, head = owner
+                meta_rows = conn.execute(
+                    "SELECT head_hmac FROM audit_anchor_meta"
+                ).fetchall()
+                event_rows = conn.execute(
+                    "SELECT tenant_id, request_id, seq, status, "
+                    "occurred_at, chain_hash FROM status_events "
+                    "ORDER BY tenant_id, request_id, seq"
+                ).fetchall()
+                anchor_rows = conn.execute(
+                    "SELECT commit_seq, tenant_id, request_id, seq, "
+                    "event_hash, anchor_hmac, key_generation "
+                    "FROM audit_anchors ORDER BY commit_seq"
+                ).fetchall()
+                request_rows = conn.execute(
+                    "SELECT tenant_id, request_id, status, chain_hash "
+                    "FROM requests"
+                ).fetchall()
+                generation_rows = conn.execute(
+                    "SELECT generation, key_fingerprint, effective_at "
+                    "FROM anchor_key_generations ORDER BY generation"
+                ).fetchall()
+            except BaseException:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+            conn.execute("COMMIT")
+        except RequestNotFound:
+            raise
+        except sqlite3.Error:
+            raise _storage_failure() from None
+    finally:
+        conn.close()
+
+    # Assessed without secrets on purpose: every structural check in the
+    # inspection evaluation still runs (event order, database link
+    # hashes, head/status agreement, one-to-one binding, generation
+    # records, gap-free global commit order, file-wide split/orphan
+    # evidence). The single reason that only means "this process holds
+    # no secret" is discounted, because anchor authentication is done
+    # off-box by the bundle's recipient; anything else wrong makes the
+    # chain non-exportable, and a structurally damaged bundle can never
+    # authenticate at verification anyway.
+    reasons = RequestStore._evaluate_inspection_rows(
+        tuple(meta_rows),
+        tuple(event_rows),
+        tuple(anchor_rows),
+        tuple(request_rows),
+        tuple(generation_rows),
+        None,
+        {},
+        (tenant_id, request_id),
+    )
+    if any(reason != _ANCHOR_REASON_SECRET_MISSING for reason in reasons):
+        raise AuditBundleUnavailable(_AUDIT_BUNDLE_UNAVAILABLE_MESSAGE)
+
+    # Structural generation binding that needs no secret: the shared
+    # evaluation only probes an anchor's generation association while it
+    # holds a secret, but a forged association is structural damage the
+    # exporter must reject even though MAC authentication happens off
+    # box. With no generation rows the file is the pre-rotation legacy
+    # shape and every anchor must carry the NULL attribution; otherwise
+    # each anchor's recorded generation (NULL names legacy generation 1)
+    # must name a generation row present in the file. The generation
+    # table itself is already verified as gap-free above.
+    generation_ids = {row[0] for row in generation_rows}
+    if not generation_ids:
+        if any(row[6] is not None for row in anchor_rows):
+            raise AuditBundleUnavailable(_AUDIT_BUNDLE_UNAVAILABLE_MESSAGE)
+    else:
+        for row in anchor_rows:
+            named_generation = row[6] if row[6] is not None else 1
+            if named_generation not in generation_ids:
+                raise AuditBundleUnavailable(_AUDIT_BUNDLE_UNAVAILABLE_MESSAGE)
+
+    return _render_audit_bundle(
+        tenant_id,
+        request_id,
+        status,
+        head,
+        tuple(event_rows),
+        tuple(anchor_rows),
+        tuple(generation_rows),
+    )
 
 
 class RequestStore:

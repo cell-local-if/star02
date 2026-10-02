@@ -30,6 +30,22 @@ PYTHONPATH=src python3 -m forgetting_evidence serve --db ./data/evidence.db --ho
 
 启用鉴权后，`Authorization` 必须为 `Bearer <已配置令牌>`；缺少或畸形授权头、令牌未配置返回 `401 {"error":"unauthorized"}`。角色不足或目标租户不是其 `tenant_id` 返回 `403 {"error":"forbidden"}`：`POST /requests` 要求 `request:submit`，目标租户取请求体 `tenant_id`；`GET /requests`、`GET /requests/{request_id}`、`GET /requests/{request_id}/status` 与 `GET /requests/{request_id}/execution-log` 均要求 `request:read`，目标租户沿用 `X-Tenant-Id` 非空优先、否则取最后一个非空 `tenant_id` 查询参数的既有规则。鉴权在已匹配路径之后（未知路径仍 404、不支持方法仍 405）、但先于载荷校验与存储访问执行。无 `--auth-file` 时 `Authorization` 头被忽略。重启后的授权结果只由同一份配置决定；令牌、角色与鉴权配置只存在于进程内存，绝不写入数据库、状态、执行、回执、审计事件、锚点或证据包，也不进入响应、异常或日志。
 
+库外审计证据包命令行（三个只读入口；不经 HTTP，不新增 health/serve 之外的其他公开命令）：
+
+```bash
+# 从已存在数据库只读导出当前已落定链（不创建数据库、不写任何记录或证据文件，也不接触锚点秘密）
+PYTHONPATH=src python3 -m forgetting_evidence export-bundle --db ./data/evidence.db --tenant-id tenant-a --request-id <request-id>
+# 从标准输入读取证据包并完全离线核验；--secrets 为代次十进制字符串到非空秘密的 UTF-8 JSON 映射文件
+PYTHONPATH=src python3 -m forgetting_evidence verify-bundle --secrets ./anchor-secrets.json < bundle.jsonl
+# 同样从标准输入读取证据包，输出既有的可信标记与原因码诊断
+PYTHONPATH=src python3 -m forgetting_evidence diagnose-bundle --secrets ./anchor-secrets.json < bundle.jsonl
+```
+
+- `export-bundle` 仅接受 `--db/--tenant-id/--request-id` 三个命名参数（均为非空，`--flag value` 或 `--flag=value` 均可），对**已存在**数据库以只读方式打开：成功时 stdout 为与存储层导出字节一致的现有单行 JSON 证据包文本（保留末尾换行），退出 0；未知或跨租户请求输出 `{"error":"not_found"}`（退出 2）；证据链不可导出（未锚定、证据损坏或结构不可信）输出 `{"error":"bundle_unavailable"}`（退出 1）；数据库缺失、不可读或故障输出 `{"error":"storage_unavailable"}`（退出 3）。该命令绝不创建数据库文件或目录、不写库、不写巡检簿记或证据文件，锚点秘密始终只由接收方保管。
+- `verify-bundle` 从标准输入读取证据包文本，`--secrets` 文件是代次十进制字符串（无符号、无前导零）到非空秘密字符串的 UTF-8 JSON 对象映射（空对象为合法的失败封闭映射）；可信时输出 `{"trusted":true}` 加换行并退出 0，认证失败、缺少所需历史秘密或代次绑定不一致时输出 `{"trusted":false}` 加换行并退出 1。
+- `diagnose-bundle` 使用与核验相同的输入，输出既有的单行诊断 JSON（`trusted` 与按 Unicode 码点排序去重的 `reasons`，沿用现有原因码）并保留末尾换行；可信退出 0，不可信退出 1。
+- 三个命令严格只读：参数、租户、请求编号、`--secrets` 文件、秘密映射或证据包非法时 stdout 为空、stderr 恰为 `{"error":"invalid_input"}` 加换行并退出 2。任何错误都不显示秘密、主体、原始范围、SQL 原文、文件路径或堆栈；无鉴权、五个 HTTP 入口、`health`、`serve` 启动语义、存储层异常以及无数据库核验行为均保持不变。
+
 
 业务入口（HTTP 五个；除新增三个只读可观测入口外其余能力均只在存储层开放）：
 
