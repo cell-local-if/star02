@@ -398,7 +398,7 @@ class HttpAcceptanceTests(unittest.TestCase):
             ("/requests/not-a-uuid", {"X-Tenant-Id": "tenant-a"}),
             ("/requests/123", {"X-Tenant-Id": "tenant-a"}),
             ("/requests/", {"X-Tenant-Id": "tenant-a"}),
-            ("/requests", {"X-Tenant-Id": "tenant-a"}),  # GET on collection is 405, skip
+            ("/requests", {"X-Tenant-Id": "tenant-a"}),  # GET collection lists, skip
         ]
         for index, (path, headers) in enumerate(paths_and_headers[:-1]):
             with self.subTest(index=index, path=path):
@@ -420,7 +420,6 @@ class HttpAcceptanceTests(unittest.TestCase):
         _, _, post_data = self._submit()
         request_id = json.loads(post_data)["request_id"]
         cases = [
-            ("GET", "/requests"),
             ("PUT", "/requests"),
             ("DELETE", "/requests"),
             ("PATCH", "/requests"),
