@@ -163,6 +163,17 @@ record, storage-layer only like the rest of the orchestration:
   irreversible key fingerprints, generations and times are persisted;
   old receipts keep verifying under the key generation that signed
   them, while a new receipt is only ever signed by the active key.
+* :meth:`RequestStore.get_receipt` recovers the already-settled first
+  receipt through a strictly read-only storage entry point that takes
+  no signature key. A request with a receipt returns the stored first
+  text byte-for-byte -- never recomputed, reordered or re-signed -- so
+  the same bytes come back before and after a key rotation, for a
+  receipt verifiable only under a historical generation, and after the
+  store is rebuilt; the current key generation is never consulted. A
+  request that exists but has no first receipt (accepted, processing,
+  failed, or completed without a settled execution record) raises
+  :class:`ReceiptUnavailable`; the read never mints the missing
+  receipt, registers a generation-1 key or changes any state.
 
 The lease boundary enforced by :meth:`claim_next` is deliberately
 narrower than "every processing request whose latest timestamp is old":
@@ -10827,6 +10838,106 @@ class RequestStore:
         # this receipt.
         expected = _receipt_tag(key, fields)
         return hmac.compare_digest(expected, fields["tag"])
+
+    def get_receipt(self, tenant_id: str, request_id: str) -> str:
+        """Recover the already-settled first deletion receipt, read-only.
+
+        Storage-layer only; never routed over HTTP. A caller that lost
+        the first :meth:`generate_receipt` result recovers it by tenant
+        and request id alone: no signature key is presented, and the
+        read is unaffected by the tenant's current receipt key
+        generation. When the request already carries a receipt the
+        stored first text is returned exactly as first written -- same
+        field content, same field order, exactly one trailing newline
+        -- never recomputed, reordered or re-signed, so the same
+        receipt is recovered byte-for-byte before and after a key
+        rotation, under a store rebuilt from the same file, and for a
+        receipt that only verifies under a historical key generation.
+
+        The entry point is strictly read-only: a missing receipt is
+        never generated, no generation-1 key is registered, and no
+        request status, execution attempt, lease, audit event, anchor,
+        key generation, existing receipt row or query result changes.
+        A request that exists but has no first receipt -- accepted,
+        processing or failed, or completed in status without a settled
+        completed execution record -- raises
+        :class:`ReceiptUnavailable`. A non-string or empty *tenant_id*
+        raises :class:`ValueError`; an empty, non-string, malformed,
+        unknown or cross-tenant *request_id*, or one that was never
+        accepted, raises :class:`RequestNotFound` identically, so the
+        request-id validation can never reveal which ids exist.
+
+        The ownership probe and the receipt row are read in one
+        deferred transaction, so a read interleaved with a concurrent
+        :meth:`generate_receipt` observes either the pre-commit state
+        (:class:`ReceiptUnavailable`) or the committed first text --
+        never a partial line. A receipt record that cannot be rebuilt
+        to the receipt specification, an unreadable store or a snapshot
+        that cannot be taken consistently raises the fixed-text
+        :class:`OSError`; no half text is ever returned. The value
+        alone is returned: exceptions and logs never carry a tenant, a
+        request id, receipt content, key material or a file path.
+        """
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        request_id = _require_identifier(request_id)
+        if self._mem_conn is not None:
+            with self._write_lock:
+                return self._get_receipt(tenant_id, request_id)
+        return self._get_receipt(tenant_id, request_id)
+
+    def _get_receipt(self, tenant_id: str, request_id: str) -> str:
+        conn = self._connect()
+        try:
+            # One deferred read transaction is the consistent snapshot:
+            # the ownership probe and the receipt row are either both
+            # the pre-mint state or both the committed first receipt, so
+            # a read racing the minting transaction can never observe a
+            # half-written line. The row is inserted (and committed) in
+            # the mint's own write transaction; uncommitted content is
+            # never visible to another connection.
+            try:
+                conn.execute("BEGIN")
+                try:
+                    owner = conn.execute(
+                        "SELECT 1 FROM requests "
+                        "WHERE tenant_id = ? AND request_id = ?",
+                        (tenant_id, request_id),
+                    ).fetchone()
+                    if owner is None:
+                        # Unknown, cross-tenant and never-accepted ids
+                        # share one outcome, so the call cannot reveal
+                        # which records exist.
+                        raise RequestNotFound("request not found")
+                    # Reuse the strict persisted-record check: the stored
+                    # text must parse as a receipt and be exactly its
+                    # canonical rendering. Anything else is storage
+                    # corruption: raise the fixed-text OSError and never
+                    # repair, recompute or return a partial text.
+                    stored = self._load_receipt_row_locked(
+                        conn, tenant_id, request_id
+                    )
+                except (RequestNotFound, OSError):
+                    self._rollback_quietly(conn)
+                    raise
+                except sqlite3.Error:
+                    self._rollback_quietly(conn)
+                    raise _storage_failure() from None
+                try:
+                    conn.execute("COMMIT")
+                except sqlite3.Error:
+                    self._rollback_quietly(conn)
+                    raise _storage_failure() from None
+            except sqlite3.Error:
+                raise _storage_failure() from None
+        finally:
+            self._release(conn)
+        # The request exists but no first receipt has committed. The
+        # read never mints one: accepted, processing, failed and
+        # completed-without-settled-execution requests share this one
+        # detail-free outcome.
+        if stored is None:
+            raise ReceiptUnavailable(_RECEIPT_UNAVAILABLE_MESSAGE)
+        return stored[1]
 
     def backup_to(self, target_path: str | os.PathLike[str]) -> str:
         """Write a transaction-consistent snapshot of this store's database.
