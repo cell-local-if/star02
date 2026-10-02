@@ -44,6 +44,7 @@ credential, worker identity, subject, scope or any other request field.
 Status advancement (:meth:`RequestStore.transition`), the execution
 orchestration (:meth:`RequestStore.claim_next`,
 :meth:`RequestStore.finish_claim`, :meth:`RequestStore.renew_lease`,
+:meth:`RequestStore.transfer_claim`,
 :meth:`RequestStore.reconcile_execution`,
 :meth:`RequestStore.reconcile_batch`,
 :meth:`RequestStore.migrate_execution_leases`) and the deletion receipts
@@ -355,6 +356,13 @@ class DeferredRequestStore:
         # Lease renewal is storage-layer only; like the rest of the
         # execution orchestration it is never routed over HTTP.
         return self._ready().renew_lease(
+            tenant_id, request_id, claim_token, lease_seconds
+        )
+
+    def transfer_claim(self, tenant_id, request_id, claim_token, lease_seconds):
+        # The secure lease handover is storage-layer only; like the rest
+        # of the execution orchestration it is never routed over HTTP.
+        return self._ready().transfer_claim(
             tenant_id, request_id, claim_token, lease_seconds
         )
 

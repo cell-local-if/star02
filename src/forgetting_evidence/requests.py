@@ -51,6 +51,18 @@ Execution orchestration lives on the same store, storage-layer only:
   commit a single new expiry that every competing caller observes, and
   an unknown, expired, released or foreign token -- or a request
   without a live lease -- raises :class:`ClaimConflict` unchanged.
+* :meth:`RequestStore.transfer_claim` is the secure lease handover: in
+  one transaction it replaces the current live lease's single-use
+  credential with a fresh unpredictable one and moves the same open
+  attempt's UTC expiry to the commit time plus the requested seconds,
+  creating no attempt and changing nothing else. It returns exactly the
+  request id, the new token (once; only its hash is stored) and the new
+  UTC RFC3339 expiry; the new token keeps working with renew_lease,
+  finish_claim and another transfer, the old token is dead at commit,
+  concurrent transfers of one credential can win at most once, and a
+  transfer racing a finish is decided solely by commit order. A
+  handover that cannot read, write or commit raises the fixed-text
+  :class:`OSError` ``execution_lease_transfer_failed``.
 * :meth:`RequestStore.get_execution_log` returns the attempt history
   (sequence, claim and expiry times, terminal result and completion
   time) with only strings, integers and nulls -- never a worker or token.
@@ -1157,6 +1169,19 @@ _LEASE_MIGRATION_MESSAGE = "execution_lease_migration_failed"
 def _lease_migration_failure() -> OSError:
     """Build the single migration error callers are ever allowed to see."""
     return OSError(_LEASE_MIGRATION_MESSAGE)
+
+
+# Fixed, detail-free text for every execution-lease handover failure: an
+# unreadable or unwritable store, a corrupt lease record, or a commit that
+# cannot land. It never embeds a tenant, a request id, a credential (old or
+# new), SQL text or a filesystem path, and a half-rotated credential or a
+# half-moved expiry is never returned.
+_LEASE_TRANSFER_MESSAGE = "execution_lease_transfer_failed"
+
+
+def _lease_transfer_failure() -> OSError:
+    """Build the single handover error callers are ever allowed to see."""
+    return OSError(_LEASE_TRANSFER_MESSAGE)
 
 
 # Fixed, detail-free text for every subject/data-scope resolution failure:
@@ -5238,6 +5263,189 @@ class RequestStore:
         if cursor.rowcount != 1:
             raise _storage_failure()
         return {"request_id": request_id, "lease_expires_at": new_expiry}
+
+    def transfer_claim(
+        self,
+        tenant_id: str,
+        request_id: str,
+        claim_token: str,
+        lease_seconds: int,
+    ) -> dict[str, str]:
+        """Securely hand the live lease to a fresh single-use credential.
+
+        The holder of the request's current, unexpired, unreleased lease
+        can in one atomic transaction replace its credential with a new
+        unpredictable single-use token and move the same execution
+        attempt's expiry to this transaction's commit time plus
+        ``lease_seconds``. The handover creates no attempt and changes
+        nothing else: request status, acceptance and event times, the
+        attempt sequence, audit timeline, anchors, receipts, tombstones,
+        the policy catalog and every query are untouched, and the
+        execution log afterwards reflects only the new expiry. Success
+        returns exactly ``request_id``, the new ``claim_token`` and the
+        new UTC RFC3339 ``lease_expires_at``; the new credential appears
+        only in that return value -- only its SHA-256 hash is stored and
+        it works with :meth:`renew_lease`, :meth:`finish_claim` and
+        another transfer, while the old credential is dead the instant
+        the transaction commits.
+
+        Parameters follow :meth:`renew_lease`: an out-of-domain tenant or
+        lease duration raises :class:`ValueError` before storage is
+        touched; an invalid, unknown or cross-tenant request id raises
+        :class:`RequestNotFound`, checked before the credential; an
+        empty, non-string, unknown, expired, released, cross-request or
+        cross-tenant credential -- or a target that is not a processing
+        request holding a live, unfinished lease -- raises the
+        detail-free :class:`ClaimConflict` and changes nothing. Two
+        transfers of the same old credential can never both win: only the
+        first commits, every loser conflicts, and a transfer racing a
+        finish is decided solely by commit order. An unreadable or
+        unwritable store, a corrupt lease record or a failed commit raises
+        the fixed-text :class:`OSError`
+        ``execution_lease_transfer_failed`` -- never a half-rotated
+        credential or a half-moved expiry. The handover survives a
+        restart and opens no HTTP route or health command.
+        """
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        lease_seconds = _require_lease_seconds(lease_seconds)
+        request_id = _require_identifier(request_id)
+
+        with self._write_lock:
+            try:
+                conn = self._connect()
+            except OSError:
+                raise _lease_transfer_failure() from None
+            try:
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                except sqlite3.Error:
+                    raise _lease_transfer_failure() from None
+                try:
+                    transferred = self._transfer_claim_locked(
+                        conn,
+                        tenant_id,
+                        request_id,
+                        claim_token,
+                        lease_seconds,
+                    )
+                    conn.execute("COMMIT")
+                except (ClaimConflict, RequestNotFound):
+                    # Domain rejections carry no engine text; ensure the
+                    # shared in-memory connection leaves the transaction.
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
+                except OSError:
+                    # A fixed-text handover failure raised after the helper
+                    # rolled back; the second rollback only guarantees the
+                    # connection has left its transaction.
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
+                except sqlite3.Error:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise _lease_transfer_failure() from None
+            finally:
+                self._release(conn)
+        _log.info("lease claim transferred request_id=%s", request_id)
+        return transferred
+
+    def _transfer_claim_locked(
+        self,
+        conn: sqlite3.Connection,
+        tenant_id: str,
+        request_id: str,
+        claim_token: str,
+        lease_seconds: int,
+    ) -> dict[str, str]:
+        # The request-id check outranks every credential check, exactly
+        # like renew_lease: unknown and cross-tenant ids are
+        # RequestNotFound whatever token is presented, so the credential
+        # can never probe existence.
+        row = conn.execute(
+            "SELECT status FROM requests WHERE tenant_id = ? AND request_id = ?",
+            (tenant_id, request_id),
+        ).fetchone()
+        if row is None:
+            raise RequestNotFound("request not found")
+        current_status = row[0]
+
+        # Every credential problem -- outside the non-empty-string
+        # domain, unknown, released, or owned by other coordinates -- is
+        # the single detail-free ClaimConflict.
+        if not isinstance(claim_token, str) or not claim_token:
+            raise _claim_conflict()
+        presented = hashlib.sha256(claim_token.encode("utf-8")).hexdigest()
+        owner = conn.execute(
+            "SELECT tenant_id, request_id, attempt_number FROM claim_tokens "
+            "WHERE token_hash = ? LIMIT 1",
+            (presented,),
+        ).fetchone()
+        if owner is None or (owner[0], owner[1]) != (tenant_id, request_id):
+            raise _claim_conflict()
+        attempt_number = owner[2]
+
+        if current_status != _STATUS_PROCESSING:
+            # Only a processing request can hold a handover-able lease;
+            # the fixed message never says which condition applied.
+            raise _claim_conflict()
+
+        latest = conn.execute(
+            "SELECT result, lease_expires_at FROM claim_attempts "
+            "WHERE tenant_id = ? AND request_id = ? AND attempt_number = ?",
+            (tenant_id, request_id, attempt_number),
+        ).fetchone()
+        # Mirror _renew_lease_locked/_finish_claim_locked: a live token
+        # always names an existing open attempt, so a missing or settled
+        # one is a conflict (released credential), never a handover.
+        if latest is None or latest[0] is not None:
+            raise _claim_conflict()
+        stored_expiry = latest[1]
+        if not isinstance(stored_expiry, str) or not stored_expiry:
+            # A lease row without its expiry is out-of-band corruption.
+            raise _lease_transfer_failure()
+        now_dt = datetime.now(timezone.utc)
+        if _format_rfc3339(now_dt) > stored_expiry:
+            # The lease has lapsed; a late handover never resurrects it.
+            raise _claim_conflict()
+
+        new_expiry = _format_rfc3339(now_dt + timedelta(seconds=lease_seconds))
+        new_token = _new_claim_token()
+        new_hash = hashlib.sha256(new_token.encode("utf-8")).hexdigest()
+        # The expiry move and the credential swap land in this one
+        # transaction: BEGIN IMMEDIATE holds the write lock, so a
+        # concurrent transfer or finish can never interleave, and a
+        # competing committer makes exactly one of these guarded writes
+        # miss -- a storage fault surfaced as the fixed-text OSError,
+        # never a half-rotated lease.
+        cursor = conn.execute(
+            "UPDATE claim_attempts SET lease_expires_at = ? "
+            "WHERE tenant_id = ? AND request_id = ? AND attempt_number = ? "
+            "AND result IS NULL AND lease_expires_at = ?",
+            (new_expiry, tenant_id, request_id, attempt_number, stored_expiry),
+        )
+        if cursor.rowcount != 1:
+            raise _lease_transfer_failure()
+        cursor = conn.execute(
+            "UPDATE claim_tokens SET token_hash = ? "
+            "WHERE tenant_id = ? AND request_id = ? AND attempt_number = ? "
+            "AND token_hash = ?",
+            (new_hash, tenant_id, request_id, attempt_number, presented),
+        )
+        if cursor.rowcount != 1:
+            raise _lease_transfer_failure()
+        return {
+            "request_id": request_id,
+            "claim_token": new_token,
+            "lease_expires_at": new_expiry,
+        }
 
     def get_execution_log(
         self,
