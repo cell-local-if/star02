@@ -22,16 +22,16 @@ PYTHONPATH=src python3 -m forgetting_evidence serve --db ./data/evidence.db --ho
 PYTHONPATH=src python3 -m forgetting_evidence serve --db ./data/evidence.db --host 0.0.0.0 --port 8080 --auth-file ./config/auth.json
 ```
 
-鉴权配置为 UTF-8 JSON 对象，含 `principals` 键，其每项含非空字符串 `token`、非空字符串 `tenant_id` 与非空数组 `roles`；`roles` 元素互异，且只能取 `request:submit` 与 `request:read`；令牌不得重复。例：
+鉴权配置为 UTF-8 JSON 对象，含 `principals` 键，其每项含非空字符串 `token`、非空字符串 `tenant_id` 与非空数组 `roles`；`roles` 元素互异，且只能取 `request:submit`、`request:read` 与 `request:reconcile`；令牌不得重复。例：
 
 ```json
 {"principals":[{"token":"token-for-a","tenant_id":"tenant-a","roles":["request:submit","request:read"]},{"token":"read-only-b","tenant_id":"tenant-b","roles":["request:read"]}]}
 ```
 
-启用鉴权后，`Authorization` 必须为 `Bearer <已配置令牌>`；缺少或畸形授权头、令牌未配置返回 `401 {"error":"unauthorized"}`。角色不足或目标租户不是其 `tenant_id` 返回 `403 {"error":"forbidden"}`：`POST /requests` 要求 `request:submit`，目标租户取请求体 `tenant_id`；`GET /requests`、`GET /requests/{request_id}`、`GET /requests/{request_id}/status` 与 `GET /requests/{request_id}/execution-log` 均要求 `request:read`，目标租户沿用 `X-Tenant-Id` 非空优先、否则取最后一个非空 `tenant_id` 查询参数的既有规则。鉴权在已匹配路径之后（未知路径仍 404、不支持方法仍 405）、但先于载荷校验与存储访问执行。无 `--auth-file` 时 `Authorization` 头被忽略。重启后的授权结果只由同一份配置决定；令牌、角色与鉴权配置只存在于进程内存，绝不写入数据库、状态、执行、回执、审计事件、锚点或证据包，也不进入响应、异常或日志。
+启用鉴权后，`Authorization` 必须为 `Bearer <已配置令牌>`；缺少或畸形授权头、令牌未配置返回 `401 {"error":"unauthorized"}`。角色不足或目标租户不是其 `tenant_id` 返回 `403 {"error":"forbidden"}`：`POST /requests` 要求 `request:submit`，目标租户取请求体 `tenant_id`；`GET /requests`、`GET /requests/{request_id}`、`GET /requests/{request_id}/status` 与 `GET /requests/{request_id}/execution-log` 均要求 `request:read`；`POST /requests/{request_id}/reconcile` 要求 `request:reconcile`，目标租户沿用 `X-Tenant-Id` 非空优先、否则取最后一个非空 `tenant_id` 查询参数的既有规则。鉴权在已匹配路径之后（未知路径仍 404、不支持方法仍 405）、但先于载荷校验与存储访问执行。无 `--auth-file` 时 `Authorization` 头被忽略。重启后的授权结果只由同一份配置决定；令牌、角色与鉴权配置只存在于进程内存，绝不写入数据库、状态、执行、回执、审计事件、锚点或证据包，也不进入响应、异常或日志。
 
 
-业务入口（HTTP 五个；除新增三个只读可观测入口外其余能力均只在存储层开放）：
+业务入口（HTTP 六个；除上述入口外其余能力均只在存储层开放）：
 
 - `POST /requests`：受理删除请求。请求体为 JSON：`tenant_id`、`subject_id`、`idempotency_key` 均为非空字符串，`scopes` 为元素互异的非空字符串数组。
   成功返回单行 JSON，依次含 `request_id`（UUID）、`status`（`accepted`）、`created_at`（UTC RFC3339），并以换行结尾。
@@ -40,6 +40,7 @@ PYTHONPATH=src python3 -m forgetting_evidence serve --db ./data/evidence.db --ho
 - `GET /requests/{request_id}`：按请求编号查询本租户的**受理回执**。租户通过 `X-Tenant-Id` 请求头或 `tenant_id` 查询参数指定，命中时返回与受理时完全一致的回执；该回执在状态推进后保持不变，始终为受理时的 `accepted` 记录（请求编号与受理时间也保持首次值）。
 - `GET /requests/{request_id}/status`：只读查询请求**当前状态**。返回单行 JSON，字段按 `request_id`、`status`、`created_at` 顺序排列并以一个换行结束；`status` 读取数据库当前状态，`created_at` 保持原始受理时间。严格只读：不推进状态、不创建尝试、不写入簿记，重启后与持久化记录一致。
 - `GET /requests/{request_id}/execution-log`：只读查询请求的**执行记录**。返回单行 JSON，恰含 `request_id` 与 `attempts`；`attempts` 按 `attempt_number` 从 1 递增排列，每项恰含 `attempt_number`、`claimed_at`、`lease_expires_at`、`result`、`completed_at`。未结束尝试的 `result` 与 `completed_at` 为 `null`；已结束尝试使用已有的 `completed` 或 `failed` 结果及完成时间。严格只读，不返回租约凭证、worker 身份、主体、范围或其他请求信息，重启后与持久化记录一致。
+- `POST /requests/{request_id}/reconcile`：对单个请求执行对账并收敛其执行记录，目标租户沿用 `X-Tenant-Id` 请求头或 `tenant_id` 查询参数的既有规则。入口不接收业务参数：`Content-Length` 缺省或为 0 表示无正文，其他正文返回 `400 {"error":"invalid_request"}`。成功返回 200 与状态查询同形的单行 JSON，恰含 `request_id`、`status`、`created_at`，为对账后当前记录，不暴露主体、范围、幂等键、worker、领取凭证或尝试明细。语义即存储层 `reconcile_execution`：`accepted` 只回报现状，有效租约的 `processing` 保持处理中，终态幂等，租约过期且无可解释租约的 `processing` 在单事务内补偿收敛。目标租户缺失或为空返回 `400 {"error":"invalid_request"}`；请求编号格式非法、未知、尚未受理或跨租户统一返回 `404 {"error":"not_found"}`；存储层参数错误返回 `400 {"error":"invalid_request"}`，存储故障或损坏返回 `503 {"error":"storage_unavailable"}`。该资源的非 POST 方法返回 `405 {"error":"method_not_allowed"}` 并带 `Allow: POST`（HEAD 不返回正文），更深路径仍为 404。重复调用不改变稳定终态、历史尝试或既有时间，并发调用由存储层原子提交决定唯一结果，失败调用不留下半成响应或额外业务记录。不新增批量对账 HTTP 入口。
 
 存储层状态机（`RequestStore`，不经 HTTP 开放）：
 
@@ -103,14 +104,14 @@ PYTHONPATH=src python3 -m forgetting_evidence serve --db ./data/evidence.db --ho
 - 入口语义：`tenant_id` 为空、非字符串抛 `ValueError`；请求编号空值、非字符串、非法、未知或跨租户统一抛 `RequestNotFound`，不泄露存在性；只给请求编号不给租户抛 `ValueError`；存储不可用或锚点状态损坏抛固定文案 `OSError`。返回值、异常与日志只含请求编号、状态、时间与稳定原因码，不含主体、范围、密钥、SQL 原文或路径。
 - 执行编排路径（首次领取进入 `processing`、`finish_claim` 终态、`reconcile_execution` 补偿、`reconcile_batch` 逐项收敛）产生的每次实际状态变化都在同事务锚定；受理、状态、执行、对账、健康与既有 HTTP 行为全部保持不变。
 
-存储层执行编排（`RequestStore`，不经 HTTP 开放）：
+存储层执行编排（`RequestStore`；除 `reconcile_execution` 另经 `POST /requests/{request_id}/reconcile` 开放外，其余不经 HTTP 开放）：
 
 - `claim_next(tenant_id, worker_id, lease_seconds)`：原子领取下一个可执行请求。`tenant_id`、`worker_id` 为非空字符串，`lease_seconds` 为 1 至 3600 的非布尔整数秒。候选为 `accepted` 请求及最新租约已过期的 `processing` 请求，按受理时间再按请求编号取最前者；首次领取使请求进入 `processing` 并开始第 1 次尝试，过期重领开始下一次尝试且不改变首次受理时间、编号或当前状态。同一请求同一时刻只有一个 worker 持有有效租约。成功返回恰好三个字段：`request_id`、不可预测的 `claim_token`、UTC RFC3339 的 `lease_expires_at`；无候选返回 `None`。worker 身份只校验不持久化，领取凭证只返回一次、绝不入库（仅存散列）或出现在日志中。
 - `finish_claim(tenant_id, request_id, claim_token, result)`：以终态完成当前租约。`result` 只接受 `completed` 或 `failed`。凭证必须对应该租户该请求当前未过期、未释放的租约；终态状态与审计链事件、尝试结果记录、凭证释放在同一事务提交。返回状态记录（`request_id`、`status`、`created_at`）。
 - `renew_lease(tenant_id, request_id, claim_token, lease_seconds)`：以领取凭证续期当前有效租约，只在存储层开放，不经 HTTP。`lease_seconds` 为 1 至 3600 的非布尔整数秒；成功只返回 `request_id` 与新的 UTC RFC3339 `lease_expires_at` 两个字段（顺序固定），不含浮点、负零或非有限数，实例重建后读取同一值。续期只把当前未释放租约的到期时间推进到本次事务提交时间加上续期秒数，请求状态、尝试序号、审计事件、回执与巡检簿记都不变，也不产生新尝试或新凭证；连续续租每次都按各自提交时间产生新的到期时间，同一凭证并发续租只提交一个新到期时间，竞争调用取得相同结果，底层锁冲突不外泄。续期后的凭证继续用于既有完成入口；到期未续的租约仍由既有对账补偿，迟到续租不复活已释放尝试。
 - `transfer_claim(tenant_id, request_id, claim_token, lease_seconds)`：执行租约的安全交接入口，只在存储层开放，不经 HTTP、不新增健康命令或路由。持有当前有效领取凭证的调用方在单一原子事务中把它替换为新的不可预测单次凭证，并把同一执行尝试的到期时间改为本次提交时刻加 `lease_seconds`（参数沿用 `renew_lease`，为 1 至 3600 的非布尔整数秒）。成功返回恰好三个字段（顺序固定）：`request_id`、新的 `claim_token` 与新的 UTC RFC3339 `lease_expires_at`。交接不创建尝试，不改变状态、受理与事件时间、尝试、审计、锚点、回执、墓碑、策略目录或任何查询，执行日志只反映新到期时间。新凭证只在成功返回值中出现一次，数据库只存其 SHA-256 散列，异常、返回值与日志都不含新旧凭证、worker、主体、范围、SQL 或路径；新凭证继续适用于 `renew_lease`、`finish_claim` 与再次 `transfer_claim`，旧凭证在提交后立即失效。相同旧凭证并发交接至多一个成功，其余抛 `ClaimConflict`；交接与 `finish_claim` 并发时由提交顺序唯一决定成功者，后提交者冲突。过期重领、对账补偿、并发领取与终态结果语义不变；重启重建后交接结果继续有效。
 - `get_execution_log(tenant_id, request_id)`：按租户与请求编号返回执行尝试列表，按尝试序号（从 1 递增）排列。每条恰含 `attempt_number`（正整数）、`claimed_at` 与 `lease_expires_at`（UTC RFC3339 字符串）、`result` 与 `completed_at`（完成后为终态与完成时间，进行中或被过期放弃的尝试为空值）。返回值只含字符串、整数与空值，不含 worker 或领取凭证。
-- `reconcile_execution(tenant_id, request_id)`：按租户和请求编号对账执行结果，返回既有状态记录（`request_id`、`status`、`created_at`）。
+- `reconcile_execution(tenant_id, request_id)`：按租户和请求编号对账执行结果，返回既有状态记录（`request_id`、`status`、`created_at`）。该入口同时经 `POST /requests/{request_id}/reconcile` 开放，HTTP 层不改变其领取、租约、补偿、终态保持与跨重启语义。
   - `accepted`（含无任何执行尝试）时只返回现状：不创建记录、尝试或回执，也不产生任何变化。
   - 仍有有效租约的 `processing` 请求保留进行中尝试，不提前写终态、不生成新尝试。
   - `completed` 或 `failed` 的重复对账幂等：保留首次终态结果与同一状态记录；执行记录中存在多个终态时保留最早完成的结果，后续重复终态记为 `failed` 且不改请求状态。
