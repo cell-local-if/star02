@@ -549,6 +549,7 @@ import hmac
 import json
 import logging
 import os
+import pathlib
 import re
 import secrets
 import sqlite3
@@ -562,6 +563,7 @@ from datetime import datetime, timedelta, timezone
 __all__ = [
     "RequestStore",
     "restore_backup",
+    "read_request_status",
     "IdempotencyConflict",
     "RequestNotFound",
     "InvalidStatusTransition",
@@ -2055,6 +2057,56 @@ def restore_backup(
             os.unlink(temp_path)
         except OSError:
             pass
+
+
+def read_request_status(
+    db_path: str | os.PathLike[str],
+    tenant_id: str,
+    request_id: str,
+) -> dict[str, str]:
+    """Read the current status record without ever opening the store for writes.
+
+    This is the strictly read-only lookup behind the ``status`` command.
+    It follows :meth:`RequestStore.get_status` semantics exactly -- the
+    same validation, the same fixed record shape and field order
+    (``request_id``, ``status``, ``created_at``) and the same
+    indistinguishable :class:`RequestNotFound` for invalid, unknown or
+    cross-tenant ids -- but it never creates the database, never runs
+    schema DDL and never writes any bookkeeping. The file is opened
+    read-only and only committed rows are read, so a missing,
+    unreadable, locked or corrupt database surfaces as the same
+    fixed-text :class:`OSError` storage failure; the underlying
+    exception, the path and any SQL never leak to the caller.
+    """
+    if isinstance(db_path, os.PathLike):
+        db_path = os.fspath(db_path)
+    if not isinstance(db_path, str) or not db_path:
+        raise ValueError("storage path must be a non-empty string")
+    tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+    request_id = _require_identifier(request_id)
+    # Open the existing file read-only: a missing path fails instead of
+    # being created, and no schema or bookkeeping write can ever occur.
+    uri = pathlib.Path(os.path.abspath(db_path)).as_uri() + "?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=_BUSY_TIMEOUT_MS / 1000)
+    except sqlite3.Error:
+        raise _storage_failure() from None
+    try:
+        try:
+            row = conn.execute(
+                "SELECT request_id, status, created_at FROM requests "
+                "WHERE tenant_id = ? AND request_id = ?",
+                (tenant_id, request_id),
+            ).fetchone()
+        except sqlite3.Error:
+            raise _storage_failure() from None
+    finally:
+        conn.close()
+    if row is None:
+        # Identical outcome for unknown ids and cross-tenant lookups:
+        # the response must not reveal that another tenant owns a record.
+        raise RequestNotFound("request not found")
+    return {"request_id": row[0], "status": row[1], "created_at": row[2]}
 
 
 # Allowed request lifecycle. completed and failed are terminal; moving a

@@ -8,7 +8,12 @@ from .httpapi import (
     build_server,
     load_auth_config,
 )
-from .requests import RestoreConflict, restore_backup
+from .requests import (
+    RequestNotFound,
+    RestoreConflict,
+    read_request_status,
+    restore_backup,
+)
 
 _USAGE = "usage: python -m forgetting_evidence health"
 _SERVE_USAGE = (
@@ -19,6 +24,8 @@ _SERVE_USAGE = (
 # Restore's markers are fixed, detail-free text: the paths and any
 # underlying error are never printed.
 _RESTORE_USAGE = "restore_usage"
+# Status shares the same rule: fixed, detail-free markers only.
+_STATUS_USAGE = "status_usage"
 
 _FLAG_ALIASES = {
     "--db": "db",
@@ -30,6 +37,75 @@ _FLAG_ALIASES = {
     "--auth-file": "auth_file",
 }
 _POSITIONAL_FIELDS = ("db", "host", "port")
+
+_STATUS_FLAG_ALIASES = {
+    "--db": "db",
+    "--tenant-id": "tenant_id",
+    "--request-id": "request_id",
+}
+_STATUS_POSITIONAL_FIELDS = ("db", "tenant_id", "request_id")
+
+
+def _parse_status_args(args: list[str]) -> dict[str, str] | None:
+    values: dict[str, str] = {}
+    positionals: list[str] = []
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if "=" in token and token.split("=", 1)[0] in _STATUS_FLAG_ALIASES:
+            name, value = token.split("=", 1)
+            field = _STATUS_FLAG_ALIASES[name]
+            if field in values or value == "":
+                return None
+            values[field] = value
+        elif token in _STATUS_FLAG_ALIASES:
+            field = _STATUS_FLAG_ALIASES[token]
+            if field in values or index + 1 >= len(args):
+                return None
+            values[field] = args[index + 1]
+            index += 1
+        elif token.startswith("--"):
+            return None
+        else:
+            positionals.append(token)
+        index += 1
+    if positionals and values:
+        # Avoid ambiguity when both styles are mixed.
+        return None
+    if positionals:
+        if len(positionals) != 3:
+            return None
+        values = dict(zip(_STATUS_POSITIONAL_FIELDS, positionals))
+    missing = [field for field in _STATUS_POSITIONAL_FIELDS if not values.get(field)]
+    if missing:
+        return None
+    return values
+
+
+def _run_status(args: list[str]) -> int:
+    parsed = _parse_status_args(args)
+    if parsed is None:
+        print(_STATUS_USAGE, file=sys.stderr)
+        return 2
+    # The lookup is strictly read-only: it never creates the database,
+    # never migrates the schema and never writes bookkeeping. Every
+    # storage problem -- a missing, unreadable, locked or corrupt
+    # database -- collapses to the single fixed failure marker, and an
+    # invalid, unknown or cross-tenant request id is indistinguishable
+    # from a missing one. The path, the tenant, the request id and any
+    # underlying error are never printed.
+    try:
+        record = read_request_status(
+            parsed["db"], parsed["tenant_id"], parsed["request_id"]
+        )
+    except RequestNotFound:
+        print("request_not_found", file=sys.stderr)
+        return 3
+    except (ValueError, OSError):
+        print("status_failed", file=sys.stderr)
+        return 2
+    print(json.dumps(record, separators=(",", ":")))
+    return 0
 
 
 def _parse_serve_args(args: list[str]) -> dict[str, str] | None:
@@ -152,6 +228,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_serve(args[1:])
     if args and args[0] == "restore":
         return _run_restore(args[1:])
+    if args and args[0] == "status":
+        return _run_status(args[1:])
     print(_USAGE, file=sys.stderr)
     return 2
 

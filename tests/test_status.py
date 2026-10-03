@@ -1,9 +1,13 @@
+import contextlib
+import io
+import json
 import os
 import sqlite3
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 
+from forgetting_evidence.__main__ import main
 from forgetting_evidence.requests import (
     InvalidStatusTransition,
     RequestNotFound,
@@ -198,6 +202,198 @@ class StorageErrorTests(unittest.TestCase):
         with self.assertRaises(OSError) as ctx:
             RequestStore(self.db_path)
         self.assertEqual(str(ctx.exception), "request store is unavailable")
+
+
+class StatusCommandTests(unittest.TestCase):
+    """The read-only ``python -m forgetting_evidence status`` command."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self._tmp.name, "evidence.db")
+        store = RequestStore(self.db_path)
+        self.receipt = store.submit(
+            "tenant-a", "subject-1", ["email"], "key-1"
+        )
+        self.request_id = self.receipt["request_id"]
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _run_cli(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = main(["status", *argv])
+        return code, out.getvalue(), err.getvalue()
+
+    def _db_bytes(self):
+        with open(self.db_path, "rb") as handle:
+            return handle.read()
+
+    # -- success ---------------------------------------------------------
+
+    def test_positional_success_outputs_compact_json_line(self):
+        code, out, err = self._run_cli(
+            self.db_path, "tenant-a", self.request_id
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertTrue(out.endswith("\n"))
+        self.assertEqual(out.count("\n"), 1)
+        record = json.loads(out)
+        self.assertEqual(
+            list(record), ["request_id", "status", "created_at"]
+        )
+        self.assertEqual(record["request_id"], self.request_id)
+        self.assertEqual(record["status"], "accepted")
+        self.assertEqual(record["created_at"], self.receipt["created_at"])
+        # Compact: no whitespace outside string values.
+        self.assertEqual(out.strip(), json.dumps(record, separators=(",", ":")))
+
+    def test_flag_style_and_equals_form_are_equivalent(self):
+        expected = self._run_cli(self.db_path, "tenant-a", self.request_id)
+        for argv in (
+            ("--db", self.db_path, "--tenant-id", "tenant-a",
+             "--request-id", self.request_id),
+            (f"--db={self.db_path}", "--tenant-id=tenant-a",
+             f"--request-id={self.request_id}"),
+        ):
+            with self.subTest(argv=argv):
+                self.assertEqual(self._run_cli(*argv), expected)
+
+    def test_status_reflects_committed_transitions_only(self):
+        store = RequestStore(self.db_path)
+        store.transition("tenant-a", self.request_id, "processing")
+        code, out, _err = self._run_cli(
+            self.db_path, "tenant-a", self.request_id
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["status"], "processing")
+        # A rebuilt store (process restart) reads the same record.
+        rebuilt = RequestStore(self.db_path)
+        self.assertEqual(
+            json.loads(out),
+            rebuilt.get_status("tenant-a", self.request_id),
+        )
+        # The frozen acceptance receipt is untouched.
+        self.assertEqual(rebuilt.get("tenant-a", self.request_id), self.receipt)
+
+    def test_command_does_not_write_to_the_database(self):
+        before = self._db_bytes()
+        code, _out, _err = self._run_cli(
+            self.db_path, "tenant-a", self.request_id
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(self._db_bytes(), before)
+        self.assertEqual(os.listdir(self._tmp.name), ["evidence.db"])
+
+    # -- usage errors ----------------------------------------------------
+
+    def test_missing_duplicate_extra_mixed_or_empty_args_are_usage(self):
+        cases = (
+            (),
+            (self.db_path,),
+            (self.db_path, "tenant-a"),
+            (self.db_path, "tenant-a", self.request_id, "extra"),
+            # Mixed positional and flag styles.
+            (self.db_path, "--tenant-id", "tenant-a",
+             "--request-id", self.request_id),
+            ("--db", self.db_path, "tenant-a", self.request_id),
+            # Duplicated flags.
+            ("--db", self.db_path, "--db", self.db_path,
+             "--tenant-id", "tenant-a", "--request-id", self.request_id),
+            ("--db", self.db_path, "--tenant-id", "tenant-a",
+             "--tenant-id", "tenant-a", "--request-id", self.request_id),
+            # Unknown flags.
+            ("--db", self.db_path, "--tenant-id", "tenant-a",
+             "--request-id", self.request_id, "--verbose"),
+            ("--host", "x"),
+            # Empty values in either style.
+            ("", "tenant-a", self.request_id),
+            (self.db_path, "", self.request_id),
+            (self.db_path, "tenant-a", ""),
+            ("--db=", "--tenant-id=tenant-a", "--request-id=x"),
+            ("--db", self.db_path, "--tenant-id", "",
+             "--request-id", self.request_id),
+            # A flag missing its value.
+            ("--db", self.db_path, "--tenant-id", "tenant-a", "--request-id"),
+        )
+        for argv in cases:
+            with self.subTest(argv=argv):
+                code, out, err = self._run_cli(*argv)
+                self.assertEqual(code, 2)
+                self.assertEqual(out, "")
+                self.assertEqual(err.strip(), "status_usage")
+
+    # -- not found -------------------------------------------------------
+
+    def test_unknown_malformed_and_cross_tenant_ids_are_not_found(self):
+        for rid in ("does-not-exist", "not-a-uuid"):
+            with self.subTest(rid=rid):
+                code, out, err = self._run_cli(self.db_path, "tenant-a", rid)
+                self.assertEqual(code, 3)
+                self.assertEqual(out, "")
+                self.assertEqual(err.strip(), "request_not_found")
+        code, out, err = self._run_cli(self.db_path, "tenant-b", self.request_id)
+        self.assertEqual(code, 3)
+        self.assertEqual(out, "")
+        self.assertEqual(err.strip(), "request_not_found")
+
+    # -- storage failures ------------------------------------------------
+
+    def test_missing_database_is_status_failed_and_not_created(self):
+        missing = os.path.join(self._tmp.name, "no-such.db")
+        code, out, err = self._run_cli(missing, "tenant-a", self.request_id)
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertEqual(err.strip(), "status_failed")
+        self.assertFalse(os.path.exists(missing))
+
+    def test_corrupt_database_is_status_failed(self):
+        with open(self.db_path, "wb") as handle:
+            handle.write(b"this is not a sqlite database")
+        code, out, err = self._run_cli(
+            self.db_path, "tenant-a", self.request_id
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertEqual(err.strip(), "status_failed")
+
+    def test_directory_as_database_is_status_failed(self):
+        code, out, err = self._run_cli(
+            self._tmp.name, "tenant-a", self.request_id
+        )
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertEqual(err.strip(), "status_failed")
+
+    # -- output hygiene --------------------------------------------------
+
+    def test_error_output_carries_no_details(self):
+        missing = os.path.join(self._tmp.name, "absent.db")
+        for argv in (
+            (self.db_path, "tenant-b", self.request_id),
+            (missing, "tenant-a", self.request_id),
+        ):
+            for _attempt in range(2):
+                _code, out, err = self._run_cli(*argv)
+                self.assertEqual(out, "")
+                for sensitive in (
+                    self.db_path, missing, "tenant-a", "tenant-b",
+                    self.request_id, "subject-1", "email", "sqlite",
+                ):
+                    self.assertNotIn(sensitive, err)
+
+    def test_success_output_carries_no_sensitive_fields(self):
+        code, out, _err = self._run_cli(
+            self.db_path, "tenant-a", self.request_id
+        )
+        self.assertEqual(code, 0)
+        record = json.loads(out)
+        self.assertEqual(
+            set(record), {"request_id", "status", "created_at"}
+        )
+        for sensitive in ("tenant-a", "subject-1", "email", "key-1"):
+            self.assertNotIn(sensitive, out)
 
 
 if __name__ == "__main__":
