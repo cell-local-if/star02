@@ -11,6 +11,7 @@ from .httpapi import (
 from .requests import (
     RequestNotFound,
     RestoreConflict,
+    read_request_evidence,
     read_request_status,
     restore_backup,
 )
@@ -26,6 +27,8 @@ _SERVE_USAGE = (
 _RESTORE_USAGE = "restore_usage"
 # Status shares the same rule: fixed, detail-free markers only.
 _STATUS_USAGE = "status_usage"
+# Evidence mirrors status: fixed, detail-free markers only.
+_EVIDENCE_USAGE = "evidence_usage"
 
 _FLAG_ALIASES = {
     "--db": "db",
@@ -105,6 +108,47 @@ def _run_status(args: list[str]) -> int:
         print("status_failed", file=sys.stderr)
         return 2
     print(json.dumps(record, separators=(",", ":")))
+    return 0
+
+
+def _run_evidence(args: list[str]) -> int:
+    # Evidence accepts the exact same two invocation styles as status --
+    # three positionals or the three named flags -- so the two share one
+    # parser; mixing styles, duplicates, empty values, unknown flags or a
+    # wrong arity never reach storage.
+    parsed = _parse_status_args(args)
+    if parsed is None:
+        print(_EVIDENCE_USAGE, file=sys.stderr)
+        return 2
+    # Strictly read-only like status: the database is never created,
+    # migrated or repaired. A tampered chain is still a successful read
+    # with verified=false; only an invalid/unknown/cross-tenant id (or a
+    # record that cannot form a legal evidence summary) is not-found, and
+    # every storage problem collapses to the fixed failure marker. The
+    # path, tenant, request id, SQL and underlying error are never
+    # printed, and the JSON line is only emitted once the read succeeds.
+    try:
+        record = read_request_evidence(
+            parsed["db"], parsed["tenant_id"], parsed["request_id"]
+        )
+    except RequestNotFound:
+        print("evidence_not_found", file=sys.stderr)
+        return 3
+    except (ValueError, OSError):
+        print("evidence_failed", file=sys.stderr)
+        return 2
+    print(
+        json.dumps(
+            {
+                "request_id": record["request_id"],
+                "status": record["status"],
+                "event_count": record["event_count"],
+                "chain_hash": record["chain_hash"],
+                "verified": record["verified"],
+            },
+            separators=(",", ":"),
+        )
+    )
     return 0
 
 
@@ -230,6 +274,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_restore(args[1:])
     if args and args[0] == "status":
         return _run_status(args[1:])
+    if args and args[0] == "evidence":
+        return _run_evidence(args[1:])
     print(_USAGE, file=sys.stderr)
     return 2
 

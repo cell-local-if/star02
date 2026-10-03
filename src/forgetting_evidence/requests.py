@@ -2109,6 +2109,139 @@ def read_request_status(
     return {"request_id": row[0], "status": row[1], "created_at": row[2]}
 
 
+def read_request_evidence(
+    db_path: str | os.PathLike[str],
+    tenant_id: str,
+    request_id: str,
+) -> dict[str, object]:
+    """Read one request's integrity evidence without ever opening for writes.
+
+    This is the strictly read-only lookup behind the ``evidence``
+    command. It combines :meth:`RequestStore.evidence` and
+    :meth:`RequestStore.verify_evidence` semantics in a single
+    read-only snapshot: the persisted ``status``, ``event_count`` and
+    ``chain_hash`` come straight from the request row and state events
+    (never recomputed or repaired), and ``verified`` replays the
+    database-internal chain from the genesis predecessor -- every link
+    recomputed in order, sequences gap-free from zero, the final link
+    equal to the request's anchored head and the final event's status
+    equal to the current status. A deleted, altered, inserted or
+    reordered event, or a final event inconsistent with the current
+    status or request head, is a successful read with ``verified``
+    false, not an error: the verdict only describes the in-database
+    chain and never authenticates external audit anchors.
+
+    The file is opened read-only, so the database is never created,
+    migrated or repaired. Invalid, unknown and cross-tenant ids -- and
+    records that cannot form a legal evidence summary (e.g. a malformed
+    persisted head) -- raise :class:`RequestNotFound`. A missing,
+    unreadable, locked or corrupt database raises the fixed-text
+    :class:`OSError` storage failure; the underlying exception, the
+    path and any SQL never reach the caller.
+    """
+    if isinstance(db_path, os.PathLike):
+        db_path = os.fspath(db_path)
+    if not isinstance(db_path, str) or not db_path:
+        raise ValueError("storage path must be a non-empty string")
+    tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+    request_id = _require_identifier(request_id)
+    # Open the existing file read-only: a missing path fails instead of
+    # being created, and no schema, repair or bookkeeping write can ever
+    # occur.
+    uri = pathlib.Path(os.path.abspath(db_path)).as_uri() + "?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=_BUSY_TIMEOUT_MS / 1000)
+    except sqlite3.Error:
+        raise _storage_failure() from None
+    try:
+        try:
+            owner = conn.execute(
+                "SELECT status, chain_hash FROM requests "
+                "WHERE tenant_id = ? AND request_id = ?",
+                (tenant_id, request_id),
+            ).fetchone()
+            if owner is None:
+                # Identical outcome for unknown ids and cross-tenant
+                # lookups.
+                raise RequestNotFound("request not found")
+            current_status, anchored_head = owner
+            rows = conn.execute(
+                "SELECT seq, status, occurred_at, chain_hash "
+                "FROM status_events "
+                "WHERE tenant_id = ? AND request_id = ? ORDER BY seq",
+                (tenant_id, request_id),
+            ).fetchall()
+            event_count = conn.execute(
+                "SELECT count(*) FROM status_events "
+                "WHERE tenant_id = ? AND request_id = ?",
+                (tenant_id, request_id),
+            ).fetchone()[0]
+        except RequestNotFound:
+            raise
+        except sqlite3.Error:
+            raise _storage_failure() from None
+    finally:
+        conn.close()
+    # A record that cannot form a legal evidence summary -- a non-text
+    # status or count, or a head that is not a well-formed digest -- is
+    # indistinguishable from a missing one, exactly like evidence().
+    if (
+        not isinstance(current_status, str)
+        or not isinstance(event_count, int)
+        or isinstance(event_count, bool)
+        or not _is_chain_hash(anchored_head)
+    ):
+        raise RequestNotFound("request not found")
+
+    # Replay the in-database chain only, with the same strict criteria as
+    # RequestStore._verify_evidence. Any single discrepancy -- a
+    # malformed row, a gap, a wrong hash, a head mismatch or a status
+    # mismatch -- settles the verdict as false; the read still succeeds.
+    verified = False
+    if rows:
+        predecessor = _GENESIS_PREDECESSOR
+        links_ok = True
+        for expected_seq, row in enumerate(rows):
+            seq, event_status, occurred_at, stored_hash = row
+            if (
+                not isinstance(seq, int)
+                or isinstance(seq, bool)
+                or seq != expected_seq
+                or not isinstance(event_status, str)
+                or not isinstance(occurred_at, str)
+                or not _is_chain_hash(stored_hash)
+            ):
+                links_ok = False
+                break
+            recomputed = _chain_hash(
+                tenant_id,
+                request_id,
+                seq,
+                event_status,
+                occurred_at,
+                predecessor,
+            )
+            # Constant-time comparison; either mismatch breaks the chain.
+            if not hmac.compare_digest(recomputed, stored_hash):
+                links_ok = False
+                break
+            predecessor = stored_hash
+        if (
+            links_ok
+            and hmac.compare_digest(predecessor, anchored_head)
+            and rows[-1][1] == current_status
+        ):
+            verified = True
+
+    return {
+        "request_id": request_id,
+        "status": current_status,
+        "event_count": event_count,
+        "chain_hash": anchored_head,
+        "verified": verified,
+    }
+
+
 # Allowed request lifecycle. completed and failed are terminal; moving a
 # request to the status it already holds is an idempotent no-op.
 _STATUS_ACCEPTED = "accepted"
