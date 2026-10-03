@@ -11,6 +11,7 @@ from .httpapi import (
 from .requests import (
     RequestNotFound,
     RestoreConflict,
+    read_request_evidence,
     read_request_status,
     restore_backup,
 )
@@ -26,6 +27,8 @@ _SERVE_USAGE = (
 _RESTORE_USAGE = "restore_usage"
 # Status shares the same rule: fixed, detail-free markers only.
 _STATUS_USAGE = "status_usage"
+# Evidence too: fixed, detail-free markers only.
+_EVIDENCE_USAGE = "evidence_usage"
 
 _FLAG_ALIASES = {
     "--db": "db",
@@ -103,6 +106,39 @@ def _run_status(args: list[str]) -> int:
         return 3
     except (ValueError, OSError):
         print("status_failed", file=sys.stderr)
+        return 2
+    print(json.dumps(record, separators=(",", ":")))
+    return 0
+
+
+def _run_evidence(args: list[str]) -> int:
+    # The argument grammar is exactly the status grammar: the same three
+    # positionals or the same three flags, never mixed, and every
+    # duplicate, empty, unknown or miscounted argument is rejected
+    # before the database is touched.
+    parsed = _parse_status_args(args)
+    if parsed is None:
+        print(_EVIDENCE_USAGE, file=sys.stderr)
+        return 2
+    # The lookup is strictly read-only: it never creates the database,
+    # never migrates the schema, never repairs evidence and never writes
+    # bookkeeping, so repeated runs print the same line. Every storage
+    # problem -- a missing, unreadable, locked or corrupt database --
+    # collapses to the single fixed failure marker, and an invalid,
+    # unknown or cross-tenant request id (or a record that cannot form
+    # a legal evidence summary) is indistinguishable from a missing
+    # one. A tampered chain is still a successful read: it reports
+    # "verified": false at exit 0. The path, the tenant, the request id
+    # and any underlying error are never printed.
+    try:
+        record = read_request_evidence(
+            parsed["db"], parsed["tenant_id"], parsed["request_id"]
+        )
+    except RequestNotFound:
+        print("evidence_not_found", file=sys.stderr)
+        return 3
+    except (ValueError, OSError):
+        print("evidence_failed", file=sys.stderr)
         return 2
     print(json.dumps(record, separators=(",", ":")))
     return 0
@@ -230,6 +266,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_restore(args[1:])
     if args and args[0] == "status":
         return _run_status(args[1:])
+    if args and args[0] == "evidence":
+        return _run_evidence(args[1:])
     print(_USAGE, file=sys.stderr)
     return 2
 

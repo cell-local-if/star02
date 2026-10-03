@@ -2109,6 +2109,129 @@ def read_request_status(
     return {"request_id": row[0], "status": row[1], "created_at": row[2]}
 
 
+def read_request_evidence(
+    db_path: str | os.PathLike[str],
+    tenant_id: str,
+    request_id: str,
+) -> dict[str, object]:
+    """Read the persisted integrity evidence for one request, read-only.
+
+    This is the strictly read-only lookup behind the ``evidence``
+    command. It combines :meth:`RequestStore.evidence` and
+    :meth:`RequestStore.verify_evidence` semantics -- the same
+    validation, the same indistinguishable :class:`RequestNotFound` for
+    invalid, unknown or cross-tenant ids, and the same link-by-link
+    recomputation -- but it never creates the database, never runs
+    schema DDL and never writes any bookkeeping. The file is opened
+    read-only and only committed rows are read, so a missing,
+    unreadable, locked or corrupt database surfaces as the same
+    fixed-text :class:`OSError` storage failure; the underlying
+    exception, the path and any SQL never leak to the caller.
+
+    The result contains exactly ``request_id``, ``status``,
+    ``event_count``, ``chain_hash`` (all as persisted) and ``verified``.
+    ``verified`` is the database-internal check only: every link
+    recomputed from the genesis predecessor, gap-free sequences from
+    zero, and the final link matching the request's anchored head and
+    current status. Deleted, altered, inserted or reordered events and
+    any head or status mismatch all yield ``False`` -- the lookup still
+    succeeds. It says nothing about the external audit anchors and
+    changes nothing about the strict ``verify_chain`` semantics. A
+    record whose persisted head is not a well-formed digest cannot form
+    a legal evidence summary and raises :class:`RequestNotFound`.
+    """
+    if isinstance(db_path, os.PathLike):
+        db_path = os.fspath(db_path)
+    if not isinstance(db_path, str) or not db_path:
+        raise ValueError("storage path must be a non-empty string")
+    tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+    request_id = _require_identifier(request_id)
+    # Open the existing file read-only: a missing path fails instead of
+    # being created, and no schema or bookkeeping write can ever occur.
+    uri = pathlib.Path(os.path.abspath(db_path)).as_uri() + "?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=_BUSY_TIMEOUT_MS / 1000)
+    except sqlite3.Error:
+        raise _storage_failure() from None
+    try:
+        try:
+            owner = conn.execute(
+                "SELECT status, chain_hash FROM requests "
+                "WHERE tenant_id = ? AND request_id = ?",
+                (tenant_id, request_id),
+            ).fetchone()
+            if owner is None:
+                # Identical outcome for unknown ids and cross-tenant
+                # lookups: the response must not reveal that another
+                # tenant owns a record.
+                raise RequestNotFound("request not found")
+            current_status, anchored_head = owner
+            rows = conn.execute(
+                "SELECT seq, status, occurred_at, chain_hash "
+                "FROM status_events "
+                "WHERE tenant_id = ? AND request_id = ? ORDER BY seq",
+                (tenant_id, request_id),
+            ).fetchall()
+        except RequestNotFound:
+            raise
+        except sqlite3.Error:
+            raise _storage_failure() from None
+    finally:
+        conn.close()
+    # A malformed anchored head or current status means the row was
+    # altered out of band and cannot form a legal evidence summary.
+    if not _is_chain_hash(anchored_head) or not isinstance(current_status, str):
+        raise RequestNotFound("request not found")
+
+    verified = True
+    predecessor = _GENESIS_PREDECESSOR
+    for expected_seq, row in enumerate(rows):
+        seq, status, occurred_at, stored_hash = row
+        # Gap-free sequences from zero: a deleted, inserted or
+        # renumbered event cannot reach here unnoticed. Strict type
+        # checks keep malformed (e.g. NULL) tampered rows from
+        # reaching the hash preimage as anything but a failure.
+        if (
+            not isinstance(seq, int)
+            or isinstance(seq, bool)
+            or seq != expected_seq
+            or not isinstance(status, str)
+            or not isinstance(occurred_at, str)
+            or not _is_chain_hash(stored_hash)
+        ):
+            verified = False
+            break
+        recomputed = _chain_hash(
+            tenant_id,
+            request_id,
+            seq,
+            status,
+            occurred_at,
+            predecessor,
+        )
+        # Constant-time comparison; either mismatch breaks the chain.
+        if not hmac.compare_digest(recomputed, stored_hash):
+            verified = False
+            break
+        predecessor = stored_hash
+    if verified:
+        # At least the genesis event must exist, the final link must be
+        # the head anchored on the request row, and its status must
+        # match the authoritative current status.
+        verified = (
+            bool(rows)
+            and hmac.compare_digest(predecessor, anchored_head)
+            and rows[-1][1] == current_status
+        )
+    return {
+        "request_id": request_id,
+        "status": current_status,
+        "event_count": len(rows),
+        "chain_hash": anchored_head,
+        "verified": verified,
+    }
+
+
 # Allowed request lifecycle. completed and failed are terminal; moving a
 # request to the status it already holds is an idempotent no-op.
 _STATUS_ACCEPTED = "accepted"
