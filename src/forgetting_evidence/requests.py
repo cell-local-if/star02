@@ -126,6 +126,13 @@ orchestration and never routed over HTTP:
 * :meth:`RequestStore.get_deletion_tombstones` returns the recorded
   tombstones ordered by normalized scope then ``adapter_id`` together
   with the first settled ``recorded_at`` and the ``evidence_digest``.
+* :meth:`RequestStore.page_deletion_tombstones` is a read-only paged
+  view of the same ledger: each page is read from one snapshot in
+  normalized-scope then ``adapter_id`` order with an opaque cursor that
+  binds the tenant, the request and the issuing snapshot; the page
+  carries only the six ledger fields per entry plus the whole-ledger
+  ``recorded_at`` and ``evidence_digest``, never the raw object or the
+  proof body, and never advances state.
 
 Deletion receipts close the lifecycle with an externally verifiable
 record, storage-layer only like the rest of the orchestration:
@@ -1315,6 +1322,19 @@ def _deletion_tombstone_failure() -> OSError:
     return OSError(_DELETION_TOMBSTONE_MESSAGE)
 
 
+# Fixed, detail-free text for every tombstone-page caller error: an empty
+# or non-string tenant, a limit outside 1..1000, or a malformed,
+# differently bound or unparseable cursor. It never embeds a tenant, a
+# request id, a scope, an adapter, SQL text or a filesystem path, and no
+# rejected call ever touches the store.
+_DELETION_TOMBSTONE_PAGE_MESSAGE = "deletion_tombstone_page_failed"
+
+
+def _deletion_tombstone_page_value_failure() -> ValueError:
+    """Build the single tombstone-page validation error callers see."""
+    return ValueError(_DELETION_TOMBSTONE_PAGE_MESSAGE)
+
+
 # Fixed, detail-free text for every tenant-scoped request-listing failure:
 # an empty tenant, an out-of-domain status, time bound, limit or cursor, a
 # cursor replayed across tenants or across filter settings, an unreadable
@@ -2341,6 +2361,150 @@ def _decode_list_cursor(
         last_created_at,
         last_request_id,
     )
+
+
+# Read-only deletion-tombstone pagination. A page sweeps one request's
+# ledger in stable (normalized scope, adapter_id) order; the default and
+# the upper bound keep a single read bounded without letting a caller ask
+# for an unbounded page.
+_DEFAULT_TOMBSTONE_PAGE_LIMIT = 100
+_MAX_TOMBSTONE_PAGE_LIMIT = 1000
+# Page cursors share the opaque envelope of the other cursors (fixed
+# version prefix plus base64url JSON) but carry their own version prefix,
+# so a listing, reconcile, inspection or migration cursor presented to
+# the paging entry point (or vice versa) is an unknown format and is
+# rejected as caller error before storage is touched. The payload binds
+# the tenant, the request and the ledger snapshot the cursor was issued
+# in -- a digest of every tombstone row in snapshot order -- so the same
+# cursor can only resume the same ledger of the same request; any later
+# registration changes the snapshot and rejects the stale cursor.
+_TOMBSTONE_PAGE_CURSOR_PREFIX = "dt1."
+
+
+def _require_tombstone_page_limit(value: object) -> int:
+    """Validate a tombstone-page limit: a non-boolean int in 1..1000."""
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or not 1 <= value <= _MAX_TOMBSTONE_PAGE_LIMIT
+    ):
+        raise _deletion_tombstone_page_value_failure()
+    return value
+
+
+def _tombstone_snapshot_digest(
+    entries: Sequence[tuple[str, str, str, str, str, str]],
+) -> str:
+    """Commit to one ledger snapshot for cursor binding.
+
+    Each entry is ``(scope, adapter_id, operation_id, outcome,
+    proof_digest, recorded_at)`` read in snapshot order (normalized
+    scope, then adapter id). The rows are covered positionally with
+    length-prefixed fields, so the digest binds both the contents --
+    including each entry's ``recorded_at`` -- and their order. The
+    preimage never contains a tenant, a request id, a subject, a raw
+    object or a proof body.
+    """
+    digest = hashlib.sha256()
+    for (
+        scope,
+        adapter_id,
+        operation_id,
+        outcome,
+        proof_digest,
+        recorded_at,
+    ) in entries:
+        for field in (
+            scope,
+            adapter_id,
+            operation_id,
+            outcome,
+            proof_digest,
+            recorded_at,
+        ):
+            encoded = field.encode("utf-8")
+            digest.update(struct.pack(">Q", len(encoded)))
+            digest.update(encoded)
+    return digest.hexdigest()
+
+
+def _encode_tombstone_page_cursor(
+    tenant_id: str,
+    request_id: str,
+    snapshot_digest: str,
+    last_scope: str,
+    last_adapter_id: str,
+) -> str:
+    """Render the opaque cursor resuming a page after its last item."""
+    payload = json.dumps(
+        {
+            "v": 1,
+            "t": tenant_id,
+            "r": request_id,
+            "s": snapshot_digest,
+            "c": last_scope,
+            "a": last_adapter_id,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return _TOMBSTONE_PAGE_CURSOR_PREFIX + base64.urlsafe_b64encode(
+        payload
+    ).decode("ascii")
+
+
+def _decode_tombstone_page_cursor(
+    value: object,
+) -> tuple[str, str, str, str, str]:
+    """Parse and strictly validate an opaque tombstone-page cursor.
+
+    Every malformed value -- non-string, empty, wrong prefix, bad
+    base64url, foreign JSON shape, wrong types -- raises the fixed
+    tombstone-page :class:`ValueError` identically, so the cursor format
+    can never be probed through distinguishable failures. The returned
+    tuple is the bound tenant, request id, snapshot digest and the
+    (scope, adapter_id) resume position.
+    """
+    if not isinstance(value, str) or not value.startswith(
+        _TOMBSTONE_PAGE_CURSOR_PREFIX
+    ):
+        raise _deletion_tombstone_page_value_failure()
+    body = value[len(_TOMBSTONE_PAGE_CURSOR_PREFIX) :]
+    if (
+        not body
+        or len(body) % 4 != 0
+        or any(char not in _B64URL_CHARS and char != "=" for char in body)
+    ):
+        raise _deletion_tombstone_page_value_failure()
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(body.encode("ascii")))
+    except (ValueError, binascii.Error):
+        raise _deletion_tombstone_page_value_failure() from None
+    if not isinstance(payload, dict) or set(payload) != {"v", "t", "r", "s", "c", "a"}:
+        raise _deletion_tombstone_page_value_failure()
+    version = payload["v"]
+    tenant_id = payload["t"]
+    request_id = payload["r"]
+    snapshot_digest = payload["s"]
+    last_scope = payload["c"]
+    last_adapter_id = payload["a"]
+    if (
+        # bool is a subclass of int and 1.0 == 1: only the exact integer
+        # version 1 names the known cursor format.
+        not isinstance(version, int)
+        or isinstance(version, bool)
+        or version != 1
+        or not isinstance(tenant_id, str)
+        or not tenant_id
+        or not isinstance(request_id, str)
+        or not request_id
+        or not _is_chain_hash(snapshot_digest)
+        or not isinstance(last_scope, str)
+        or not last_scope
+        or not isinstance(last_adapter_id, str)
+        or not last_adapter_id
+    ):
+        raise _deletion_tombstone_page_value_failure()
+    return tenant_id, request_id, snapshot_digest, last_scope, last_adapter_id
 
 
 def _require_lease_seconds(value: object) -> int:
@@ -6296,6 +6460,259 @@ class RequestStore:
             "tombstones": tombstones,
             "recorded_at": min(recorded_ats) if recorded_ats else None,
             "evidence_digest": evidence_digest,
+        }
+
+    def page_deletion_tombstones(
+        self,
+        tenant_id: object,
+        request_id: object,
+        cursor: object = None,
+        limit: object = None,
+    ) -> dict[str, object]:
+        """Return one read-only page of the request's tombstone ledger.
+
+        The page is read from a single consistent snapshot in ascending
+        normalized-scope (Unicode code point) then ``adapter_id`` order
+        and carries exactly ``request_id``, ``tombstones``,
+        ``recorded_at``, ``evidence_digest`` and ``next_cursor``; each
+        tombstone carries exactly ``adapter_id``, ``scope``,
+        ``operation_id``, ``outcome``, ``proof_digest`` and
+        ``recorded_at`` -- never the raw object or the proof body. The
+        top-level ``recorded_at`` and ``evidence_digest`` describe the
+        whole ledger (both ``None`` for an empty ledger), not just the
+        page. ``limit`` defaults to 100 and only accepts a non-boolean
+        integer in 1..1000. ``cursor`` is the opaque continuation value
+        from a previous page: it binds the same tenant, the same request
+        and the snapshot it was issued in, resumes strictly after the
+        last item of the page that issued it and is unaffected by the
+        limit used afterwards; ``next_cursor`` is present only while the
+        snapshot still has a following item and is ``None`` otherwise.
+        The same cursor replayed against an unchanged ledger returns the
+        same bytes and position, including after a restart; a ledger
+        changed by a later registration no longer matches the bound
+        snapshot and rejects the stale cursor.
+
+        An empty or non-string *tenant_id*, an illegal *limit*, or a
+        malformed or mismatched *cursor* raises the fixed-text
+        :class:`ValueError` ``deletion_tombstone_page_failed`` without
+        touching storage. An empty, non-string, malformed, unknown or
+        cross-tenant *request_id* raises :class:`RequestNotFound`. An
+        unreadable store or a corrupt tombstone or finish record raises
+        the fixed-text :class:`OSError`
+        ``deletion_tombstone_failed``; a partial page or a fabricated
+        digest is never returned. The read never advances state, never
+        creates an attempt or a tombstone and never changes
+        ``recorded_at``, ``evidence_digest``, scoped completion,
+        reconciliation, the audit chain or the sensitive-information
+        boundary.
+        """
+        # Validate before touching the database: tenant and limit errors
+        # are ValueErrors, every request-id problem (missing, empty,
+        # non-string or malformed) collapses to RequestNotFound, and a
+        # malformed or differently bound cursor is a ValueError.
+        if not isinstance(tenant_id, str) or not tenant_id:
+            raise _deletion_tombstone_page_value_failure()
+        request_id = _require_identifier(request_id)
+        resolved_limit = (
+            _DEFAULT_TOMBSTONE_PAGE_LIMIT if limit is None else limit
+        )
+        resolved_limit = _require_tombstone_page_limit(resolved_limit)
+        position: tuple[str, str] | None = None
+        bound_snapshot: str | None = None
+        if cursor is not None:
+            (
+                cursor_tenant,
+                cursor_request,
+                cursor_snapshot,
+                last_scope,
+                last_adapter_id,
+            ) = _decode_tombstone_page_cursor(cursor)
+            # A cursor only resumes the exact ledger it was issued for:
+            # the same tenant and request; the snapshot is matched once
+            # it has been read inside the store transaction.
+            if (cursor_tenant, cursor_request) != (tenant_id, request_id):
+                raise _deletion_tombstone_page_value_failure()
+            bound_snapshot = cursor_snapshot
+            position = (last_scope, last_adapter_id)
+        if self._mem_conn is not None:
+            with self._write_lock:
+                return self._page_deletion_tombstones(
+                    tenant_id,
+                    request_id,
+                    bound_snapshot,
+                    position,
+                    resolved_limit,
+                )
+        return self._page_deletion_tombstones(
+            tenant_id,
+            request_id,
+            bound_snapshot,
+            position,
+            resolved_limit,
+        )
+
+    def _page_deletion_tombstones(
+        self,
+        tenant_id: str,
+        request_id: str,
+        bound_snapshot: str | None,
+        position: tuple[str, str] | None,
+        limit: int,
+    ) -> dict[str, object]:
+        conn = self._connect()
+        try:
+            # One deferred read transaction spans ownership, the ledger
+            # and the finish row so every value comes from the same
+            # snapshot; the transaction only reads and is rolled back.
+            try:
+                conn.execute("BEGIN")
+                owner = conn.execute(
+                    "SELECT 1 FROM requests WHERE tenant_id = ? AND request_id = ?",
+                    (tenant_id, request_id),
+                ).fetchone()
+                if owner is None:
+                    # Resolve ownership inside the snapshot: an empty
+                    # ledger must not distinguish "missing" from a
+                    # foreign record.
+                    raise RequestNotFound("request not found")
+                rows = conn.execute(
+                    "SELECT scope, adapter_id, operation_id, outcome, "
+                    "proof_digest, recorded_at FROM deletion_tombstones "
+                    "WHERE tenant_id = ? AND request_id = ? "
+                    "ORDER BY scope, adapter_id",
+                    (tenant_id, request_id),
+                ).fetchall()
+                settled = conn.execute(
+                    "SELECT result, evidence_digest "
+                    "FROM deletion_tombstone_finishes "
+                    "WHERE tenant_id = ? AND request_id = ?",
+                    (tenant_id, request_id),
+                ).fetchone()
+            except RequestNotFound:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+            except sqlite3.Error:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise _deletion_tombstone_failure() from None
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+        finally:
+            self._release(conn)
+
+        ordered: list[tuple[str, str, str, str, str, str]] = []
+        digest_entries: list[tuple[str, str, str, str, str]] = []
+        recorded_ats: list[str] = []
+        for scope, adapter_id, operation_id, outcome, proof_digest, recorded_at in rows:
+            if (
+                not isinstance(scope, str)
+                or not scope
+                or not isinstance(adapter_id, str)
+                or not adapter_id
+                or not isinstance(operation_id, str)
+                or not operation_id
+                or not isinstance(outcome, str)
+                or outcome not in _TOMBSTONE_OUTCOMES
+                or not _is_chain_hash(proof_digest)
+                or not isinstance(recorded_at, str)
+                or not recorded_at
+            ):
+                # Every row was written by the store itself; a malformed
+                # field means out-of-band alteration and fails the whole
+                # page rather than being skipped.
+                raise _deletion_tombstone_failure()
+            ordered.append(
+                (scope, adapter_id, operation_id, outcome, proof_digest, recorded_at)
+            )
+            digest_entries.append(
+                (scope, operation_id, adapter_id, outcome, proof_digest)
+            )
+            recorded_ats.append(recorded_at)
+        snapshot_entries = [
+            (
+                scope,
+                adapter_id,
+                operation_id,
+                outcome,
+                proof_digest,
+                recorded_at,
+            )
+            for scope, adapter_id, operation_id, outcome, proof_digest, recorded_at in ordered
+        ]
+        snapshot_digest = _tombstone_snapshot_digest(snapshot_entries)
+        if bound_snapshot is not None and bound_snapshot != snapshot_digest:
+            # The ledger changed after the cursor was issued: the cursor
+            # names a snapshot that no longer exists, so it cannot be
+            # resumed and is rejected as caller error.
+            raise _deletion_tombstone_page_value_failure()
+
+        start = 0
+        if position is not None:
+            # Resume strictly after the previous page's last item in the
+            # same (scope, adapter_id) order. The position must name an
+            # item of the bound snapshot; a cursor issued by this store
+            # always does, while a forged or foreign position does not
+            # and is rejected as caller error.
+            index = 0
+            while index < len(ordered) and (
+                (ordered[index][0], ordered[index][1]) != position
+            ):
+                index += 1
+            if index == len(ordered):
+                raise _deletion_tombstone_page_value_failure()
+            start = index + 1
+        page_rows = ordered[start : start + limit]
+        next_cursor: str | None = None
+        if start + limit < len(ordered):
+            last_scope, last_adapter_id = page_rows[-1][0], page_rows[-1][1]
+            next_cursor = _encode_tombstone_page_cursor(
+                tenant_id,
+                request_id,
+                snapshot_digest,
+                last_scope,
+                last_adapter_id,
+            )
+        tombstones = [
+            {
+                "adapter_id": adapter_id,
+                "scope": scope,
+                "operation_id": operation_id,
+                "outcome": outcome,
+                "proof_digest": proof_digest,
+                "recorded_at": recorded_at,
+            }
+            for scope, adapter_id, operation_id, outcome, proof_digest, recorded_at in page_rows
+        ]
+        evidence_digest = (
+            _tombstone_evidence_digest(digest_entries) if digest_entries else None
+        )
+        if settled is not None:
+            finished_result, finished_digest = settled
+            if finished_result not in _TERMINAL_RESULTS or (
+                finished_digest is not None and not _is_chain_hash(finished_digest)
+            ):
+                raise _deletion_tombstone_failure()
+            if (
+                finished_result == _STATUS_COMPLETED
+                and finished_digest != evidence_digest
+            ):
+                # The settled completion commitment must match the
+                # ledger it was computed from; a divergence means the
+                # record was altered out of band.
+                raise _deletion_tombstone_failure()
+        return {
+            "request_id": request_id,
+            "tombstones": tombstones,
+            "recorded_at": min(recorded_ats) if recorded_ats else None,
+            "evidence_digest": evidence_digest,
+            "next_cursor": next_cursor,
         }
 
     def reconcile_execution(
