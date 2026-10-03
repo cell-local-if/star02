@@ -8,6 +8,7 @@ from .httpapi import (
     build_server,
     load_auth_config,
 )
+from .requests import RestoreConflict, restore_backup
 
 _USAGE = "usage: python -m forgetting_evidence health"
 _SERVE_USAGE = (
@@ -15,6 +16,9 @@ _SERVE_USAGE = (
     "       python -m forgetting_evidence serve --db <database> "
     "--host <address> --port <port> [--auth-file <auth-config>]"
 )
+# Restore's markers are fixed, detail-free text: the paths and any
+# underlying error are never printed.
+_RESTORE_USAGE = "restore_usage"
 
 _FLAG_ALIASES = {
     "--db": "db",
@@ -118,6 +122,27 @@ def _run_serve(args: list[str]) -> int:
     return 0
 
 
+def _run_restore(args: list[str]) -> int:
+    # Exactly the snapshot and the destination database are accepted;
+    # any other arity is the fixed usage marker at exit 2.
+    if len(args) != 2:
+        print(_RESTORE_USAGE, file=sys.stderr)
+        return 2
+    snapshot_path, database_path = args
+    try:
+        restore_backup(snapshot_path, database_path)
+    except RestoreConflict:
+        print("restore_conflict", file=sys.stderr)
+        return 3
+    except (OSError, ValueError):
+        # Invalid path values share the single failure marker of a
+        # missing, unreadable or inconsistent snapshot.
+        print("restore_failed", file=sys.stderr)
+        return 2
+    print(json.dumps({"status": "restored"}, separators=(",", ":")))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if args == ["health"]:
@@ -125,6 +150,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args and args[0] == "serve":
         return _run_serve(args[1:])
+    if args and args[0] == "restore":
+        return _run_restore(args[1:])
     print(_USAGE, file=sys.stderr)
     return 2
 
