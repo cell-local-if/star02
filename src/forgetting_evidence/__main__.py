@@ -1,6 +1,9 @@
 import json
+import os
 import signal
+import sqlite3
 import sys
+import urllib.parse
 
 from .httpapi import (
     AuthConfigError,
@@ -19,6 +22,10 @@ _SERVE_USAGE = (
 # Restore's markers are fixed, detail-free text: the paths and any
 # underlying error are never printed.
 _RESTORE_USAGE = "restore_usage"
+# Status shares the same discipline: the markers are fixed text and
+# never embed the tenant, the request id, SQL, the underlying error or
+# any path.
+_STATUS_USAGE = "status_usage"
 
 _FLAG_ALIASES = {
     "--db": "db",
@@ -143,6 +150,102 @@ def _run_restore(args: list[str]) -> int:
     return 0
 
 
+_STATUS_FLAG_ALIASES = {
+    "--db": "db",
+    "--tenant-id": "tenant_id",
+    "--request-id": "request_id",
+}
+_STATUS_POSITIONAL_FIELDS = ("db", "tenant_id", "request_id")
+
+
+def _parse_status_args(args: list[str]) -> dict[str, str] | None:
+    values: dict[str, str] = {}
+    positionals: list[str] = []
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if "=" in token and token.split("=", 1)[0] in _STATUS_FLAG_ALIASES:
+            name, value = token.split("=", 1)
+            field = _STATUS_FLAG_ALIASES[name]
+            if field in values:
+                return None
+            values[field] = value
+        elif token in _STATUS_FLAG_ALIASES:
+            field = _STATUS_FLAG_ALIASES[token]
+            if field in values or index + 1 >= len(args):
+                return None
+            values[field] = args[index + 1]
+            index += 1
+        elif token.startswith("--"):
+            return None
+        else:
+            positionals.append(token)
+        index += 1
+    if positionals and values:
+        # The positional and flag spellings are equivalent but never
+        # mixable in a single invocation.
+        return None
+    if positionals:
+        if len(positionals) != len(_STATUS_POSITIONAL_FIELDS):
+            return None
+        values = dict(zip(_STATUS_POSITIONAL_FIELDS, positionals))
+    if any(field not in values for field in _STATUS_POSITIONAL_FIELDS):
+        return None
+    return values
+
+
+def _run_status(args: list[str]) -> int:
+    parsed = _parse_status_args(args)
+    if parsed is None:
+        print(_STATUS_USAGE, file=sys.stderr)
+        return 2
+    tenant_id = parsed["tenant_id"]
+    request_id = parsed["request_id"]
+    # Validation mirrors get_status: an invalid tenant is caller error
+    # (status_failed), while an invalid request id is indistinguishable
+    # from an unknown or cross-tenant one (request_not_found).
+    if not tenant_id:
+        print("status_failed", file=sys.stderr)
+        return 2
+    if not request_id:
+        print("request_not_found", file=sys.stderr)
+        return 3
+    db_path = parsed["db"]
+    # The command is strictly read-only: it never creates the database,
+    # never migrates the schema and never writes bookkeeping. A missing
+    # or non-file path is the same fixed failure as an unreadable,
+    # locked or corrupt database -- the underlying exception type never
+    # crosses the command line.
+    if not db_path or not os.path.isfile(db_path):
+        print("status_failed", file=sys.stderr)
+        return 2
+    uri = "file:" + urllib.parse.quote(os.path.abspath(db_path)) + "?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True)
+    except (sqlite3.Error, OSError):
+        print("status_failed", file=sys.stderr)
+        return 2
+    try:
+        try:
+            row = conn.execute(
+                "SELECT request_id, status, created_at FROM requests "
+                "WHERE tenant_id = ? AND request_id = ?",
+                (tenant_id, request_id),
+            ).fetchone()
+        except (sqlite3.Error, OSError):
+            print("status_failed", file=sys.stderr)
+            return 2
+    finally:
+        conn.close()
+    if row is None:
+        print("request_not_found", file=sys.stderr)
+        return 3
+    # The same fixed shape and field order as RequestStore.get_status.
+    record = {"request_id": row[0], "status": row[1], "created_at": row[2]}
+    print(json.dumps(record, separators=(",", ":")))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if args == ["health"]:
@@ -152,6 +255,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_serve(args[1:])
     if args and args[0] == "restore":
         return _run_restore(args[1:])
+    if args and args[0] == "status":
+        return _run_status(args[1:])
     print(_USAGE, file=sys.stderr)
     return 2
 
