@@ -1,7 +1,7 @@
 """HTTP layer for deletion-request acceptance, lookup, observation and
 single-request reconciliation.
 
-The service exposes six business endpoints:
+The service exposes seven business endpoints:
 
 * ``POST /requests`` -- accept a deletion request for a tenant. The JSON
   body must carry non-empty ``tenant_id``, ``subject_id`` and
@@ -36,6 +36,23 @@ The service exposes six business endpoints:
   and ``completed_at``. An unfinished attempt has ``null`` ``result`` and
   ``completed_at``; a finished attempt carries its stored ``completed``
   or ``failed`` result and completion time.
+* ``GET /requests/{request_id}/tombstones`` -- the tenant-scoped,
+  paginated read of the request's deletion tombstones (the tenant's
+  deletion proofs). The tenant follows the existing
+  ``X-Tenant-Id``/query rule; the only other accepted query parameters
+  are ``cursor`` and ``limit`` (1..1000, default 100). The single-line
+  JSON body carries exactly ``request_id``, ``tombstones``,
+  ``recorded_at``, ``evidence_digest`` and ``next_cursor`` in that
+  order; ``tombstones`` holds only this page's entries in normalized
+  scope Unicode code point order, then ``adapter_id``, each entry
+  carrying exactly ``adapter_id``, ``scope``, ``operation_id``,
+  ``outcome`` (``deleted`` or ``absent``), ``proof_digest`` (64
+  lower-case hex) and ``recorded_at``. The top-level ``recorded_at`` and
+  ``evidence_digest`` describe the whole ledger (both ``null`` when
+  empty); ``next_cursor`` is the opaque continuation value or ``null``
+  at the end of the ledger. An unknown or duplicated parameter, an
+  invalid limit, or an empty, malformed or foreign-bound cursor answers
+  400 without writing anything.
 * ``POST /requests/{request_id}/reconcile`` -- reconcile exactly one
   request's execution record against its persisted state by calling the
   storage layer's :meth:`RequestStore.reconcile_execution`. The endpoint
@@ -73,11 +90,13 @@ audit inspection (:meth:`RequestStore.audit_inspection` and
 :meth:`RequestStore.audit_inspection_summary`) exist only on
 the storage layer and are deliberately not exposed over HTTP: over HTTP
 the service opens request acceptance, the acceptance-receipt lookup, the
-read-only tenant-scoped listing, the two read-only observation reads and
+read-only tenant-scoped listing, the read-only observation reads, the
+read-only tombstone paging and
 the single-request execution reconciliation described above. The
 current-status lookup (:meth:`RequestStore.get_status`), the
 tenant-scoped listing (:meth:`RequestStore.list_requests`), the
-execution log (:meth:`RequestStore.get_execution_log`) and the
+execution log (:meth:`RequestStore.get_execution_log`), the tombstone
+paging (:meth:`RequestStore.page_deletion_tombstones`) and the
 single-request reconciliation
 (:meth:`RequestStore.reconcile_execution`) back their HTTP endpoints but
 remain storage-layer methods as well.
@@ -89,7 +108,11 @@ reconcile render exactly ``request_id``, ``status`` and ``created_at``
 byte-identical bodies. The execution-log read renders exactly
 ``request_id`` and ``attempts``. The
 listing read renders exactly ``items`` and ``next_cursor``, each item
-rendering exactly ``request_id``, ``status`` and ``created_at``.
+rendering exactly ``request_id``, ``status`` and ``created_at``. The
+tombstone read renders exactly ``request_id``, ``tombstones``,
+``recorded_at``, ``evidence_digest`` and ``next_cursor``, each
+tombstone rendering exactly ``adapter_id``, ``scope``, ``operation_id``,
+``outcome``, ``proof_digest`` and ``recorded_at``.
 Error responses are single-line JSON objects with exactly one key,
 ``error``, holding a stable error code:
 
@@ -107,7 +130,7 @@ for a configured principal: a missing/malformed/unknown token answers
 endpoint, or acting on a tenant other than its own ``tenant_id``,
 answers ``403 forbidden``. ``POST /requests`` requires
 ``request:submit`` and the target tenant is the body's ``tenant_id``;
-each of the four GET endpoints requires ``request:read`` and the target
+each of the five GET endpoints requires ``request:read`` and the target
 tenant follows the existing ``X-Tenant-Id``/query rule; the
 single-request reconciliation ``POST /requests/{request_id}/reconcile``
 requires ``request:reconcile`` and its target tenant follows the same
@@ -149,6 +172,7 @@ _COLLECTION_PATH = "/requests"
 _ITEM_PATH_PREFIX = "/requests/"
 _STATUS_RESOURCE = "status"
 _EXECUTION_LOG_RESOURCE = "execution-log"
+_TOMBSTONES_RESOURCE = "tombstones"
 _RECONCILE_RESOURCE = "reconcile"
 _TENANT_HEADER = "X-Tenant-Id"
 _AUTHORIZATION_HEADER = "Authorization"
@@ -176,6 +200,19 @@ _LIST_QUERY_PARAMS = frozenset(
     {"tenant_id", "status", "created_from", "created_to", "cursor", "limit"}
 )
 _LIST_LIMIT_RE = re.compile(r"^[0-9]+$")
+
+# The query parameters the GET /requests/{request_id}/tombstones read
+# understands besides the tenant selector; anything else is an invalid
+# request.
+_TOMBSTONE_QUERY_PARAMS = frozenset({"tenant_id", "cursor", "limit"})
+
+# The tombstone outcomes the read may serialise, mirrored from the
+# storage layer so a corrupt or substituted store can never serialise
+# another value.
+_TOMBSTONE_OUTCOMES = frozenset({"deleted", "absent"})
+
+# A proof or evidence digest is exactly 64 lower-case hex characters.
+_HEX_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 
 _UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
@@ -395,6 +432,13 @@ class DeferredRequestStore:
         # endpoint; strictly read-only, like get_status.
         return self._ready().get_execution_log(tenant_id, request_id)
 
+    def page_deletion_tombstones(self, tenant_id, request_id, cursor=None, limit=None):
+        # Serves the read-only GET /requests/{request_id}/tombstones
+        # endpoint; strictly read-only, like get_status.
+        return self._ready().page_deletion_tombstones(
+            tenant_id, request_id, cursor, limit
+        )
+
     def reconcile_execution(self, tenant_id, request_id):
         # Backs the POST /requests/{request_id}/reconcile endpoint; the
         # store's atomic commit decides the unique reconciliation outcome.
@@ -492,9 +536,10 @@ def make_handler(
                 # Empty or nested segments do not name a request.
                 if segment and "/" not in segment:
                     return "item", segment
-                # The two read-only observability sub-resources live under
-                # a request id: /requests/{id}/status and
-                # /requests/{id}/execution-log, alongside the single
+                # The read-only observability sub-resources live under
+                # a request id: /requests/{id}/status,
+                # /requests/{id}/execution-log and
+                # /requests/{id}/tombstones, alongside the single
                 # reconciliation action /requests/{id}/reconcile. Deeper
                 # nesting or any other suffix stays an unknown path (404).
                 if "/" in segment:
@@ -504,6 +549,8 @@ def make_handler(
                             return "status", item_id
                         if suffix == _EXECUTION_LOG_RESOURCE:
                             return "execution_log", item_id
+                        if suffix == _TOMBSTONES_RESOURCE:
+                            return "tombstones", item_id
                         if suffix == _RECONCILE_RESOURCE:
                             return "reconcile", item_id
             return None, None
@@ -557,7 +604,7 @@ def make_handler(
                 self._reply_error(404, _NOT_FOUND, headless=headless)
             else:
                 # The collection accepts POST (acceptance) and GET (the
-                # tenant-scoped listing); the item and both read-only
+                # tenant-scoped listing); the item and the read-only
                 # sub-resources are GET-only; the reconcile action is
                 # POST-only.
                 if kind == "collection":
@@ -687,9 +734,10 @@ def make_handler(
                     405, _METHOD_NOT_ALLOWED, allowed="POST"
                 )
                 return
-            # item (acceptance receipt), status and execution_log are the
-            # three GET-only reads; authorization/tenant/id resolution and
-            # the resulting error ordering are shared by all of them.
+            # item (acceptance receipt), status, execution_log and
+            # tombstones are the GET-only reads; authorization/tenant/id
+            # resolution and the resulting error ordering are shared by
+            # all of them.
             assert segment is not None
             resolved = self._resolve_read(segment)
             if resolved is None:
@@ -699,6 +747,8 @@ def make_handler(
                 self._serve_receipt(tenant_id, request_id)
             elif kind == "status":
                 self._serve_status(tenant_id, request_id)
+            elif kind == "tombstones":
+                self._serve_tombstones(tenant_id, request_id)
             else:
                 self._serve_execution_log(tenant_id, request_id)
 
@@ -816,6 +866,76 @@ def make_handler(
                 self._reply_error(503, _STORAGE_UNAVAILABLE)
                 return
             self._reply_execution_log(request_id, attempts)
+
+        def _serve_tombstones(self, tenant_id: str, request_id: str) -> None:
+            # The tombstone read shares the other reads' authorization
+            # and tenant/id resolution (already done by the caller); only
+            # the cursor/limit query parameters remain to validate before
+            # the read-only storage call.
+            try:
+                filters = self._tombstone_filters()
+            except _BadRequest:
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            try:
+                page = store.page_deletion_tombstones(
+                    tenant_id, request_id, **filters
+                )
+            except RequestNotFound:
+                # Missing ids and cross-tenant lookups are indistinguishable.
+                self._reply_error(404, _NOT_FOUND)
+                return
+            except ValueError:
+                # The store's fixed-text ValueError covers every invalid
+                # limit and every malformed, stale or foreign-bound
+                # cursor; a rejected read writes nothing.
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            except _StorageUnavailable:
+                _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
+                self._reply_error(503, _STORAGE_UNAVAILABLE)
+                return
+            except (sqlite3.Error, RuntimeError, OSError):
+                # A storage fault or a corrupt tombstone/finish record
+                # surfaces as the fixed-text OSError; no partial page or
+                # pseudo digest is ever rendered.
+                _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
+                self._reply_error(503, _STORAGE_UNAVAILABLE)
+                return
+            self._reply_tombstone_page(page)
+
+        def _tombstone_filters(self) -> dict[str, object]:
+            """Validate the tombstone read's query string into store arguments.
+
+            Only ``tenant_id`` (kept for the tenant resolution in
+            ``_tenant_id``), ``cursor`` and ``limit`` may appear; the
+            cursor and the limit may each appear at most once. Every
+            other shape is a bad request; the store re-validates the
+            values themselves as defence in depth.
+            """
+            params = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+            if not set(params) <= _TOMBSTONE_QUERY_PARAMS:
+                raise _BadRequest("unknown query parameter")
+            filters: dict[str, object] = {}
+            for name in ("cursor", "limit"):
+                values = params.get(name)
+                if values is None:
+                    continue
+                if len(values) != 1:
+                    raise _BadRequest(f"duplicate {name}")
+                value = values[0]
+                if name == "limit":
+                    # Far more digits than the 1..1000 domain can ever
+                    # hold is a bad request, not a storage fault (and an
+                    # unbounded digit string must never reach int()).
+                    if not _LIST_LIMIT_RE.match(value) or len(value) > 10:
+                        raise _BadRequest("invalid limit")
+                    filters["limit"] = int(value)
+                elif not value:
+                    raise _BadRequest("invalid cursor")
+                else:
+                    filters["cursor"] = value
+            return filters
 
         def _serve_reconcile(self, segment: str) -> None:
             # The single-request reconcile shares the read endpoints'
@@ -1177,6 +1297,101 @@ def make_handler(
             body = (
                 json.dumps(
                     {"items": rendered_items, "next_cursor": next_cursor},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+            self._write_body(200, body)
+
+        def _reply_tombstone_page(self, page: object) -> None:
+            # Whitelist and re-render every field: even a store substitute
+            # that returned extra keys could not leak a subject, a raw
+            # object, a proof body, an idempotency key or a worker
+            # identity into the body. Shapes and types are re-checked so
+            # a corrupt page never serialises into a partially-formed
+            # record.
+            if not isinstance(page, dict) or set(page) != {
+                "request_id",
+                "tombstones",
+                "recorded_at",
+                "evidence_digest",
+                "next_cursor",
+            }:
+                raise RuntimeError("malformed tombstone page from store")
+            request_id = page["request_id"]
+            tombstones = page["tombstones"]
+            recorded_at = page["recorded_at"]
+            evidence_digest = page["evidence_digest"]
+            next_cursor = page["next_cursor"]
+            if not isinstance(request_id, str) or not request_id:
+                raise RuntimeError("malformed tombstone page from store")
+            if not isinstance(tombstones, list):
+                raise RuntimeError("malformed tombstone page from store")
+            if recorded_at is not None and (
+                not isinstance(recorded_at, str) or not recorded_at
+            ):
+                raise RuntimeError("malformed tombstone page from store")
+            if evidence_digest is not None and (
+                not isinstance(evidence_digest, str)
+                or not _HEX_DIGEST_RE.match(evidence_digest)
+            ):
+                raise RuntimeError("malformed tombstone page from store")
+            if next_cursor is not None and (
+                not isinstance(next_cursor, str) or not next_cursor
+            ):
+                raise RuntimeError("malformed tombstone page from store")
+            rendered_tombstones: list[dict[str, str]] = []
+            for entry in tombstones:
+                if not isinstance(entry, dict) or set(entry) != {
+                    "adapter_id",
+                    "scope",
+                    "operation_id",
+                    "outcome",
+                    "proof_digest",
+                    "recorded_at",
+                }:
+                    raise RuntimeError("malformed tombstone page from store")
+                adapter_id = entry["adapter_id"]
+                scope = entry["scope"]
+                operation_id = entry["operation_id"]
+                outcome = entry["outcome"]
+                proof_digest = entry["proof_digest"]
+                entry_recorded_at = entry["recorded_at"]
+                if (
+                    not isinstance(adapter_id, str)
+                    or not adapter_id
+                    or not isinstance(scope, str)
+                    or not scope
+                    or not isinstance(operation_id, str)
+                    or not operation_id
+                    or not isinstance(outcome, str)
+                    or outcome not in _TOMBSTONE_OUTCOMES
+                    or not isinstance(proof_digest, str)
+                    or not _HEX_DIGEST_RE.match(proof_digest)
+                    or not isinstance(entry_recorded_at, str)
+                    or not entry_recorded_at
+                ):
+                    raise RuntimeError("malformed tombstone page from store")
+                rendered_tombstones.append(
+                    {
+                        "adapter_id": adapter_id,
+                        "scope": scope,
+                        "operation_id": operation_id,
+                        "outcome": outcome,
+                        "proof_digest": proof_digest,
+                        "recorded_at": entry_recorded_at,
+                    }
+                )
+            body = (
+                json.dumps(
+                    {
+                        "request_id": request_id,
+                        "tombstones": rendered_tombstones,
+                        "recorded_at": recorded_at,
+                        "evidence_digest": evidence_digest,
+                        "next_cursor": next_cursor,
+                    },
                     ensure_ascii=False,
                     separators=(",", ":"),
                 )
