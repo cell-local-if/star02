@@ -8,6 +8,7 @@ from .httpapi import (
     build_server,
     load_auth_config,
 )
+from .requests import RestoreConflict, restore_backup
 
 _USAGE = "usage: python -m forgetting_evidence health"
 _SERVE_USAGE = (
@@ -118,6 +119,24 @@ def _run_serve(args: list[str]) -> int:
     return 0
 
 
+def _run_restore(args: list[str]) -> int:
+    # The restore entry point speaks in fixed markers only: no path,
+    # engine text or failure detail is ever printed.
+    if len(args) != 2:
+        print("restore_usage", file=sys.stderr)
+        return 2
+    try:
+        restore_backup(args[0], args[1])
+    except RestoreConflict:
+        print("restore_conflict", file=sys.stderr)
+        return 3
+    except (ValueError, OSError):
+        print("restore_failed", file=sys.stderr)
+        return 2
+    print(json.dumps({"status": "restored"}, separators=(",", ":")))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if args == ["health"]:
@@ -125,6 +144,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args and args[0] == "serve":
         return _run_serve(args[1:])
+    if args and args[0] == "restore":
+        return _run_restore(args[1:])
     print(_USAGE, file=sys.stderr)
     return 2
 

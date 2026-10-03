@@ -372,6 +372,23 @@ source database is left untouched. Rebuilt with the same current and
 historical anchor secrets, a snapshot instance reaches the same
 verification, summary and metric conclusions as its source.
 
+:func:`restore_backup` is the complementary landing entry: it takes a
+snapshot path and a target database path, stages a full copy of the
+snapshot in a temporary file inside the target's directory, validates
+it against the same criteria the backup guarantees (openable, complete
+table structure, SQLite consistency check) and only then atomically
+lands it, so one call either leaves a complete database or leaves
+neither a target nor a staged file behind. The target is only ever
+created -- an existing file, directory or symbolic link is never
+overwritten, the parent directory must already exist, and two restores
+racing for the same target let exactly one land. The source snapshot
+is only read, and no anchor history secret, receipt key or other
+reversible credential is read or generated. An invalid path raises
+:class:`ValueError`, an existing target raises :class:`RestoreConflict`,
+and a missing, unreadable, incomplete or inconsistent snapshot or a
+failed copy or landing raises the fixed-text :class:`OSError`
+``restore_failed``.
+
 Portable audit evidence bundles close the audit capability,
 storage-layer only like the rest of the orchestration and never routed
 over HTTP. :meth:`RequestStore.export_audit_bundle` freezes one
@@ -525,6 +542,7 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import sqlite3
 import struct
 import tempfile
@@ -535,6 +553,7 @@ from datetime import datetime, timedelta, timezone
 
 __all__ = [
     "RequestStore",
+    "restore_backup",
     "IdempotencyConflict",
     "RequestNotFound",
     "InvalidStatusTransition",
@@ -545,6 +564,7 @@ __all__ = [
     "AuditInspectionNotFound",
     "AuditBundleUnavailable",
     "BackupConflict",
+    "RestoreConflict",
     "PolicyCatalogConflict",
     "PolicyCatalogNotFound",
     "TombstoneConflict",
@@ -624,6 +644,17 @@ class BackupConflict(Exception):
     The target file already exists -- whether written by an earlier
     backup or by a concurrent one that landed first -- and is never
     overwritten nor treated as a usable snapshot. The fixed message
+    never identifies which condition applied and never embeds the
+    target path.
+    """
+
+
+class RestoreConflict(Exception):
+    """Raised when a restore target cannot be claimed as asked.
+
+    The target file already exists -- whether written by an earlier
+    restore or by a concurrent one that landed first -- and is never
+    overwritten nor treated as a usable database. The fixed message
     never identifies which condition applied and never embeds the
     target path.
     """
@@ -1828,6 +1859,140 @@ def _validate_backup_snapshot(conn: sqlite3.Connection) -> None:
         raise _storage_failure() from None
     if not _BACKUP_TABLES.issubset(names) or checks != [("ok",)]:
         raise _storage_failure() from None
+
+
+_RESTORE_CONFLICT_MESSAGE = "restore conflict"
+
+# Fixed, detail-free text for every restore failure: a missing or
+# unreadable snapshot, an incomplete or inconsistent one, a missing
+# target directory, a failed copy or a failed atomic landing. It never
+# embeds a filesystem path, SQL text or the engine's own error text.
+_RESTORE_FAILED_MESSAGE = "restore_failed"
+
+
+def _restore_failure() -> OSError:
+    """Build the single restore error callers are ever allowed to see."""
+    return OSError(_RESTORE_FAILED_MESSAGE)
+
+
+def _require_restore_path(value: object, label: str) -> str:
+    """Validate one restore path: a non-empty, usable file-path string."""
+    if isinstance(value, os.PathLike):
+        value = os.fspath(value)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"{label} must be a non-empty string")
+    if value == ":memory:" or "\x00" in value:
+        raise ValueError(f"{label} must be a usable file path")
+    # A path that already names a directory can never receive or serve
+    # a database file; that is caller error, not a conflict.
+    if os.path.isdir(value):
+        raise ValueError(f"{label} must be a usable file path")
+    return value
+
+
+def restore_backup(
+    snapshot_path: str | os.PathLike[str],
+    target_path: str | os.PathLike[str],
+) -> str:
+    """Land a snapshot written by :meth:`RequestStore.backup_to` as a new database.
+
+    The snapshot is staged as a full copy in a temporary file inside the
+    target's directory, validated against the same criteria the backup
+    entry point guarantees -- openable, complete table structure and
+    SQLite's own consistency check -- and only then atomically landed,
+    so one call either leaves a complete database at the target or
+    leaves neither a target nor a staged file behind. The target is
+    only ever created: an existing file, directory or symbolic link is
+    never overwritten, the parent directory must already exist and is
+    never created, and two restores racing for the same target let
+    exactly one land. The source snapshot is only read, never modified,
+    and no anchor history secret, receipt key or other reversible
+    credential is read or generated along the way. On success the
+    landed target path is returned and the database can be opened by a
+    fresh :class:`RequestStore`, reaching the same records and evidence
+    conclusions as the snapshot when rebuilt with the same anchor
+    secrets.
+
+    An empty, non-string or unusable *snapshot_path* or *target_path*
+    -- including a memory database name, an embedded NUL or a directory
+    used as a file -- raises :class:`ValueError` without touching
+    anything; an already existing target raises :class:`RestoreConflict`
+    and is never overwritten; a missing or unreadable snapshot, an
+    incomplete or inconsistent one, a missing target directory, a
+    failed copy or a failed atomic landing raises the fixed-text
+    :class:`OSError` ``restore_failed``.
+    """
+    # Validate both paths before touching the filesystem: an empty or
+    # non-string path is caller error (ValueError), never a storage
+    # fault, and neither the snapshot nor the target may be disturbed.
+    snapshot_path = _require_restore_path(snapshot_path, "snapshot path")
+    target_path = _require_restore_path(target_path, "restore path")
+    # An existing target is never overwritten: the caller must choose a
+    # fresh path.
+    if os.path.lexists(target_path):
+        raise RestoreConflict(_RESTORE_CONFLICT_MESSAGE)
+    # The directory must already exist; the restore entry point never
+    # creates directories.
+    parent = os.path.dirname(os.path.abspath(target_path))
+    if not os.path.isdir(parent):
+        raise _restore_failure()
+    # Stage the copy in a sibling temporary file so a failure can never
+    # leave a partial or invalid target behind.
+    try:
+        fd, temp_path = tempfile.mkstemp(
+            prefix=".forgetting-evidence-restore-", dir=parent
+        )
+    except OSError:
+        raise _restore_failure() from None
+    try:
+        os.close(fd)
+        _copy_snapshot_into_temp(snapshot_path, temp_path)
+        try:
+            # Atomic land: the link fails if a concurrent restore (or
+            # anyone else) claimed the target first, and the loser
+            # leaves the winner's file untouched.
+            os.link(temp_path, target_path)
+        except FileExistsError:
+            raise RestoreConflict(_RESTORE_CONFLICT_MESSAGE) from None
+        except OSError:
+            raise _restore_failure() from None
+    finally:
+        # The temporary file is always removed: on failure so no stray
+        # artifact remains, on success because the target now owns the
+        # same content.
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+    return target_path
+
+
+def _copy_snapshot_into_temp(snapshot_path: str, temp_path: str) -> None:
+    """Copy the snapshot into the staged file and validate it.
+
+    Reads only the snapshot file; a missing, unreadable, incomplete or
+    inconsistent snapshot and any copy or validation failure is the
+    fixed-text restore error.
+    """
+    try:
+        shutil.copyfile(snapshot_path, temp_path)
+    except OSError:
+        raise _restore_failure() from None
+    try:
+        conn = sqlite3.connect(
+            temp_path,
+            timeout=_BUSY_TIMEOUT_MS / 1000,
+            check_same_thread=False,
+        )
+    except sqlite3.Error:
+        raise _restore_failure() from None
+    try:
+        try:
+            _validate_backup_snapshot(conn)
+        except OSError:
+            raise _restore_failure() from None
+    finally:
+        conn.close()
 
 # Allowed request lifecycle. completed and failed are terminal; moving a
 # request to the status it already holds is an idempotent no-op.
