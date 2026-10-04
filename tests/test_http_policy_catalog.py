@@ -223,10 +223,10 @@ class PolicyCatalogVersionsReadTests(_Base):
             self.assertEqual(body, INVALID_REQUEST)
 
     def test_unsupported_methods_are_405(self):
-        for method in ("POST", "PUT", "DELETE", "PATCH", "OPTIONS"):
+        for method in ("PUT", "DELETE", "PATCH", "OPTIONS"):
             status, headers, body = self._request(method, PATH)
             self.assertEqual(status, 405, method)
-            self.assertEqual(headers["Allow"], "GET")
+            self.assertEqual(headers["Allow"], "GET, POST")
             self.assertEqual(body, METHOD_NOT_ALLOWED)
 
     def test_unknown_neighbour_paths_are_404(self):
