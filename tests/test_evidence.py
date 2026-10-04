@@ -451,6 +451,127 @@ def snapshot(path):
         return handle.read()
 
 
+class RequestEvidenceSnapshotTests(unittest.TestCase):
+    """The single-snapshot read behind GET /requests/{id}/evidence."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self._tmp.name, "nested", "evidence.db")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _store(self):
+        return RequestStore(self.db_path)
+
+    def _raw(self):
+        return sqlite3.connect(self.db_path)
+
+    def _lifecycle(self, statuses=("processing", "completed"), key="key-1"):
+        store = self._store()
+        receipt = store.submit("tenant-a", "subject-1", ["email"], key)
+        for target in statuses:
+            store.transition("tenant-a", receipt["request_id"], target)
+        return store, receipt
+
+    def test_clean_snapshot_fields_and_verdict(self):
+        store, receipt = self._lifecycle()
+        record = store.get_request_evidence("tenant-a", receipt["request_id"])
+        self.assertEqual(
+            set(record),
+            {"request_id", "status", "event_count", "chain_hash", "verified"},
+        )
+        self.assertEqual(record["request_id"], receipt["request_id"])
+        self.assertEqual(record["status"], "completed")
+        self.assertEqual(record["event_count"], 3)
+        self.assertTrue(HEX64.match(record["chain_hash"]))
+        self.assertIs(record["verified"], True)
+
+    def test_submit_only_snapshot(self):
+        store = self._store()
+        receipt = store.submit("tenant-a", "subject-1", ["email"], "key-1")
+        record = store.get_request_evidence("tenant-a", receipt["request_id"])
+        self.assertEqual(record["status"], "accepted")
+        self.assertEqual(record["event_count"], 1)
+        self.assertIs(record["verified"], True)
+
+    def test_malformed_persisted_head_is_null_not_an_error(self):
+        store, receipt = self._lifecycle()
+        with self._raw() as conn:
+            conn.execute(
+                "UPDATE requests SET chain_hash = 'not-a-digest' WHERE request_id = ?",
+                (receipt["request_id"],),
+            )
+        record = store.get_request_evidence("tenant-a", receipt["request_id"])
+        self.assertIsNone(record["chain_hash"])
+        self.assertIs(record["verified"], False)
+        self.assertEqual(record["status"], "completed")
+        self.assertEqual(record["event_count"], 3)
+
+    def test_well_formed_but_wrong_head_is_reported_with_verified_false(self):
+        store, receipt = self._lifecycle()
+        forged = "a" * 64
+        with self._raw() as conn:
+            conn.execute(
+                "UPDATE requests SET chain_hash = ? WHERE request_id = ?",
+                (forged, receipt["request_id"]),
+            )
+        record = store.get_request_evidence("tenant-a", receipt["request_id"])
+        self.assertEqual(record["chain_hash"], forged)
+        self.assertIs(record["verified"], False)
+
+    def test_tampered_events_are_verified_false_but_still_read(self):
+        store, receipt = self._lifecycle()
+        rid = receipt["request_id"]
+        with self._raw() as conn:
+            conn.execute(
+                "DELETE FROM status_events WHERE request_id = ? AND seq = 1",
+                (rid,),
+            )
+        record = store.get_request_evidence("tenant-a", rid)
+        self.assertIs(record["verified"], False)
+        self.assertEqual(record["event_count"], 2)
+        with self._raw() as conn:
+            conn.execute(
+                "DELETE FROM status_events WHERE request_id = ?", (rid,)
+            )
+        record = store.get_request_evidence("tenant-a", rid)
+        self.assertIs(record["verified"], False)
+        self.assertEqual(record["event_count"], 0)
+
+    def test_missing_unknown_and_cross_tenant_raise_not_found(self):
+        store, receipt = self._lifecycle()
+        for bad in ("", None, 7, b"rid"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(RequestNotFound):
+                    store.get_request_evidence("tenant-a", bad)
+        with self.assertRaises(RequestNotFound):
+            store.get_request_evidence("tenant-a", "does-not-exist")
+        with self.assertRaises(RequestNotFound):
+            store.get_request_evidence("tenant-b", receipt["request_id"])
+        with self.assertRaises(ValueError):
+            store.get_request_evidence("", receipt["request_id"])
+
+    def test_read_never_writes(self):
+        store, receipt = self._lifecycle()
+        before = snapshot(self.db_path)
+        for _ in range(5):
+            record = store.get_request_evidence(
+                "tenant-a", receipt["request_id"]
+            )
+            self.assertIs(record["verified"], True)
+        self.assertEqual(snapshot(self.db_path), before)
+
+    def test_in_memory_store_verifies(self):
+        store = RequestStore(":memory:")
+        receipt = store.submit("tenant-a", "subject-1", ["email"], "key-1")
+        store.transition("tenant-a", receipt["request_id"], "processing")
+        record = store.get_request_evidence("tenant-a", receipt["request_id"])
+        self.assertEqual(record["status"], "processing")
+        self.assertEqual(record["event_count"], 2)
+        self.assertIs(record["verified"], True)
+
+
 class LegacySchemaMigrationTests(unittest.TestCase):
     """Databases created before chain hashes must upgrade transparently."""
 

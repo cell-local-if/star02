@@ -9782,6 +9782,155 @@ class RequestStore:
             raise RequestNotFound("request not found")
         return row[0], row[1], row[2]
 
+    def get_request_evidence(
+        self, tenant_id: str, request_id: str
+    ) -> dict[str, object]:
+        """Return one request's current evidence snapshot for the HTTP read.
+
+        Unlike :meth:`evidence` plus :meth:`verify_evidence`, the current
+        status, event count, persisted chain head and verification verdict
+        are produced from **one committed snapshot**: the request row, the
+        ordered state-event timeline and the event count are read inside a
+        single read-only transaction, so a status advance or a concurrent
+        writer can never let the response mix two transactions. The chain
+        itself is replayed from the rows read in that snapshot.
+
+        The result contains exactly ``request_id``, ``status``,
+        ``event_count``, ``chain_hash`` and ``verified``. ``chain_hash`` is
+        the head persisted on the request row verbatim, or ``None`` when
+        the persisted value is not legal 64-character lowercase
+        hexadecimal SHA-256 text; in that case ``verified`` is ``False``
+        but the read still succeeds. A deleted, altered, inserted,
+        reordered or cross-request/cross-tenant rebound event likewise
+        yields a successful read with ``verified`` false: the verdict only
+        describes the in-database chain and never authenticates external
+        audit anchors. Invalid, unknown and cross-tenant ids raise
+        :class:`RequestNotFound`; a non-string or empty *tenant_id*
+        raises :class:`ValueError`. The read never writes anything.
+        """
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        request_id = _require_identifier(request_id)
+        if self._mem_conn is not None:
+            with self._write_lock:
+                return self._get_request_evidence(tenant_id, request_id)
+        return self._get_request_evidence(tenant_id, request_id)
+
+    def _get_request_evidence(
+        self, tenant_id: str, request_id: str
+    ) -> dict[str, object]:
+        conn = self._connect()
+        try:
+            try:
+                # One explicit read-only transaction covers every read:
+                # the current status and anchored head, the full ordered
+                # timeline and the event count are the same committed
+                # snapshot, so a concurrent transition can never contribute
+                # a new head with the old events or vice versa.
+                conn.execute("BEGIN")
+                try:
+                    owner = conn.execute(
+                        "SELECT status, chain_hash FROM requests "
+                        "WHERE tenant_id = ? AND request_id = ?",
+                        (tenant_id, request_id),
+                    ).fetchone()
+                    if owner is None:
+                        # Identical outcome for unknown ids and cross-tenant
+                        # lookups; the enclosing handler rolls the read
+                        # transaction back before this propagates.
+                        raise RequestNotFound("request not found")
+                    current_status, anchored_head = owner
+                    rows = conn.execute(
+                        "SELECT seq, status, occurred_at, chain_hash "
+                        "FROM status_events "
+                        "WHERE tenant_id = ? AND request_id = ? ORDER BY seq",
+                        (tenant_id, request_id),
+                    ).fetchall()
+                    count_row = conn.execute(
+                        "SELECT count(*) FROM status_events "
+                        "WHERE tenant_id = ? AND request_id = ?",
+                        (tenant_id, request_id),
+                    ).fetchone()
+                except BaseException:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
+                conn.execute("COMMIT")
+            except RequestNotFound:
+                raise
+            except sqlite3.Error:
+                # Never surface the database engine's own error text.
+                raise _storage_failure() from None
+        finally:
+            self._release(conn)
+
+        # Defensive shape checks: the count subquery always returns one
+        # row, and a status written by the store is text; anything else
+        # is record corruption, not a partial snapshot.
+        if (
+            count_row is None
+            or not isinstance(count_row[0], int)
+            or isinstance(count_row[0], bool)
+            or not isinstance(current_status, str)
+        ):
+            raise _storage_failure()
+        event_count = count_row[0]
+        # A head that is not legal SHA-256 text is reported as null and
+        # settles the verdict as false; the read itself still succeeds.
+        reported_head = anchored_head if _is_chain_hash(anchored_head) else None
+
+        # Replay the in-database chain only, with the same strict criteria
+        # as _verify_evidence: every link recomputed in order from the
+        # genesis predecessor, sequences gap-free from zero, the final
+        # link equal to the request's anchored head and the final event's
+        # status equal to the current status. A single discrepancy -- a
+        # malformed row, a gap, a wrong hash, a head mismatch, a status
+        # mismatch or no events at all -- settles the verdict as false.
+        verified = False
+        if rows and _is_chain_hash(anchored_head):
+            predecessor = _GENESIS_PREDECESSOR
+            links_ok = True
+            for expected_seq, row in enumerate(rows):
+                seq, event_status, occurred_at, stored_hash = row
+                if (
+                    not isinstance(seq, int)
+                    or isinstance(seq, bool)
+                    or seq != expected_seq
+                    or not isinstance(event_status, str)
+                    or not isinstance(occurred_at, str)
+                    or not _is_chain_hash(stored_hash)
+                ):
+                    links_ok = False
+                    break
+                recomputed = _chain_hash(
+                    tenant_id,
+                    request_id,
+                    seq,
+                    event_status,
+                    occurred_at,
+                    predecessor,
+                )
+                # Constant-time comparison; either mismatch breaks the chain.
+                if not hmac.compare_digest(recomputed, stored_hash):
+                    links_ok = False
+                    break
+                predecessor = stored_hash
+            if (
+                links_ok
+                and hmac.compare_digest(predecessor, anchored_head)
+                and rows[-1][1] == current_status
+            ):
+                verified = True
+
+        return {
+            "request_id": request_id,
+            "status": current_status,
+            "event_count": event_count,
+            "chain_hash": reported_head,
+            "verified": verified,
+        }
+
     # -- external trust anchors ---------------------------------------
 
     def _fail_anchor_commit_locked(self, conn: sqlite3.Connection):
