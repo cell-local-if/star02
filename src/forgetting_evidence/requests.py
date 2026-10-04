@@ -2244,6 +2244,65 @@ def read_request_evidence(
     }
 
 
+def read_audit_health(
+    db_path: str | os.PathLike[str],
+    tenant_id: str,
+) -> dict[str, object]:
+    """Read a tenant's health snapshot without ever opening for writes.
+
+    This is the strictly read-only lookup behind the ``audit-health``
+    command. It follows :meth:`RequestStore.audit_health` semantics
+    exactly -- the same fixed plain-dictionary shape (``total``,
+    ``statuses``, ``verified``, ``unverified``, ``reasons``), the same
+    four lifecycle buckets with explicit zeros, the same complementary
+    trust tally and the same merged reason list ordered by Unicode code
+    point, all computed from one consistent snapshot inside a single
+    read-only transaction -- but it never creates the database, never
+    runs schema DDL or migrations and never writes any bookkeeping. The
+    file is opened read-only and only committed rows are read.
+
+    The process holds no anchor secret, so a database anchored with one
+    reports every request unverified with the stable
+    ``anchor_secret_missing`` reason: unverified evidence is still a
+    successful read, never an error. A missing, unreadable, locked or
+    corrupt database, corrupt bookkeeping or evidence records, or a
+    snapshot that cannot be read consistently raises the fixed-text
+    :class:`OSError` ``audit_health_failed`` -- never a partial
+    snapshot, and never a path, tenant, request id, SQL text or
+    underlying exception in the error.
+    """
+    if isinstance(db_path, os.PathLike):
+        db_path = os.fspath(db_path)
+    if not isinstance(db_path, str) or not db_path:
+        raise ValueError("storage path must be a non-empty string")
+    tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+    # Open the existing file read-only: a missing path fails instead of
+    # being created, and no schema, migration, repair or bookkeeping
+    # write can ever occur.
+    uri = pathlib.Path(os.path.abspath(db_path)).as_uri() + "?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=_BUSY_TIMEOUT_MS / 1000)
+    except sqlite3.Error:
+        raise _audit_health_failure() from None
+    conn.isolation_level = None  # explicit transaction control
+    try:
+        snapshot_rows = RequestStore._fetch_audit_health_rows(conn)
+    finally:
+        conn.close()
+    snapshot = RequestStore._build_audit_health_snapshot(
+        snapshot_rows, tenant_id, None, {}
+    )
+    # Log only counts and the stable outcome: no path, tenant, request
+    # id, credential or SQL text ever reaches the log.
+    _log.info(
+        "audit health read total=%s verified=%s reasons=%s",
+        snapshot["total"],
+        snapshot["verified"],
+        len(snapshot["reasons"]),
+    )
+    return snapshot
+
+
 # Allowed request lifecycle. completed and failed are terminal; moving a
 # request to the status it already holds is an idempotent no-op.
 _STATUS_ACCEPTED = "accepted"
@@ -8969,46 +9028,94 @@ class RequestStore:
     def _audit_health(self, tenant_id: str) -> dict[str, object]:
         conn = self._connect()
         try:
-            try:
-                # One explicit read-only transaction: the request rows
-                # and every piece of audit evidence are read from a
-                # single consistent snapshot, never piecemeal across
-                # statements that a concurrent write could interleave.
-                conn.execute("BEGIN")
-                try:
-                    meta_rows = conn.execute(
-                        "SELECT head_hmac FROM audit_anchor_meta"
-                    ).fetchall()
-                    event_rows = conn.execute(
-                        "SELECT tenant_id, request_id, seq, status, "
-                        "occurred_at, chain_hash FROM status_events "
-                        "ORDER BY tenant_id, request_id, seq"
-                    ).fetchall()
-                    anchor_rows = conn.execute(
-                        "SELECT commit_seq, tenant_id, request_id, seq, "
-                        "event_hash, anchor_hmac, key_generation "
-                        "FROM audit_anchors ORDER BY commit_seq"
-                    ).fetchall()
-                    request_rows = conn.execute(
-                        "SELECT tenant_id, request_id, status, chain_hash "
-                        "FROM requests"
-                    ).fetchall()
-                    generation_rows = conn.execute(
-                        "SELECT generation, key_fingerprint, effective_at "
-                        "FROM anchor_key_generations ORDER BY generation"
-                    ).fetchall()
-                except BaseException:
-                    try:
-                        conn.execute("ROLLBACK")
-                    except sqlite3.Error:
-                        pass
-                    raise
-                conn.execute("COMMIT")
-            except sqlite3.Error:
-                raise _audit_health_failure() from None
+            snapshot_rows = self._fetch_audit_health_rows(conn)
         finally:
             self._release(conn)
+        snapshot = self._build_audit_health_snapshot(
+            snapshot_rows,
+            tenant_id,
+            self._anchor_secret,
+            self._anchor_history_secrets,
+        )
+        # Log only counts and the stable outcome: no tenant, request id,
+        # credential or SQL text ever reaches the log.
+        _log.info(
+            "audit health read total=%s verified=%s reasons=%s",
+            snapshot["total"],
+            snapshot["verified"],
+            len(snapshot["reasons"]),
+        )
+        return snapshot
 
+    @staticmethod
+    def _fetch_audit_health_rows(
+        conn: sqlite3.Connection,
+    ) -> tuple[tuple, tuple, tuple, tuple, tuple]:
+        """Read every health-snapshot table from one consistent snapshot.
+
+        One explicit read-only transaction: the request rows and every
+        piece of audit evidence are read from a single consistent
+        snapshot, never piecemeal across statements that a concurrent
+        write could interleave. Any storage failure collapses to the
+        fixed-text ``audit_health_failed`` OSError.
+        """
+        try:
+            conn.execute("BEGIN")
+            try:
+                meta_rows = conn.execute(
+                    "SELECT head_hmac FROM audit_anchor_meta"
+                ).fetchall()
+                event_rows = conn.execute(
+                    "SELECT tenant_id, request_id, seq, status, "
+                    "occurred_at, chain_hash FROM status_events "
+                    "ORDER BY tenant_id, request_id, seq"
+                ).fetchall()
+                anchor_rows = conn.execute(
+                    "SELECT commit_seq, tenant_id, request_id, seq, "
+                    "event_hash, anchor_hmac, key_generation "
+                    "FROM audit_anchors ORDER BY commit_seq"
+                ).fetchall()
+                request_rows = conn.execute(
+                    "SELECT tenant_id, request_id, status, chain_hash "
+                    "FROM requests"
+                ).fetchall()
+                generation_rows = conn.execute(
+                    "SELECT generation, key_fingerprint, effective_at "
+                    "FROM anchor_key_generations ORDER BY generation"
+                ).fetchall()
+            except BaseException:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+            conn.execute("COMMIT")
+        except sqlite3.Error:
+            raise _audit_health_failure() from None
+        return (
+            tuple(meta_rows),
+            tuple(event_rows),
+            tuple(anchor_rows),
+            tuple(request_rows),
+            tuple(generation_rows),
+        )
+
+    @staticmethod
+    def _build_audit_health_snapshot(
+        snapshot_rows: tuple[tuple, tuple, tuple, tuple, tuple],
+        tenant_id: str,
+        secret: str | None,
+        history_secrets: Mapping[int, str],
+    ) -> dict[str, object]:
+        """Build the tenant health snapshot purely from rows already read.
+
+        The computation only compares and recomputes, never writes; the
+        caller supplies the rows of one consistent snapshot plus the
+        anchor secrets held in memory.
+        """
+        meta_rows, event_rows, anchor_rows, request_rows, generation_rows = (
+            snapshot_rows
+        )
         # Bucket the tenant's requests by the four lifecycle statuses; a
         # status no request holds stays explicitly zero. A request row
         # whose id or status is not what the store writes is bookkeeping
@@ -9037,20 +9144,17 @@ class RequestStore:
         # criteria the inspection sweep applies and purely from the one
         # snapshot read above: the evaluation only compares and
         # recomputes, it never writes.
-        snapshot_rows = (
-            tuple(meta_rows),
-            tuple(event_rows),
-            tuple(anchor_rows),
-            tuple(request_rows),
-            tuple(generation_rows),
-        )
         verified = 0
         reason_counts: dict[str, int] = {}
         for request_id in scoped_ids:
-            reasons = self._evaluate_inspection_rows(
-                *snapshot_rows,
-                self._anchor_secret,
-                self._anchor_history_secrets,
+            reasons = RequestStore._evaluate_inspection_rows(
+                meta_rows,
+                event_rows,
+                anchor_rows,
+                request_rows,
+                generation_rows,
+                secret,
+                history_secrets,
                 (tenant_id, request_id),
             )
             if not reasons:
@@ -9070,7 +9174,7 @@ class RequestStore:
         # Reason codes sort by Unicode code point (plain string order);
         # equal reasons are already merged and every count is a positive
         # integer by construction.
-        snapshot = {
+        return {
             "total": total,
             "statuses": statuses,
             "verified": verified,
@@ -9080,15 +9184,6 @@ class RequestStore:
                 for reason in sorted(reason_counts)
             ],
         }
-        # Log only counts and the stable outcome: no tenant, request id,
-        # credential or SQL text ever reaches the log.
-        _log.info(
-            "audit health read total=%s verified=%s reasons=%s",
-            total,
-            verified,
-            len(reason_counts),
-        )
-        return snapshot
 
     @staticmethod
     def _next_inspection_candidate(

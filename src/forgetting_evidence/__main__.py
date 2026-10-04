@@ -11,6 +11,7 @@ from .httpapi import (
 from .requests import (
     RequestNotFound,
     RestoreConflict,
+    read_audit_health,
     read_request_evidence,
     read_request_status,
     restore_backup,
@@ -29,6 +30,9 @@ _RESTORE_USAGE = "restore_usage"
 _STATUS_USAGE = "status_usage"
 # Evidence mirrors status: fixed, detail-free markers only.
 _EVIDENCE_USAGE = "evidence_usage"
+# Audit-health shares the same rule: fixed, detail-free markers only.
+_AUDIT_HEALTH_USAGE = "audit_health_usage"
+_AUDIT_HEALTH_FAILED = "audit_health_failed"
 
 _FLAG_ALIASES = {
     "--db": "db",
@@ -48,21 +52,37 @@ _STATUS_FLAG_ALIASES = {
 }
 _STATUS_POSITIONAL_FIELDS = ("db", "tenant_id", "request_id")
 
+_AUDIT_HEALTH_FLAG_ALIASES = {
+    "--db": "db",
+    "--database": "db",
+    "--tenant-id": "tenant_id",
+}
+_AUDIT_HEALTH_POSITIONAL_FIELDS = ("db", "tenant_id")
 
-def _parse_status_args(args: list[str]) -> dict[str, str] | None:
+
+def _parse_strict_args(
+    args: list[str],
+    flag_aliases: dict[str, str],
+    positional_fields: tuple[str, ...],
+) -> dict[str, str] | None:
+    """Parse either pure positionals or pure named flags, never a mix.
+
+    Shared by status, evidence and audit-health: duplicates, empty
+    values, unknown flags and a wrong arity all reject the invocation.
+    """
     values: dict[str, str] = {}
     positionals: list[str] = []
     index = 0
     while index < len(args):
         token = args[index]
-        if "=" in token and token.split("=", 1)[0] in _STATUS_FLAG_ALIASES:
+        if "=" in token and token.split("=", 1)[0] in flag_aliases:
             name, value = token.split("=", 1)
-            field = _STATUS_FLAG_ALIASES[name]
+            field = flag_aliases[name]
             if field in values or value == "":
                 return None
             values[field] = value
-        elif token in _STATUS_FLAG_ALIASES:
-            field = _STATUS_FLAG_ALIASES[token]
+        elif token in flag_aliases:
+            field = flag_aliases[token]
             if field in values or index + 1 >= len(args):
                 return None
             values[field] = args[index + 1]
@@ -76,13 +96,17 @@ def _parse_status_args(args: list[str]) -> dict[str, str] | None:
         # Avoid ambiguity when both styles are mixed.
         return None
     if positionals:
-        if len(positionals) != 3:
+        if len(positionals) != len(positional_fields):
             return None
-        values = dict(zip(_STATUS_POSITIONAL_FIELDS, positionals))
-    missing = [field for field in _STATUS_POSITIONAL_FIELDS if not values.get(field)]
+        values = dict(zip(positional_fields, positionals))
+    missing = [field for field in positional_fields if not values.get(field)]
     if missing:
         return None
     return values
+
+
+def _parse_status_args(args: list[str]) -> dict[str, str] | None:
+    return _parse_strict_args(args, _STATUS_FLAG_ALIASES, _STATUS_POSITIONAL_FIELDS)
 
 
 def _run_status(args: list[str]) -> int:
@@ -149,6 +173,36 @@ def _run_evidence(args: list[str]) -> int:
             separators=(",", ":"),
         )
     )
+    return 0
+
+
+def _run_audit_health(args: list[str]) -> int:
+    # Audit-health accepts two invocation styles -- two positionals or
+    # the two named flags (--db/--database and --tenant-id) -- under the
+    # same strict rules as status and evidence: mixing styles,
+    # duplicates, empty values, unknown flags or a wrong arity never
+    # reach storage.
+    parsed = _parse_strict_args(
+        args, _AUDIT_HEALTH_FLAG_ALIASES, _AUDIT_HEALTH_POSITIONAL_FIELDS
+    )
+    if parsed is None:
+        print(_AUDIT_HEALTH_USAGE, file=sys.stderr)
+        return 2
+    # Strictly read-only like status and evidence: the database is never
+    # created, migrated, repaired or overwritten, and no partial snapshot
+    # is ever emitted. Unverified evidence is still a successful read
+    # with its stable reasons; only a missing, unreadable, locked or
+    # corrupt database -- or a snapshot that cannot be read consistently
+    # -- is a failure. Every storage problem collapses to the single
+    # fixed failure marker: the path, the tenant, the request ids, SQL
+    # and any underlying error are never printed, and the JSON line is
+    # only emitted once the read succeeds.
+    try:
+        snapshot = read_audit_health(parsed["db"], parsed["tenant_id"])
+    except (ValueError, OSError):
+        print(_AUDIT_HEALTH_FAILED, file=sys.stderr)
+        return 3
+    print(json.dumps(snapshot, separators=(",", ":")))
     return 0
 
 
@@ -276,6 +330,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_status(args[1:])
     if args and args[0] == "evidence":
         return _run_evidence(args[1:])
+    if args and args[0] == "audit-health":
+        return _run_audit_health(args[1:])
     print(_USAGE, file=sys.stderr)
     return 2
 
