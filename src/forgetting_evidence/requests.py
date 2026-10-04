@@ -564,6 +564,7 @@ from datetime import datetime, timedelta, timezone
 
 __all__ = [
     "RequestStore",
+    "backup_database",
     "restore_backup",
     "read_request_status",
     "IdempotencyConflict",
@@ -1889,6 +1890,48 @@ def _validate_backup_snapshot(conn: sqlite3.Connection) -> None:
         raise _storage_failure() from None
 
 
+def _backup_connection_into_temp(
+    source: sqlite3.Connection,
+    temp_path: str,
+    mem_lock: threading.Lock | None = None,
+    mem_conn: sqlite3.Connection | None = None,
+) -> None:
+    """Copy one open source database into the staged file and validate it.
+
+    Shares the exact snapshot semantics of
+    :meth:`RequestStore.backup_to`: the backup API copies a
+    transaction-consistent view, the staged copy must be openable,
+    carry the full table structure and pass SQLite's own consistency
+    check, and any read, copy or validation failure is the fixed-text
+    storage error. A shared in-memory source connection is serialized
+    through *mem_lock* like every other use of it; a file-backed source
+    is read directly and closed by the caller.
+    """
+    try:
+        dest = sqlite3.connect(
+            temp_path,
+            timeout=_BUSY_TIMEOUT_MS / 1000,
+            check_same_thread=False,
+        )
+    except sqlite3.Error:
+        raise _storage_failure() from None
+    try:
+        # The backup API copies a transaction-consistent view: a
+        # concurrently committing transaction is either fully inside
+        # the snapshot or fully outside it.
+        if mem_conn is not None:
+            assert mem_lock is not None
+            with mem_lock:
+                source.backup(dest)
+        else:
+            source.backup(dest)
+        _validate_backup_snapshot(dest)
+    except sqlite3.Error:
+        raise _storage_failure() from None
+    finally:
+        dest.close()
+
+
 # Fixed, detail-free text for every restore conflict and failure. Neither
 # ever embeds a filesystem path, SQL text or engine error detail.
 _RESTORE_CONFLICT_MESSAGE = "restore conflict"
@@ -2059,6 +2102,109 @@ def restore_backup(
             os.unlink(temp_path)
         except OSError:
             pass
+
+
+# Staged command-line backups live beside the target under this prefix,
+# exactly like storage-layer backups, so a failed copy never impersonates
+# a database.
+_BACKUP_STAGING_PREFIX = ".forgetting-evidence-backup-"
+
+
+def backup_database(
+    db_path: str | os.PathLike[str],
+    target_path: str | os.PathLike[str],
+) -> str:
+    """Write a transaction-consistent snapshot without opening the source.
+
+    The strictly read-only entry point behind the ``backup`` command: it
+    delivers exactly :meth:`RequestStore.backup_to`'s snapshot semantics
+    -- requests, statuses, execution attempts, receipts, audit anchors
+    and inspection bookkeeping as one consistent view that reopens
+    through :class:`RequestStore` and reaches the same verification and
+    summary conclusions with the same anchor secrets -- but never
+    constructs a store. The source is opened read-only, so it is never
+    created, migrated, journaled, locked for writing or otherwise
+    changed: a missing path fails instead of creating a file, and no
+    record, lease, audit chain or inspection cursor can move.
+
+    The target's directory must already exist (it is never created) and
+    the target file must not exist yet. The copy is staged in a
+    temporary file in the same directory, validated -- openable,
+    complete table structure, SQLite consistency check -- and only then
+    atomically landed, so no failure can leave a target file behind and
+    two backups racing for the same target let exactly one land, with
+    every loser leaving the winner's file untouched.
+
+    An empty, non-string, in-memory or NUL-bearing path, or a target
+    that names a directory, raises :class:`ValueError` without touching
+    anything; an already existing target raises :class:`BackupConflict`
+    and is never overwritten; a missing, unreadable or corrupt source,
+    a missing or unwritable target directory, a temporary-file failure
+    or a failed snapshot validation raises the fixed-text
+    :class:`OSError` ``request store is unavailable``. No failure path
+    changes the source, overwrites the target or leaves a staged file
+    behind; the path, SQL and underlying error are never embedded.
+    """
+    db_path = _validate_restore_path(db_path, "database")
+    target_path = _validate_restore_path(target_path, "backup")
+    # A path that names a directory can never receive the snapshot
+    # file; that is caller error, not a conflict.
+    if os.path.isdir(target_path):
+        raise ValueError("backup path must be a usable file path")
+    # An existing target is never overwritten nor treated as a usable
+    # snapshot: the caller must choose a fresh path.
+    if os.path.lexists(target_path):
+        raise BackupConflict(_BACKUP_CONFLICT_MESSAGE)
+    # The directory must already exist; the backup entry point never
+    # creates directories.
+    parent = os.path.dirname(os.path.abspath(target_path))
+    if not os.path.isdir(parent):
+        raise _storage_failure()
+    # The source must name an existing readable file; a missing path, a
+    # special file, a directory or anything unreadable collapses to the
+    # fixed storage error once the read-only open is attempted.
+    if not os.path.isfile(db_path):
+        raise _storage_failure()
+    # Open the existing source read-only: a missing path would fail
+    # instead of being created, and no schema, journal or bookkeeping
+    # write can ever occur against the source.
+    uri = pathlib.Path(os.path.abspath(db_path)).as_uri() + "?mode=ro"
+    try:
+        source = sqlite3.connect(uri, uri=True, timeout=_BUSY_TIMEOUT_MS / 1000)
+    except sqlite3.Error:
+        raise _storage_failure() from None
+    try:
+        # Stage the snapshot in a sibling temporary file so a failure
+        # can never leave a partial or invalid target behind.
+        try:
+            fd, temp_path = tempfile.mkstemp(
+                prefix=_BACKUP_STAGING_PREFIX, dir=parent
+            )
+        except OSError:
+            raise _storage_failure() from None
+        try:
+            os.close(fd)
+            _backup_connection_into_temp(source, temp_path)
+            try:
+                # Atomic land: the link fails if a concurrent backup
+                # (or anyone else) claimed the target first, and the
+                # loser leaves the winner's file untouched.
+                os.link(temp_path, target_path)
+            except FileExistsError:
+                raise BackupConflict(_BACKUP_CONFLICT_MESSAGE) from None
+            except OSError:
+                raise _storage_failure() from None
+        finally:
+            # The temporary file is always removed: on failure so no
+            # stray artifact remains, on success because the target now
+            # owns the same content.
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+    finally:
+        source.close()
+    return target_path
 
 
 def read_request_status(
@@ -12036,7 +12182,13 @@ class RequestStore:
             raise _storage_failure() from None
         try:
             os.close(fd)
-            self._backup_into_temp(temp_path)
+            source = self._connect()
+            try:
+                _backup_connection_into_temp(
+                    source, temp_path, self._write_lock, self._mem_conn
+                )
+            finally:
+                self._release(source)
             try:
                 # Atomic land: the link fails if a concurrent backup (or
                 # anyone else) claimed the target first, and the loser
@@ -12055,41 +12207,6 @@ class RequestStore:
             except OSError:
                 pass
         return target_path
-
-    def _backup_into_temp(self, temp_path: str) -> None:
-        """Copy this store's database into the staged file and validate it.
-
-        Reads only this instance's database; any read, copy or
-        validation failure is the fixed-text storage error.
-        """
-        try:
-            dest = sqlite3.connect(
-                temp_path,
-                timeout=_BUSY_TIMEOUT_MS / 1000,
-                check_same_thread=False,
-            )
-        except sqlite3.Error:
-            raise _storage_failure() from None
-        try:
-            source = self._connect()
-            try:
-                # The backup API copies a transaction-consistent view:
-                # a concurrently committing transaction is either fully
-                # inside the snapshot or fully outside it. The shared
-                # in-memory connection is serialized like every other
-                # use of it.
-                if self._mem_conn is not None:
-                    with self._write_lock:
-                        source.backup(dest)
-                else:
-                    source.backup(dest)
-            except sqlite3.Error:
-                raise _storage_failure() from None
-            finally:
-                self._release(source)
-            _validate_backup_snapshot(dest)
-        finally:
-            dest.close()
 
     # -- audit evidence bundles -----------------------------------------
 

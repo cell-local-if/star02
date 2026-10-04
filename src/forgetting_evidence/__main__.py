@@ -11,6 +11,8 @@ from .httpapi import (
 from .requests import (
     RequestNotFound,
     RestoreConflict,
+    BackupConflict,
+    backup_database,
     read_audit_health,
     read_request_evidence,
     read_request_status,
@@ -26,6 +28,8 @@ _SERVE_USAGE = (
 # Restore's markers are fixed, detail-free text: the paths and any
 # underlying error are never printed.
 _RESTORE_USAGE = "restore_usage"
+# Backup shares the same rule: fixed, detail-free markers only.
+_BACKUP_USAGE = "backup_usage"
 # Status shares the same rule: fixed, detail-free markers only.
 _STATUS_USAGE = "status_usage"
 # Evidence mirrors status: fixed, detail-free markers only.
@@ -321,6 +325,34 @@ def _run_restore(args: list[str]) -> int:
     return 0
 
 
+def _run_backup(args: list[str]) -> int:
+    # Exactly the source database and the snapshot target are
+    # accepted; any other arity is the fixed usage marker at exit 2.
+    if len(args) != 2:
+        print(_BACKUP_USAGE, file=sys.stderr)
+        return 2
+    database_path, snapshot_path = args
+    # The export is strictly read-only at the source: it never creates
+    # or migrates the database, never writes bookkeeping and never
+    # creates the target directory. Every storage problem -- a missing,
+    # unreadable, locked or corrupt source, an empty, directory or
+    # unusable target, a staging failure or a snapshot that fails its
+    # openability, structure or consistency checks -- collapses to the
+    # single fixed failure marker; only an already claimed target,
+    # including one won by a concurrent backup, is the conflict marker.
+    # The paths, SQL and any underlying error are never printed.
+    try:
+        backup_database(database_path, snapshot_path)
+    except BackupConflict:
+        print("backup_conflict", file=sys.stderr)
+        return 3
+    except (ValueError, OSError):
+        print("backup_failed", file=sys.stderr)
+        return 2
+    print(json.dumps({"status": "backed_up"}, separators=(",", ":")))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = list(sys.argv[1:] if argv is None else argv)
     if args == ["health"]:
@@ -330,6 +362,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_serve(args[1:])
     if args and args[0] == "restore":
         return _run_restore(args[1:])
+    if args and args[0] == "backup":
+        return _run_backup(args[1:])
     if args and args[0] == "status":
         return _run_status(args[1:])
     if args and args[0] == "evidence":
