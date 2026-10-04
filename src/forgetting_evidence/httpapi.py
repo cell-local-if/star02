@@ -1,7 +1,7 @@
 """HTTP layer for deletion-request acceptance, lookup, observation and
 single-request reconciliation.
 
-The service exposes ten business endpoints:
+The service exposes eleven business endpoints:
 
 * ``POST /requests`` -- accept a deletion request for a tenant. The JSON
   body must carry non-empty ``tenant_id``, ``subject_id`` and
@@ -83,6 +83,30 @@ The service exposes ten business endpoints:
   completely answers 503. The read never creates or changes a request,
   a state event, an execution attempt, a tombstone, a receipt, a policy
   catalog or an audit anchor.
+* ``GET /requests/{request_id}/audit-bundle`` -- read-only export of the
+  request's settled audit chain as a portable evidence bundle. The
+  tenant follows the existing ``X-Tenant-Id``/query rule and the
+  endpoint requires the ``request:read`` role; the query string accepts
+  no parameter other than ``tenant_id`` -- a duplicated key, an unknown
+  parameter or a missing or conflicting tenant answers 400. The body is
+  the verbatim single-line compact UTF-8 JSON text (with its single
+  trailing newline) produced by
+  :meth:`RequestStore.export_audit_bundle` from the same database
+  snapshot: exactly ``request_id``, ``status``, ``events``, ``chain``,
+  ``anchors`` and ``generations`` -- never wrapped in a response object,
+  re-ordered, re-indented or summarised, and never carrying a subject, a
+  raw scope, an idempotency key, a claim credential or any secret
+  material. Repeated reads at the same chain head answer byte-identical
+  bodies; a status event appended afterwards only makes later reads
+  produce a new bundle and never changes a body already handed out. A
+  malformed, unknown, cross-tenant or not-yet-accepted request id
+  answers 404 indistinguishably; a request whose audit chain has not
+  settled reliably, whose historical anchor secret is missing or whose
+  evidence is untrusted answers 409 with exactly
+  ``audit_bundle_unavailable`` and never a partial text; an unreadable
+  database, a failed snapshot read or a corrupt bundle answers 503. The
+  read never advances state, never writes an audit event, never creates
+  a batch and never changes any persisted evidence.
 * ``GET /policy-catalog/versions`` -- read-only publication of the
   tenant's policy-catalog version history, without any subject detail.
   The tenant follows the existing ``X-Tenant-Id``/query rule; the query
@@ -159,7 +183,7 @@ audit inspection (:meth:`RequestStore.audit_inspection` and
 :meth:`RequestStore.audit_inspection_summary`) exist only on
 the storage layer and are deliberately not exposed over HTTP: over HTTP
 the service opens request acceptance, the acceptance-receipt lookup, the
-read-only tenant-scoped listing, the four read-only observation reads,
+read-only tenant-scoped listing, the five read-only observation reads,
 the single-request execution reconciliation, the read-only
 policy-catalog version history and the policy-catalog publication
 described above. The
@@ -169,6 +193,8 @@ execution log (:meth:`RequestStore.get_execution_log`), the tombstone
 page read (:meth:`RequestStore.page_deletion_tombstones`), the
 single-snapshot request evidence read
 (:meth:`RequestStore.get_request_evidence`), the
+settled-chain audit-bundle export
+(:meth:`RequestStore.export_audit_bundle`), the
 single-request reconciliation
 (:meth:`RequestStore.reconcile_execution`), the catalog version
 history (:meth:`RequestStore.audit_policy_catalog`) and the catalog
@@ -186,6 +212,9 @@ listing read renders exactly ``items`` and ``next_cursor``, each item
 rendering exactly ``request_id``, ``status`` and ``created_at``. The
 evidence read renders exactly ``request_id``, ``status``,
 ``event_count``, ``chain_hash`` and ``verified``. The
+audit-bundle read renders the store's verbatim bundle text: exactly
+``request_id``, ``status``, ``events``, ``chain``, ``anchors`` and
+``generations``. The
 tombstone page read renders exactly ``request_id``, ``tombstones``,
 ``recorded_at``, ``evidence_digest`` and ``next_cursor``, each
 tombstone rendering exactly ``adapter_id``, ``scope``, ``operation_id``,
@@ -199,8 +228,8 @@ Error responses are single-line JSON objects with exactly one key,
 
 ``invalid_request`` (400), ``unauthorized`` (401), ``forbidden``
 (403), ``idempotency_conflict`` (409), ``policy_catalog_conflict``
-(409), ``not_found`` (404), ``method_not_allowed`` (405) and
-``storage_unavailable`` (503).
+(409), ``audit_bundle_unavailable`` (409), ``not_found`` (404),
+``method_not_allowed`` (405) and ``storage_unavailable`` (503).
 
 Optional token authentication and role-based access control can be
 enabled by passing an auth configuration (see :func:`load_auth_config`)
@@ -212,7 +241,7 @@ for a configured principal: a missing/malformed/unknown token answers
 endpoint, or acting on a tenant other than its own ``tenant_id``,
 answers ``403 forbidden``. ``POST /requests`` requires
 ``request:submit`` and the target tenant is the body's ``tenant_id``;
-each of the six GET endpoints requires
+each of the seven GET endpoints requires
 ``request:read`` and the target tenant follows the existing
 ``X-Tenant-Id``/query rule; the
 single-request reconciliation ``POST /requests/{request_id}/reconcile``
@@ -249,6 +278,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 from .requests import (
+    AuditBundleUnavailable,
     IdempotencyConflict,
     PolicyCatalogConflict,
     RequestNotFound,
@@ -273,6 +303,7 @@ _STATUS_RESOURCE = "status"
 _EXECUTION_LOG_RESOURCE = "execution-log"
 _TOMBSTONES_RESOURCE = "tombstones"
 _EVIDENCE_RESOURCE = "evidence"
+_AUDIT_BUNDLE_RESOURCE = "audit-bundle"
 _RECONCILE_RESOURCE = "reconcile"
 _TENANT_HEADER = "X-Tenant-Id"
 _AUTHORIZATION_HEADER = "Authorization"
@@ -323,6 +354,12 @@ _TOMBSTONES_QUERY_PARAMS = frozenset({"tenant_id", "cursor", "limit"})
 # parameter, or any duplicated key, is an invalid request.
 _POLICY_CATALOG_QUERY_PARAMS = frozenset({"tenant_id"})
 
+# The query parameters the GET /requests/{request_id}/audit-bundle
+# export read understands: only ``tenant_id``, which keeps its
+# historical header-or-query resolution and is validated separately.
+# Any other parameter, or any duplicated key, is an invalid request.
+_AUDIT_BUNDLE_QUERY_PARAMS = frozenset({"tenant_id"})
+
 # The JSON body keys of the POST /policy-catalog/versions publication:
 # exactly the tenant and the two catalogs, nothing else.
 _POLICY_CATALOG_PUBLISH_KEYS = frozenset(
@@ -350,6 +387,7 @@ _NOT_FOUND = "not_found"
 _METHOD_NOT_ALLOWED = "method_not_allowed"
 _IDEMPOTENCY_CONFLICT = "idempotency_conflict"
 _POLICY_CATALOG_CONFLICT = "policy_catalog_conflict"
+_AUDIT_BUNDLE_UNAVAILABLE = "audit_bundle_unavailable"
 _STORAGE_UNAVAILABLE = "storage_unavailable"
 
 
@@ -624,6 +662,12 @@ class DeferredRequestStore:
         # the read never writes anything.
         return self._ready().get_request_evidence(tenant_id, request_id)
 
+    def export_audit_bundle(self, tenant_id, request_id):
+        # Serves the read-only GET /requests/{request_id}/audit-bundle
+        # endpoint; the settled-chain bundle text comes from one
+        # committed snapshot and the read never writes anything.
+        return self._ready().export_audit_bundle(tenant_id, request_id)
+
 
 def _normalize_request_id(value: str) -> str:
     """Validate a request id as a UUID and return its canonical text."""
@@ -632,6 +676,20 @@ def _normalize_request_id(value: str) -> str:
     # Accept upper-case spellings but look the store up under the same
     # canonical form uuid4() rows were written with.
     return value.lower()
+
+
+def _is_count(value: object) -> bool:
+    """Return whether *value* is an exact non-negative integer.
+
+    ``bool`` is a subclass of ``int`` and ``1.0 == 1``: only exact
+    integers count.
+    """
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _is_hex_digest(value: object) -> bool:
+    """Return whether *value* is 64 lowercase hexadecimal characters."""
+    return isinstance(value, str) and _HEX_DIGEST_RE.match(value) is not None
 
 
 def build_server(
@@ -685,11 +743,12 @@ def make_handler(
                 # Empty or nested segments do not name a request.
                 if segment and "/" not in segment:
                     return "item", segment
-                # The four read-only observability sub-resources live
+                # The five read-only observability sub-resources live
                 # under a request id: /requests/{id}/status,
                 # /requests/{id}/execution-log,
-                # /requests/{id}/tombstones and
-                # /requests/{id}/evidence, alongside the single
+                # /requests/{id}/tombstones,
+                # /requests/{id}/evidence and
+                # /requests/{id}/audit-bundle, alongside the single
                 # reconciliation action /requests/{id}/reconcile. Deeper
                 # nesting or any other suffix stays an unknown path (404).
                 if "/" in segment:
@@ -703,6 +762,8 @@ def make_handler(
                             return "tombstones", item_id
                         if suffix == _EVIDENCE_RESOURCE:
                             return "evidence", item_id
+                        if suffix == _AUDIT_BUNDLE_RESOURCE:
+                            return "audit_bundle", item_id
                         if suffix == _RECONCILE_RESOURCE:
                             return "reconcile", item_id
             return None, None
@@ -897,9 +958,9 @@ def make_handler(
                 )
                 return
             # item (acceptance receipt), status, execution_log,
-            # tombstones and evidence are the five GET-only reads;
-            # authorization, tenant/id resolution and the resulting error
-            # ordering are shared by all of them.
+            # tombstones, evidence and audit_bundle are the six GET-only
+            # reads; authorization, tenant/id resolution and the
+            # resulting error ordering are shared by all of them.
             assert segment is not None
             resolved = self._resolve_read(segment)
             if resolved is None:
@@ -913,6 +974,8 @@ def make_handler(
                 self._serve_execution_log(tenant_id, request_id)
             elif kind == "evidence":
                 self._serve_evidence(tenant_id, request_id)
+            elif kind == "audit_bundle":
+                self._serve_audit_bundle(tenant_id, request_id)
             else:
                 self._serve_tombstones(tenant_id, request_id)
 
@@ -1058,6 +1121,61 @@ def make_handler(
                 self._reply_error(503, _STORAGE_UNAVAILABLE)
                 return
             self._reply_evidence(record)
+
+        def _serve_audit_bundle(self, tenant_id: str, request_id: str) -> None:
+            # The audit-bundle export shares the other GET reads'
+            # authorization and tenant/id resolution (done by the
+            # caller); the tenant-only query-string gate runs here,
+            # before storage is touched. The store renders the settled
+            # chain's bundle text from one committed read-only snapshot;
+            # an unsettled or untrusted chain is a conflict, never a
+            # partial text, and the read never writes anything.
+            try:
+                self._audit_bundle_query_gate()
+            except _BadRequest:
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            try:
+                text = store.export_audit_bundle(tenant_id, request_id)
+            except RequestNotFound:
+                # Missing ids and cross-tenant lookups are indistinguishable.
+                self._reply_error(404, _NOT_FOUND)
+                return
+            except AuditBundleUnavailable:
+                # The chain has not settled reliably, a historical anchor
+                # secret is missing or the evidence is untrusted; the
+                # fixed code never says which.
+                self._reply_error(409, _AUDIT_BUNDLE_UNAVAILABLE)
+                return
+            except ValueError:
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            except _StorageUnavailable:
+                _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
+                self._reply_error(503, _STORAGE_UNAVAILABLE)
+                return
+            except (sqlite3.Error, RuntimeError, OSError):
+                # An unreadable database or a snapshot that cannot be read
+                # completely surfaces as the fixed-text storage error.
+                _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
+                self._reply_error(503, _STORAGE_UNAVAILABLE)
+                return
+            self._reply_audit_bundle(text)
+
+        def _audit_bundle_query_gate(self) -> None:
+            """Reject any query parameter other than a single ``tenant_id``.
+
+            The bundle export takes no business parameters; ``tenant_id``
+            keeps its historical header-or-query resolution in
+            ``_tenant_id``. An unknown parameter or any duplicated key
+            (including ``tenant_id`` itself) is a bad request.
+            """
+            params = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+            if not set(params) <= _AUDIT_BUNDLE_QUERY_PARAMS:
+                raise _BadRequest("unknown query parameter")
+            for values in params.values():
+                if len(values) != 1:
+                    raise _BadRequest("duplicate query parameter")
 
         def _serve_tombstones(self, tenant_id: str, request_id: str) -> None:
             # The tombstone page read shares the other GET reads'
@@ -1601,6 +1719,137 @@ def make_handler(
                 + "\n"
             ).encode("utf-8")
             self._write_body(200, body)
+
+        def _reply_audit_bundle(self, text: object) -> None:
+            # The body is the store's verbatim single-line compact JSON
+            # bundle text with its single trailing newline. It is still
+            # re-validated field by field before it is emitted: a corrupt
+            # or substituted store must never serialise a subject, a raw
+            # scope, an idempotency key, a claim credential or any secret
+            # material into the body, and a malformed bundle surfaces as
+            # the stable storage code, never as a partial text.
+            if (
+                not isinstance(text, str)
+                or not text.endswith("\n")
+                or "\n" in text[:-1]
+                or "\r" in text
+            ):
+                raise RuntimeError("malformed audit bundle from store")
+            try:
+                payload = json.loads(text[:-1])
+            except ValueError:
+                raise RuntimeError("malformed audit bundle from store") from None
+            self._validate_audit_bundle_payload(payload)
+            # The emitted bytes must be exactly the compact single-line
+            # rendering of the validated payload; anything else (extra
+            # whitespace, a reserialised duplicate key, a non-canonical
+            # number) is not the store's verbatim text.
+            canonical = (
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                + "\n"
+            )
+            if text != canonical:
+                raise RuntimeError("malformed audit bundle from store")
+            self._write_body(200, text.encode("utf-8"))
+
+        def _validate_audit_bundle_payload(self, payload: object) -> None:
+            # Whitelist and re-check every field of the bundle shape the
+            # store renders: exactly request_id, status, events, chain,
+            # anchors and generations, each with its fixed nested fields
+            # and value domains.
+            if not isinstance(payload, dict) or set(payload) != {
+                "request_id",
+                "status",
+                "events",
+                "chain",
+                "anchors",
+                "generations",
+            }:
+                raise RuntimeError("malformed audit bundle from store")
+            request_id = payload["request_id"]
+            status = payload["status"]
+            if (
+                not isinstance(request_id, str)
+                or not request_id
+                or not isinstance(status, str)
+                or status not in _REQUEST_STATUSES
+            ):
+                raise RuntimeError("malformed audit bundle from store")
+            events = payload["events"]
+            if not isinstance(events, list) or not events:
+                raise RuntimeError("malformed audit bundle from store")
+            for event in events:
+                if not isinstance(event, dict) or set(event) != {
+                    "seq",
+                    "status",
+                    "occurred_at",
+                    "chain_hash",
+                }:
+                    raise RuntimeError("malformed audit bundle from store")
+                if (
+                    not _is_count(event["seq"])
+                    or not isinstance(event["status"], str)
+                    or event["status"] not in _REQUEST_STATUSES
+                    or not isinstance(event["occurred_at"], str)
+                    or not event["occurred_at"]
+                    or not _is_hex_digest(event["chain_hash"])
+                ):
+                    raise RuntimeError("malformed audit bundle from store")
+            chain = payload["chain"]
+            if not isinstance(chain, dict) or set(chain) != {
+                "tenant_id",
+                "event_count",
+                "head",
+            }:
+                raise RuntimeError("malformed audit bundle from store")
+            if (
+                not isinstance(chain["tenant_id"], str)
+                or not chain["tenant_id"]
+                or not _is_count(chain["event_count"])
+                or chain["event_count"] < 1
+                or not _is_hex_digest(chain["head"])
+            ):
+                raise RuntimeError("malformed audit bundle from store")
+            anchors = payload["anchors"]
+            if not isinstance(anchors, list) or not anchors:
+                raise RuntimeError("malformed audit bundle from store")
+            for anchor in anchors:
+                if not isinstance(anchor, dict) or set(anchor) != {
+                    "seq",
+                    "anchor_hmac",
+                    "key_generation",
+                }:
+                    raise RuntimeError("malformed audit bundle from store")
+                key_generation = anchor["key_generation"]
+                if (
+                    not _is_count(anchor["seq"])
+                    or not _is_hex_digest(anchor["anchor_hmac"])
+                    # Null is the legacy generation-1 attribution; any
+                    # present value must be a positive integer.
+                    or not (
+                        key_generation is None or _is_count(key_generation)
+                    )
+                    or (isinstance(key_generation, int) and key_generation < 1)
+                ):
+                    raise RuntimeError("malformed audit bundle from store")
+            generations = payload["generations"]
+            if not isinstance(generations, list):
+                raise RuntimeError("malformed audit bundle from store")
+            for record in generations:
+                if not isinstance(record, dict) or set(record) != {
+                    "generation",
+                    "key_fingerprint",
+                    "effective_at",
+                }:
+                    raise RuntimeError("malformed audit bundle from store")
+                if (
+                    not _is_count(record["generation"])
+                    or record["generation"] < 1
+                    or not _is_hex_digest(record["key_fingerprint"])
+                    or not isinstance(record["effective_at"], str)
+                    or not record["effective_at"]
+                ):
+                    raise RuntimeError("malformed audit bundle from store")
 
         def _reply_listing(self, page: object) -> None:
             # Whitelist and re-render every field: even a store substitute
