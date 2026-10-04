@@ -398,15 +398,17 @@ missing, unreadable, incomplete or inconsistent snapshot and every copy
 or atomic-landing failure raises the fixed-text :class:`OSError`
 ``restore_failed``.
 
-Portable audit evidence bundles close the audit capability,
-storage-layer only like the rest of the orchestration and never routed
-over HTTP. :meth:`RequestStore.export_audit_bundle` freezes one
+Portable audit evidence bundles close the audit capability.
+:meth:`RequestStore.export_audit_bundle` freezes one
 request's currently settled chain -- the request id, the snapshot
 status, the event sequence, the chain summary, the per-event anchors
 and the secret-generation association, in that order -- into a single
 compact JSON line (exactly one trailing newline, never a float, a
 negative zero or a non-finite number) the caller can keep outside the
-database. The export is read-only, freezes the request chain head as
+database. The same text is also served verbatim by the read-only
+``GET /requests/{request_id}/audit-bundle`` HTTP endpoint; the offline
+verification and diagnosis companions below remain storage-layer only,
+never routed over HTTP. The export is read-only, freezes the request chain head as
 settled at that moment (later status events never change or invalidate
 an already exported bundle, and repeated exports at the same chain head
 are byte-identical), and carries only the business fields the proof
@@ -12022,7 +12024,9 @@ class RequestStore:
     def export_audit_bundle(self, tenant_id: str, request_id: str) -> str:
         """Export the request's settled chain as a portable evidence bundle.
 
-        Storage-layer only; never routed over HTTP. The bundle is a
+        Backs the read-only ``GET /requests/{request_id}/audit-bundle``
+        HTTP endpoint and remains a storage-layer method as well. The
+        bundle is a
         single compact JSON line (exactly one trailing newline) holding,
         in order, the request id, the snapshot status, the event
         sequence, the chain summary, the per-event anchors and the
