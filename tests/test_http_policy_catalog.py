@@ -1,11 +1,17 @@
-"""Tests for the read-only GET /policy-catalog/versions HTTP endpoint.
+"""Tests for the /policy-catalog/versions HTTP endpoints.
 
-The endpoint publishes the tenant's policy-catalog version history
-without any subject detail: the body is the verbatim single-line
-compact JSON text of ``RequestStore.audit_policy_catalog``. The read
-never creates or advances catalog versions, requests, attempts,
-tombstones, receipts or audit records. With auth enabled it requires
-the ``policy:read`` role and a matching principal tenant.
+GET publishes the tenant's policy-catalog version history without any
+subject detail: the body is the verbatim single-line compact JSON text
+of ``RequestStore.audit_policy_catalog``. The read never creates or
+advances catalog versions, requests, attempts, tombstones, receipts or
+audit records. With auth enabled it requires the ``policy:read`` role
+and a matching principal tenant.
+
+POST is the only catalog publication entry point: it freezes the body's
+``rules``/``exceptions`` catalog for the body's ``tenant_id`` as one
+immutable version and answers exactly ``version`` and ``effective_at``.
+With auth enabled it requires the ``policy:write`` role and the body
+tenant must be the principal's tenant.
 """
 
 import http.client
@@ -30,6 +36,13 @@ READ_A = {"token": "tok-read-a", "tenant_id": "tenant-a",
           "roles": ["request:read"]}
 POLICY_B = {"token": "tok-policy-b", "tenant_id": "tenant-b",
             "roles": ["policy:read"]}
+WRITE_A = {"token": "tok-write-a", "tenant_id": "tenant-a",
+           "roles": ["policy:write"]}
+WRITE_B = {"token": "tok-write-b", "tenant_id": "tenant-b",
+            "roles": ["policy:write"]}
+LEGACY_A = {"token": "tok-legacy-a", "tenant_id": "tenant-a",
+            "roles": ["request:submit", "request:read",
+                      "request:reconcile"]}
 
 INVALID_REQUEST = b'{"error":"invalid_request"}\n'
 UNAUTHORIZED = b'{"error":"unauthorized"}\n'
@@ -37,6 +50,7 @@ FORBIDDEN = b'{"error":"forbidden"}\n'
 NOT_FOUND = b'{"error":"not_found"}\n'
 METHOD_NOT_ALLOWED = b'{"error":"method_not_allowed"}\n'
 STORAGE_UNAVAILABLE = b'{"error":"storage_unavailable"}\n'
+POLICY_CATALOG_CONFLICT = b'{"error":"policy_catalog_conflict"}\n'
 
 PATH = "/policy-catalog/versions"
 
@@ -105,6 +119,29 @@ class _Base(unittest.TestCase):
         merged = {"X-Tenant-Id": tenant} if tenant is not None else {}
         merged.update(headers or {})
         return self._request("GET", path, headers=merged)
+
+    def _post(self, body, headers=None, path=PATH):
+        data = body if isinstance(body, bytes) else json.dumps(body).encode()
+        merged = {"Content-Length": str(len(data))}
+        merged.update(headers or {})
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        try:
+            conn.request("POST", path, body=data, headers=merged)
+            resp = conn.getresponse()
+            payload = resp.read()
+            return resp.status, dict(resp.getheaders()), payload
+        finally:
+            conn.close()
+
+    def _catalog(self, tenant="tenant-a", rules=None, exceptions=None):
+        return {
+            "tenant_id": tenant,
+            "rules": {"p-default": _rule("*", 30, "default retention")}
+            if rules is None else rules,
+            "exceptions": {"x-1": _exception("subject-1", "users*", 90,
+                                             "legal hold")}
+            if exceptions is None else exceptions,
+        }
 
     def _publish(self, tenant="tenant-a", rules=None, exceptions=None):
         return self.store.publish_policy_catalog(
@@ -223,10 +260,10 @@ class PolicyCatalogVersionsReadTests(_Base):
             self.assertEqual(body, INVALID_REQUEST)
 
     def test_unsupported_methods_are_405(self):
-        for method in ("POST", "PUT", "DELETE", "PATCH", "OPTIONS"):
+        for method in ("PUT", "DELETE", "PATCH", "OPTIONS"):
             status, headers, body = self._request(method, PATH)
             self.assertEqual(status, 405, method)
-            self.assertEqual(headers["Allow"], "GET")
+            self.assertEqual(headers["Allow"], "GET, POST")
             self.assertEqual(body, METHOD_NOT_ALLOWED)
 
     def test_unknown_neighbour_paths_are_404(self):
@@ -268,6 +305,258 @@ class PolicyCatalogVersionsReadTests(_Base):
                 self.assertEqual(body, STORAGE_UNAVAILABLE)
             finally:
                 conn.close()
+
+
+class PolicyCatalogVersionsPublishTests(_Base):
+    def test_first_publish_is_version_one(self):
+        status, headers, body = self._post(self._catalog())
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "application/json")
+        payload = json.loads(body)
+        self.assertEqual(list(payload), ["version", "effective_at"])
+        self.assertEqual(payload["version"], 1)
+        self.assertIsInstance(payload["effective_at"], str)
+        self.assertTrue(payload["effective_at"])
+        self.assertEqual(body, json.dumps(payload, separators=(",", ":"))
+                         .encode() + b"\n")
+        # The version is readable through the existing history summary.
+        history = json.loads(self._get()[2])
+        self.assertEqual([v["version"] for v in history["versions"]], [1])
+
+    def test_identical_republish_reuses_first_version_and_writes_nothing(self):
+        _, _, first = self._post(self._catalog())
+        # A different key order in the body is the same normalized catalog.
+        shuffled = {
+            "exceptions": self._catalog()["exceptions"],
+            "tenant_id": "tenant-a",
+            "rules": self._catalog()["rules"],
+        }
+        for body in (self._catalog(), shuffled):
+            status, _, repeated = self._post(body)
+            self.assertEqual(status, 200)
+            self.assertEqual(repeated, first)
+        history = json.loads(self.store.audit_policy_catalog("tenant-a"))
+        self.assertEqual(len(history["versions"]), 1)
+
+    def test_different_catalog_takes_next_consecutive_version(self):
+        _, _, first = self._post(self._catalog())
+        other = self._catalog(rules={
+            "p-default": _rule("*", 30, "default retention"),
+            "p-users": _rule("users*", 14, "shorter retention"),
+        })
+        status, _, body = self._post(other)
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["version"], 2)
+        # The first catalog still replays its first version afterwards.
+        status, _, replay = self._post(self._catalog())
+        self.assertEqual(status, 200)
+        self.assertEqual(replay, first)
+        history = json.loads(self.store.audit_policy_catalog("tenant-a"))
+        self.assertEqual([v["version"] for v in history["versions"]], [1, 2])
+
+    def test_tenants_publish_independently(self):
+        self._post(self._catalog(tenant="tenant-a"))
+        status, _, body = self._post(self._catalog(tenant="tenant-b"))
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["version"], 1)
+
+    def test_concurrent_identical_publications_land_once(self):
+        results = []
+
+        def publish():
+            results.append(self._post(self._catalog()))
+
+        threads = [threading.Thread(target=publish) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertTrue(all(status == 200 for status, _, _ in results))
+        self.assertEqual(len({body for _, _, body in results}), 1)
+        history = json.loads(self.store.audit_policy_catalog("tenant-a"))
+        self.assertEqual(len(history["versions"]), 1)
+
+    def test_concurrent_different_publications_have_a_single_winner(self):
+        catalog_a = self._catalog(rules={
+            "p-default": _rule("*", 30, "default retention"),
+            "p-a": _rule("a*", 1, "catalog a"),
+        })
+        catalog_b = self._catalog(rules={
+            "p-default": _rule("*", 30, "default retention"),
+            "p-b": _rule("b*", 2, "catalog b"),
+        })
+        results = []
+
+        def publish(catalog):
+            results.append(self._post(catalog))
+
+        threads = [threading.Thread(target=publish, args=(catalog,))
+                   for catalog in (catalog_a, catalog_b) * 5]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        for status, _, body in results:
+            self.assertIn(status, (200, 409))
+            if status == 409:
+                self.assertEqual(body, POLICY_CATALOG_CONFLICT)
+        self.assertTrue(any(status == 200 for status, _, _ in results))
+        self.assertTrue(any(status == 409 for status, _, _ in results))
+        # The loser's catalog never landed: every stored version
+        # deserializes and the sequence stays gap-free.
+        history = json.loads(self.store.audit_policy_catalog("tenant-a"))
+        versions = [v["version"] for v in history["versions"]]
+        self.assertEqual(versions, list(range(1, len(versions) + 1)))
+
+    def test_invalid_bodies_are_400_and_write_nothing(self):
+        valid_rules = {"p-default": _rule("*", 30, "default retention")}
+        bad_bodies = [
+            b"not json",
+            b"[1, 2]",
+            b"null",
+            b'"text"',
+            {"tenant_id": "tenant-a", "rules": valid_rules},
+            {"tenant_id": "tenant-a", "exceptions": {}},
+            {"rules": valid_rules, "exceptions": {}},
+            dict(self._catalog(), extra=1),
+            self._catalog(tenant=""),
+            self._catalog(tenant="   "),
+            self._catalog(tenant=123),
+            self._catalog(rules=[]),
+            self._catalog(exceptions=[]),
+            # Illegal selector.
+            self._catalog(rules={"p": _rule("Users*", 1, "r")}),
+            self._catalog(rules={"p": _rule("users", 1, "r")}),
+            # Negative, boolean and non-integer day counts.
+            self._catalog(rules={"p": _rule("*", -1, "r")}),
+            self._catalog(rules={"p": _rule("*", True, "r")}),
+            self._catalog(rules={"p": _rule("*", 1.5, "r")}),
+            # Empty reason.
+            self._catalog(rules={"p": _rule("*", 1, "")}),
+            # Missing whole-data default rule.
+            self._catalog(rules={"p": _rule("users*", 1, "r")}),
+            # A rule entry with missing or extra keys.
+            self._catalog(rules={"p": {"selector": "*", "days": 1}}),
+            self._catalog(rules={"p": dict(_rule("*", 1, "r"), extra=1)}),
+            # policy_id duplicated across rules and exceptions.
+            self._catalog(
+                rules={"p": _rule("*", 1, "r")},
+                exceptions={"p": _exception("s", "*", 1, "r")},
+            ),
+            # Exception with a blank subject.
+            self._catalog(exceptions={"x": _exception("  ", "*", 1, "r")}),
+        ]
+        for body in bad_bodies:
+            status, _, payload = self._post(body)
+            self.assertEqual(status, 400, body)
+            self.assertEqual(payload, INVALID_REQUEST)
+        self.assertEqual(
+            self.store.audit_policy_catalog("tenant-a"),
+            '{"versions":[]}\n'
+        )
+
+    def test_oversized_body_is_400(self):
+        catalog = self._catalog(
+            rules={"p-default": _rule("*", 30, "x" * (1 << 20))}
+        )
+        status, _, body = self._post(catalog)
+        self.assertEqual(status, 400)
+        self.assertEqual(body, INVALID_REQUEST)
+
+    def test_unwritable_database_is_503(self):
+        blocker = os.path.join(self._tmp.name, "blocker")
+        with open(blocker, "w", encoding="utf-8") as handle:
+            handle.write("not a directory")
+        deferred = DeferredRequestStore(os.path.join(blocker, "evidence.db"))
+        with _Server(deferred) as fixture:
+            conn = http.client.HTTPConnection(
+                "127.0.0.1", fixture.port, timeout=10
+            )
+            try:
+                data = json.dumps(self._catalog()).encode()
+                conn.request("POST", PATH, body=data,
+                             headers={"Content-Length": str(len(data))})
+                resp = conn.getresponse()
+                body = resp.read()
+                self.assertEqual(resp.status, 503)
+                self.assertEqual(body, STORAGE_UNAVAILABLE)
+            finally:
+                conn.close()
+
+    def test_publish_does_not_touch_requests_or_receipts(self):
+        self._post(self._catalog())
+        self.assertEqual(
+            self.store.list_requests("tenant-a"),
+            {"items": [], "next_cursor": None},
+        )
+
+
+class PolicyCatalogVersionsPublishAuthTests(_Base):
+    auth = AuthConfig([POLICY_A, WRITE_A, WRITE_B, LEGACY_A])
+
+    def _auth_post(self, token, body=None):
+        headers = {}
+        if token is not None:
+            headers["Authorization"] = token
+        return self._post(self._catalog() if body is None else body,
+                          headers=headers)
+
+    def test_missing_malformed_or_unknown_token_is_401(self):
+        for header in (None, "tok-write-a", "Bearer", "Bearer ",
+                       "Basic tok-write-a", "Bearer unknown-token"):
+            status, _, body = self._auth_post(header)
+            self.assertEqual(status, 401, header)
+            self.assertEqual(body, UNAUTHORIZED)
+
+    def test_missing_policy_write_role_is_403(self):
+        for token in ("Bearer tok-policy-a", "Bearer tok-legacy-a"):
+            status, _, body = self._auth_post(token)
+            self.assertEqual(status, 403, token)
+            self.assertEqual(body, FORBIDDEN)
+
+    def test_body_tenant_other_than_principal_is_403(self):
+        status, _, body = self._auth_post("Bearer tok-write-b")
+        self.assertEqual(status, 403)
+        self.assertEqual(body, FORBIDDEN)
+        # The rejected cross-tenant call published nothing.
+        self.assertEqual(
+            self.store.audit_policy_catalog("tenant-a"),
+            '{"versions":[]}\n'
+        )
+
+    def test_principal_publishes_own_tenant(self):
+        status, _, body = self._auth_post("Bearer tok-write-a")
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["version"], 1)
+        status, _, body = self._auth_post(
+            "Bearer tok-write-b", self._catalog(tenant="tenant-b")
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body)["version"], 1)
+
+    def test_auth_precedes_json_validation(self):
+        # An unknown token with a malformed body is 401, never 400.
+        status, _, body = self._post(b"garbage",
+                                     headers={"Authorization": "Bearer nope"})
+        self.assertEqual(status, 401)
+        self.assertEqual(body, UNAUTHORIZED)
+        # A missing role with a malformed body is 403, never 400.
+        status, _, body = self._post(
+            b"garbage", headers={"Authorization": "Bearer tok-policy-a"}
+        )
+        self.assertEqual(status, 403)
+        self.assertEqual(body, FORBIDDEN)
+
+    def test_error_bodies_never_echo_token_or_catalog_detail(self):
+        bodies = [
+            self._auth_post("Bearer tok-write-b")[2],
+            self._auth_post("Bearer unknown-token")[2],
+            self._auth_post("Bearer tok-policy-a")[2],
+        ]
+        for body in bodies:
+            for leaked in (b"tok-", b"subject-1", b"users*",
+                           b"legal hold", b"policy"):
+                self.assertNotIn(leaked, body)
 
 
 class PolicyCatalogVersionsAuthTests(_Base):
@@ -343,6 +632,13 @@ class PolicyCatalogAuthConfigTests(unittest.TestCase):
         self.assertEqual(
             config.authenticate("tok-policy-a"),
             ("tenant-a", frozenset({"policy:read"})),
+        )
+
+    def test_policy_write_role_is_accepted(self):
+        config = self._load([WRITE_A])
+        self.assertEqual(
+            config.authenticate("tok-write-a"),
+            ("tenant-a", frozenset({"policy:write"})),
         )
 
     def test_existing_roles_still_load_without_policy_read(self):
