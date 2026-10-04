@@ -565,6 +565,7 @@ from datetime import datetime, timedelta, timezone
 __all__ = [
     "RequestStore",
     "restore_backup",
+    "run_backup",
     "read_request_status",
     "IdempotencyConflict",
     "RequestNotFound",
@@ -1842,6 +1843,10 @@ def _decide_retention_scopes(
 
 _BACKUP_CONFLICT_MESSAGE = "backup conflict"
 
+# Staged snapshots live beside the target under this prefix so a failed
+# backup is trivially recognizable and never impersonates a database.
+_BACKUP_STAGING_PREFIX = ".forgetting-evidence-backup-"
+
 # Every table the schema creates. A snapshot missing any of them is not
 # a usable store and must never be landed as a backup target.
 _BACKUP_TABLES = frozenset({
@@ -1887,6 +1892,83 @@ def _validate_backup_snapshot(conn: sqlite3.Connection) -> None:
         raise _storage_failure() from None
     if not _BACKUP_TABLES.issubset(names) or checks != [("ok",)]:
         raise _storage_failure() from None
+
+
+def _validate_backup_target(
+    target_path: str | os.PathLike[str],
+) -> tuple[str, str]:
+    """Validate a backup target path and return it with its directory.
+
+    An empty, non-string, in-memory or NUL-bearing path, or a path that
+    names a directory, is caller error (:class:`ValueError`) before
+    anything is touched; an already existing target raises
+    :class:`BackupConflict` and is never overwritten; a missing parent
+    directory is the fixed-text :class:`OSError` storage failure -- the
+    directory is never created.
+    """
+    if isinstance(target_path, os.PathLike):
+        target_path = os.fspath(target_path)
+    if not isinstance(target_path, str) or not target_path:
+        raise ValueError("backup path must be a non-empty string")
+    if target_path == ":memory:" or "\x00" in target_path:
+        raise ValueError("backup path must be a usable file path")
+    # A path that already names a directory can never receive the
+    # snapshot file; that is caller error, not a conflict.
+    if os.path.isdir(target_path):
+        raise ValueError("backup path must be a usable file path")
+    # An existing target is never overwritten nor treated as a usable
+    # snapshot: the caller must choose a fresh path.
+    if os.path.lexists(target_path):
+        raise BackupConflict(_BACKUP_CONFLICT_MESSAGE)
+    # The directory must already exist; the backup entry points never
+    # create directories.
+    parent = os.path.dirname(os.path.abspath(target_path))
+    if not os.path.isdir(parent):
+        raise _storage_failure()
+    return target_path, parent
+
+
+def _land_validated_backup(
+    target_path: str,
+    parent: str,
+    populate: "Callable[[str], None]",
+) -> str:
+    """Stage, validate and atomically land a snapshot at *target_path*.
+
+    *populate* receives the staged temporary path and must fill it with
+    the snapshot and validate it, raising the fixed-text :class:`OSError`
+    on any failure. The staged file lives beside the target so a failure
+    never leaves a partial or invalid target behind; the atomic link
+    lets exactly one of concurrent backups land, and the loser leaves
+    the winner's file untouched. The temporary file is always removed.
+    """
+    try:
+        fd, temp_path = tempfile.mkstemp(
+            prefix=_BACKUP_STAGING_PREFIX, dir=parent
+        )
+    except OSError:
+        raise _storage_failure() from None
+    try:
+        os.close(fd)
+        populate(temp_path)
+        try:
+            # Atomic land: the link fails if a concurrent backup (or
+            # anyone else) claimed the target first, and the loser
+            # leaves the winner's file untouched.
+            os.link(temp_path, target_path)
+        except FileExistsError:
+            raise BackupConflict(_BACKUP_CONFLICT_MESSAGE) from None
+        except OSError:
+            raise _storage_failure() from None
+    finally:
+        # The temporary file is always removed: on failure so no stray
+        # artifact remains, on success because the target now owns the
+        # same content.
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+    return target_path
 
 
 # Fixed, detail-free text for every restore conflict and failure. Neither
@@ -2059,6 +2141,89 @@ def restore_backup(
             os.unlink(temp_path)
         except OSError:
             pass
+
+
+def run_backup(
+    db_path: str | os.PathLike[str],
+    target_path: str | os.PathLike[str],
+) -> str:
+    """Export a transaction-consistent snapshot of an existing database.
+
+    This is the strictly read-only export behind the ``backup`` command:
+    it delivers the same snapshot semantics as
+    :meth:`RequestStore.backup_to` -- requests, statuses, execution
+    attempts, receipts, audit anchors and inspection bookkeeping copied
+    as one consistent view -- but it never opens the source for writes.
+    The database file is opened read-only, so it is never created,
+    migrated, repaired or otherwise changed: records, leases, execution
+    history, the audit chain and inspection cursors are left untouched,
+    and a missing, unreadable or corrupt source surfaces as the
+    fixed-text :class:`OSError` storage failure.
+
+    The target rules mirror :meth:`RequestStore.backup_to` exactly: the
+    directory must already exist (it is never created), the target must
+    not exist yet, the copy is staged in a temporary file in the same
+    directory, validated -- openable, complete table structure, SQLite
+    consistency check -- and only then atomically landed, so no failure
+    leaves a target or staged file behind and concurrent backups to the
+    same target let exactly one land. On success the landed target path
+    is returned; the snapshot is a plain SQLite file a fresh
+    :class:`RequestStore` reopens with the same verification and summary
+    conclusions under the same anchor secrets.
+
+    An empty, non-string, in-memory or NUL-bearing *db_path* or
+    *target_path*, or a target naming a directory, raises
+    :class:`ValueError` without touching anything; an existing target,
+    or one claimed first by a concurrent backup, raises
+    :class:`BackupConflict`; an unusable source, a missing or unwritable
+    directory, a staging failure or a failed snapshot validation raises
+    the fixed-text :class:`OSError`. Neither the paths nor the
+    underlying error ever leak into the exception text.
+    """
+    if isinstance(db_path, os.PathLike):
+        db_path = os.fspath(db_path)
+    if not isinstance(db_path, str) or not db_path:
+        raise ValueError("storage path must be a non-empty string")
+    if db_path == ":memory:" or "\x00" in db_path:
+        raise ValueError("storage path must be a usable file path")
+    target_path, parent = _validate_backup_target(target_path)
+
+    def _populate(temp_path: str) -> None:
+        # Open the existing database read-only: a missing path fails
+        # instead of being created, and no schema, repair or
+        # bookkeeping write can ever occur.
+        uri = pathlib.Path(os.path.abspath(db_path)).as_uri() + "?mode=ro"
+        try:
+            source = sqlite3.connect(
+                uri, uri=True, timeout=_BUSY_TIMEOUT_MS / 1000
+            )
+        except sqlite3.Error:
+            raise _storage_failure() from None
+        try:
+            try:
+                dest = sqlite3.connect(
+                    temp_path,
+                    timeout=_BUSY_TIMEOUT_MS / 1000,
+                    check_same_thread=False,
+                )
+            except sqlite3.Error:
+                raise _storage_failure() from None
+            try:
+                try:
+                    # The backup API copies a transaction-consistent
+                    # view: a concurrently committing transaction is
+                    # either fully inside the snapshot or fully outside
+                    # it.
+                    source.backup(dest)
+                except sqlite3.Error:
+                    raise _storage_failure() from None
+                _validate_backup_snapshot(dest)
+            finally:
+                dest.close()
+        finally:
+            source.close()
+
+    return _land_validated_backup(target_path, parent, _populate)
 
 
 def read_request_status(
@@ -12007,54 +12172,10 @@ class RequestStore:
         # Validate the target before touching the filesystem: an empty
         # or non-string path is caller error (ValueError), never a
         # storage fault, and the source must stay untouched.
-        if isinstance(target_path, os.PathLike):
-            target_path = os.fspath(target_path)
-        if not isinstance(target_path, str) or not target_path:
-            raise ValueError("backup path must be a non-empty string")
-        if target_path == ":memory:" or "\x00" in target_path:
-            raise ValueError("backup path must be a usable file path")
-        # A path that already names a directory can never receive the
-        # snapshot file; that is caller error, not a conflict.
-        if os.path.isdir(target_path):
-            raise ValueError("backup path must be a usable file path")
-        # An existing target is never overwritten nor treated as a
-        # usable snapshot: the caller must choose a fresh path.
-        if os.path.lexists(target_path):
-            raise BackupConflict(_BACKUP_CONFLICT_MESSAGE)
-        # The directory must already exist; unlike the constructor, the
-        # backup entry point never creates directories.
-        parent = os.path.dirname(os.path.abspath(target_path))
-        if not os.path.isdir(parent):
-            raise _storage_failure()
+        target_path, parent = _validate_backup_target(target_path)
         # Stage the snapshot in a sibling temporary file so a failure
         # can never leave a partial or invalid target behind.
-        try:
-            fd, temp_path = tempfile.mkstemp(
-                prefix=".forgetting-evidence-backup-", dir=parent
-            )
-        except OSError:
-            raise _storage_failure() from None
-        try:
-            os.close(fd)
-            self._backup_into_temp(temp_path)
-            try:
-                # Atomic land: the link fails if a concurrent backup (or
-                # anyone else) claimed the target first, and the loser
-                # leaves the winner's file untouched.
-                os.link(temp_path, target_path)
-            except FileExistsError:
-                raise BackupConflict(_BACKUP_CONFLICT_MESSAGE) from None
-            except OSError:
-                raise _storage_failure() from None
-        finally:
-            # The temporary file is always removed: on failure so no
-            # stray artifact remains, on success because the target now
-            # owns the same content.
-            try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
-        return target_path
+        return _land_validated_backup(target_path, parent, self._backup_into_temp)
 
     def _backup_into_temp(self, temp_path: str) -> None:
         """Copy this store's database into the staged file and validate it.

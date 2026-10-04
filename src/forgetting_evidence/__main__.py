@@ -9,12 +9,14 @@ from .httpapi import (
     load_auth_config,
 )
 from .requests import (
+    BackupConflict,
     RequestNotFound,
     RestoreConflict,
     read_audit_health,
     read_request_evidence,
     read_request_status,
     restore_backup,
+    run_backup,
 )
 
 _USAGE = "usage: python -m forgetting_evidence health"
@@ -32,6 +34,8 @@ _STATUS_USAGE = "status_usage"
 _EVIDENCE_USAGE = "evidence_usage"
 # Audit-health shares the same rule: fixed, detail-free markers only.
 _AUDIT_HEALTH_USAGE = "audit_health_usage"
+# Backup shares the same rule: fixed, detail-free markers only.
+_BACKUP_USAGE = "backup_usage"
 
 _FLAG_ALIASES = {
     "--db": "db",
@@ -300,6 +304,34 @@ def _run_serve(args: list[str]) -> int:
     return 0
 
 
+def _run_backup(args: list[str]) -> int:
+    # Exactly the source database and the snapshot target are accepted;
+    # any other arity is the fixed usage marker at exit 2.
+    if len(args) != 2:
+        print(_BACKUP_USAGE, file=sys.stderr)
+        return 2
+    database_path, snapshot_path = args
+    # Strictly read-only like status: the source database is never
+    # created, migrated, repaired or otherwise changed, and the target
+    # is staged, validated and atomically landed by the storage layer.
+    # Every storage problem -- a missing, unreadable or corrupt source,
+    # an unusable target path, a missing directory, a staging failure or
+    # a failed snapshot validation -- collapses to the single fixed
+    # failure marker. The paths and any underlying error are never
+    # printed, and the JSON line is only emitted once the snapshot has
+    # landed.
+    try:
+        run_backup(database_path, snapshot_path)
+    except BackupConflict:
+        print("backup_conflict", file=sys.stderr)
+        return 3
+    except (OSError, ValueError):
+        print("backup_failed", file=sys.stderr)
+        return 2
+    print(json.dumps({"status": "backed_up"}, separators=(",", ":")))
+    return 0
+
+
 def _run_restore(args: list[str]) -> int:
     # Exactly the snapshot and the destination database are accepted;
     # any other arity is the fixed usage marker at exit 2.
@@ -330,6 +362,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_serve(args[1:])
     if args and args[0] == "restore":
         return _run_restore(args[1:])
+    if args and args[0] == "backup":
+        return _run_backup(args[1:])
     if args and args[0] == "status":
         return _run_status(args[1:])
     if args and args[0] == "evidence":
