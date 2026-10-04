@@ -503,7 +503,10 @@ in the error, the result or the log.
 :meth:`RequestStore.read_policy_catalog` and
 :meth:`RequestStore.audit_policy_catalog` add versioned policy
 catalog management, storage-layer only like the rest of the
-capability and never routed over HTTP. A publication takes the
+capability; only the subject-free version history of
+:meth:`audit_policy_catalog` is also routed over HTTP (the read-only
+``GET /policy-catalog/versions`` endpoint), while publication and
+catalog reads stay off HTTP. A publication takes the
 tenant, the ordinary rule catalog and the subject exception catalog,
 normalizes both with the existing retention semantics (keeping rule
 priority and the policy-number ordering) and freezes them as one
@@ -12824,8 +12827,10 @@ class RequestStore:
     def audit_policy_catalog(self, tenant_id: str) -> str:
         """Return the tenant's catalog version history as one JSON line.
 
-        Storage-layer only; never routed over HTTP and never a health
-        command. Strictly read-only: it never repairs, backfills,
+        Backs the read-only ``GET /policy-catalog/versions`` HTTP
+        endpoint (which renders this text verbatim) and remains a
+        storage-layer method; never a health command. Strictly
+        read-only: it never repairs, backfills,
         recomputes or overwrites any catalog and never changes request
         state, execution records or the audit chain. The result is one
         compact JSON line with exactly one trailing newline holding
