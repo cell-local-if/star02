@@ -1,7 +1,7 @@
 """HTTP layer for deletion-request acceptance, lookup, observation and
 single-request reconciliation.
 
-The service exposes seven business endpoints:
+The service exposes eight business endpoints:
 
 * ``POST /requests`` -- accept a deletion request for a tenant. The JSON
   body must carry non-empty ``tenant_id``, ``subject_id`` and
@@ -57,6 +57,23 @@ The service exposes seven business endpoints:
   fault or a corrupt ledger answers 503 and never a partial page or a
   pseudo digest. The read never advances state, never creates an
   attempt or a tombstone and never changes the audit chain.
+* ``GET /policy-catalog/versions`` -- read-only publication of the
+  tenant's policy-catalog version history, without any subject detail.
+  The tenant follows the existing ``X-Tenant-Id``/query rule; the query
+  string accepts no parameter other than ``tenant_id`` -- a duplicated
+  key, an unknown parameter or an empty or malformed tenant answers 400.
+  The body is the verbatim single-line compact UTF-8 JSON text (with its
+  single trailing newline) produced by
+  :meth:`RequestStore.audit_policy_catalog`: exactly ``versions`` at the
+  top level, versions in ascending order, each carrying exactly
+  ``version``, ``effective_at``, ``rule_count``, ``exception_count`` and
+  ``status`` -- never a policy id, selector, reason, subject or any raw
+  catalog content. The read never creates or advances a catalog version,
+  request, attempt, tombstone, receipt or audit record, so repeated
+  reads and reads after a restart return the same snapshot. A tenant
+  without publications answers 200 with an empty ``versions`` array; a
+  corrupt catalog or any storage failure answers 503 and never a
+  partial history or a fabricated summary.
 * ``POST /requests/{request_id}/reconcile`` -- reconcile exactly one
   request's execution record against its persisted state by calling the
   storage layer's :meth:`RequestStore.reconcile_execution`. The endpoint
@@ -94,15 +111,17 @@ audit inspection (:meth:`RequestStore.audit_inspection` and
 :meth:`RequestStore.audit_inspection_summary`) exist only on
 the storage layer and are deliberately not exposed over HTTP: over HTTP
 the service opens request acceptance, the acceptance-receipt lookup, the
-read-only tenant-scoped listing, the three read-only observation reads
-and the single-request execution reconciliation described above. The
+read-only tenant-scoped listing, the three read-only observation reads,
+the single-request execution reconciliation and the read-only
+policy-catalog version history described above. The
 current-status lookup (:meth:`RequestStore.get_status`), the
 tenant-scoped listing (:meth:`RequestStore.list_requests`), the
 execution log (:meth:`RequestStore.get_execution_log`), the tombstone
-page read (:meth:`RequestStore.page_deletion_tombstones`) and the
+page read (:meth:`RequestStore.page_deletion_tombstones`), the
 single-request reconciliation
-(:meth:`RequestStore.reconcile_execution`) back their HTTP endpoints but
-remain storage-layer methods as well.
+(:meth:`RequestStore.reconcile_execution`) and the catalog version
+history (:meth:`RequestStore.audit_policy_catalog`) back their HTTP
+endpoints but remain storage-layer methods as well.
 
 Success responses are a single line of JSON followed by a trailing
 newline. Acceptance, receipt lookup, the status read and a successful
@@ -115,7 +134,10 @@ rendering exactly ``request_id``, ``status`` and ``created_at``. The
 tombstone page read renders exactly ``request_id``, ``tombstones``,
 ``recorded_at``, ``evidence_digest`` and ``next_cursor``, each
 tombstone rendering exactly ``adapter_id``, ``scope``, ``operation_id``,
-``outcome``, ``proof_digest`` and ``recorded_at``.
+``outcome``, ``proof_digest`` and ``recorded_at``. The policy-catalog
+history read renders exactly ``versions``, each version rendering
+exactly ``version``, ``effective_at``, ``rule_count``,
+``exception_count`` and ``status``.
 Error responses are single-line JSON objects with exactly one key,
 ``error``, holding a stable error code:
 
@@ -137,7 +159,13 @@ each of the five GET endpoints requires ``request:read`` and the target
 tenant follows the existing ``X-Tenant-Id``/query rule; the
 single-request reconciliation ``POST /requests/{request_id}/reconcile``
 requires ``request:reconcile`` and its target tenant follows the same
-existing ``X-Tenant-Id``/query rule. Authentication runs after
+existing ``X-Tenant-Id``/query rule; the policy-catalog history
+``GET /policy-catalog/versions`` requires ``policy:read`` and its
+target tenant follows the same existing ``X-Tenant-Id``/query rule.
+The configuration keeps accepting the ``request:submit``,
+``request:read`` and ``request:reconcile`` roles alone: a principal
+without ``policy:read`` simply cannot use the catalog endpoint, and an
+existing configuration without it never fails to load. Authentication runs after
 path/method routing (unknown paths stay 404, unsupported methods stay
 405) but before payload validation and any storage access.
 Tokens, roles and the configuration never enter a response, a raised
@@ -173,6 +201,7 @@ _log = logging.getLogger(__name__)
 
 _COLLECTION_PATH = "/requests"
 _ITEM_PATH_PREFIX = "/requests/"
+_POLICY_CATALOG_VERSIONS_PATH = "/policy-catalog/versions"
 _STATUS_RESOURCE = "status"
 _EXECUTION_LOG_RESOURCE = "execution-log"
 _TOMBSTONES_RESOURCE = "tombstones"
@@ -187,7 +216,10 @@ _MAX_BODY_BYTES = 1 << 20  # 1 MiB
 _ROLE_SUBMIT = "request:submit"
 _ROLE_READ = "request:read"
 _ROLE_RECONCILE = "request:reconcile"
-_ALLOWED_ROLES = frozenset({_ROLE_SUBMIT, _ROLE_READ, _ROLE_RECONCILE})
+_ROLE_POLICY_READ = "policy:read"
+_ALLOWED_ROLES = frozenset(
+    {_ROLE_SUBMIT, _ROLE_READ, _ROLE_RECONCILE, _ROLE_POLICY_READ}
+)
 
 # Terminal attempt results, mirrored from the execution state machine so a
 # corrupt or substituted store can never serialise another value.
@@ -209,6 +241,12 @@ _LIST_LIMIT_RE = re.compile(r"^[0-9]+$")
 # keeps its historical header-or-query resolution and is validated
 # separately.
 _TOMBSTONES_QUERY_PARAMS = frozenset({"tenant_id", "cursor", "limit"})
+
+# The query parameters the GET /policy-catalog/versions history read
+# understands: only ``tenant_id``, which keeps its historical
+# header-or-query resolution and is validated separately. Any other
+# parameter, or any duplicated key, is an invalid request.
+_POLICY_CATALOG_QUERY_PARAMS = frozenset({"tenant_id"})
 
 # The only outcomes a deletion tombstone may serialise, mirrored from
 # the storage layer so a corrupt or substituted store can never
@@ -279,8 +317,8 @@ def load_auth_config(path: str) -> AuthConfig:
     The file must be a UTF-8 JSON object with a ``principals`` array;
     each principal is an object carrying non-empty ``token`` and
     ``tenant_id`` strings plus a non-empty ``roles`` array of distinct
-    values drawn from ``request:submit``, ``request:read`` and
-    ``request:reconcile``. Tokens must be unique across principals. Any
+    values drawn from ``request:submit``, ``request:read``,
+    ``request:reconcile`` and ``policy:read``. Tokens must be unique across principals. Any
     deviation -- including an unreadable or non-UTF-8 file, malformed
     JSON, a missing ``principals`` key or a principal missing/typing-wrong
     one of the required keys -- raises :class:`AuthConfigError` so the
@@ -484,6 +522,11 @@ class DeferredRequestStore:
         # routed over HTTP and never writes anything.
         return self._ready().audit_inspection_summary(tenant_id, batch_id)
 
+    def audit_policy_catalog(self, tenant_id):
+        # Serves the read-only GET /policy-catalog/versions endpoint;
+        # strictly read-only, like get_status.
+        return self._ready().audit_policy_catalog(tenant_id)
+
 
 def _normalize_request_id(value: str) -> str:
     """Validate a request id as a UUID and return its canonical text."""
@@ -538,6 +581,8 @@ def make_handler(
             path = urlsplit(self.path).path
             if path == _COLLECTION_PATH:
                 return "collection", None
+            if path == _POLICY_CATALOG_VERSIONS_PATH:
+                return "policy_catalog_versions", None
             if path.startswith(_ITEM_PATH_PREFIX):
                 segment = path[len(_ITEM_PATH_PREFIX) :]
                 # Empty or nested segments do not name a request.
@@ -734,6 +779,10 @@ def make_handler(
                 # The tenant-scoped, paginated listing of accepted
                 # requests; read-only like the item observations.
                 self._serve_list()
+                return
+            if kind == "policy_catalog_versions":
+                # The read-only policy-catalog version history.
+                self._serve_policy_catalog_versions()
                 return
             if kind == "reconcile":
                 # The reconciliation action is POST-only.
@@ -1077,6 +1126,62 @@ def make_handler(
                 raise _BadRequest("duplicate status")
             return statuses
 
+        def _serve_policy_catalog_versions(self) -> None:
+            # The catalog history shares the read endpoints'
+            # authorization and tenant resolution: authentication first,
+            # then the tenant (header or query) and its match against
+            # the principal, then the query-string gate, then storage.
+            principal = self._authorize(_ROLE_POLICY_READ)
+            if principal is None:
+                return
+            try:
+                tenant_id = self._tenant_id()
+            except _BadRequest:
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            if not self._tenant_allowed(principal[0], tenant_id):
+                return
+            try:
+                self._policy_catalog_query_gate()
+            except _BadRequest:
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            try:
+                text = store.audit_policy_catalog(tenant_id)
+            except ValueError:
+                # Defence in depth: the HTTP validation above is
+                # authoritative, but a rejected store call reads nothing
+                # and maps to the same client error.
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            except _StorageUnavailable:
+                _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
+                self._reply_error(503, _STORAGE_UNAVAILABLE)
+                return
+            except (sqlite3.Error, RuntimeError, OSError):
+                # A corrupt catalog or an unusable database surfaces as
+                # the fixed-text OSError; no partial history or
+                # fabricated summary is ever rendered.
+                _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
+                self._reply_error(503, _STORAGE_UNAVAILABLE)
+                return
+            self._reply_policy_catalog_audit(text)
+
+        def _policy_catalog_query_gate(self) -> None:
+            """Reject any query parameter other than a single ``tenant_id``.
+
+            The history read takes no business parameters; ``tenant_id``
+            keeps its historical header-or-query resolution in
+            ``_tenant_id``. An unknown parameter or any duplicated key
+            (including ``tenant_id`` itself) is a bad request.
+            """
+            params = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+            if not set(params) <= _POLICY_CATALOG_QUERY_PARAMS:
+                raise _BadRequest("unknown query parameter")
+            for values in params.values():
+                if len(values) != 1:
+                    raise _BadRequest("duplicate query parameter")
+
         # -- input parsing ---------------------------------------------
 
         def _tenant_id(self) -> str:
@@ -1408,6 +1513,72 @@ def make_handler(
                 + "\n"
             ).encode("utf-8")
             self._write_body(200, body)
+
+        def _reply_policy_catalog_audit(self, text: object) -> None:
+            # The body is the store's verbatim single-line compact JSON
+            # text with its single trailing newline. It is still
+            # re-validated field by field before it is emitted: a
+            # corrupt or substituted store must never serialise a policy
+            # id, a selector, a reason, a subject or any raw catalog
+            # content into the body, and a malformed history surfaces as
+            # the stable storage code, never as a partial summary.
+            if (
+                not isinstance(text, str)
+                or not text.endswith("\n")
+                or "\n" in text[:-1]
+                or "\r" in text
+            ):
+                raise RuntimeError("malformed catalog audit from store")
+            try:
+                payload = json.loads(text[:-1])
+            except ValueError:
+                raise RuntimeError("malformed catalog audit from store") from None
+            if not isinstance(payload, dict) or set(payload) != {"versions"}:
+                raise RuntimeError("malformed catalog audit from store")
+            versions = payload["versions"]
+            if not isinstance(versions, list):
+                raise RuntimeError("malformed catalog audit from store")
+            for expected, entry in enumerate(versions, start=1):
+                if not isinstance(entry, dict) or set(entry) != {
+                    "version",
+                    "effective_at",
+                    "rule_count",
+                    "exception_count",
+                    "status",
+                }:
+                    raise RuntimeError("malformed catalog audit from store")
+                version = entry["version"]
+                effective_at = entry["effective_at"]
+                rule_count = entry["rule_count"]
+                exception_count = entry["exception_count"]
+                status = entry["status"]
+                if (
+                    not isinstance(version, int)
+                    or isinstance(version, bool)
+                    # Versions ascend gap-free from one.
+                    or version != expected
+                    or not isinstance(effective_at, str)
+                    or not effective_at
+                    or not isinstance(rule_count, int)
+                    or isinstance(rule_count, bool)
+                    or rule_count < 0
+                    or not isinstance(exception_count, int)
+                    or isinstance(exception_count, bool)
+                    or exception_count < 0
+                    or not isinstance(status, bool)
+                ):
+                    raise RuntimeError("malformed catalog audit from store")
+            # The emitted bytes must be exactly the compact single-line
+            # rendering of the validated payload; anything else (extra
+            # whitespace, a reserialised duplicate key, a non-canonical
+            # number) is not the store's verbatim text.
+            canonical = (
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                + "\n"
+            )
+            if text != canonical:
+                raise RuntimeError("malformed catalog audit from store")
+            self._write_body(200, text.encode("utf-8"))
 
         def _reply_error(
             self,
