@@ -9759,6 +9759,142 @@ class RequestStore:
             return False
         return rows[-1][1] == current_status
 
+    def get_request_evidence(
+        self, tenant_id: str, request_id: str
+    ) -> dict[str, object]:
+        """Return the request's integrity evidence from one committed snapshot.
+
+        The result carries exactly ``request_id``, ``status``,
+        ``event_count``, ``chain_hash`` and ``verified``. ``status``,
+        ``event_count`` and the persisted ``chain_hash`` head are read
+        from a single read-only transaction together with every status
+        event, so a concurrent transition or write can never mix two
+        commits into one response. ``chain_hash`` is the persisted head
+        exactly as stored -- never recomputed or repaired; a persisted
+        head that is not a well-formed SHA-256 digest is reported as
+        ``None``. ``verified`` is ``True`` only when every link
+        recomputes to its stored hash from the genesis predecessor, the
+        sequences are gap-free from zero, the final link equals the
+        request's anchored head and the final event's status equals the
+        current status -- all within that same snapshot; any deletion,
+        alteration, insertion, reordering or rebinding settles ``False``
+        without failing the read. The method never writes: no request,
+        event, attempt, tombstone, receipt, catalog or anchor row is
+        created or modified.
+
+        Invalid, unknown and cross-tenant ids raise
+        :class:`RequestNotFound` with identical behaviour; a non-string
+        or empty *tenant_id* raises :class:`ValueError`. A storage fault
+        or a snapshot that cannot be read whole raises the fixed-text
+        :class:`OSError` storage failure.
+        """
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        request_id = _require_identifier(request_id)
+        if self._mem_conn is not None:
+            with self._write_lock:
+                return self._get_request_evidence(tenant_id, request_id)
+        return self._get_request_evidence(tenant_id, request_id)
+
+    def _get_request_evidence(
+        self, tenant_id: str, request_id: str
+    ) -> dict[str, object]:
+        conn = self._connect()
+        try:
+            try:
+                # One read-only transaction for the whole snapshot: the
+                # request row, its events and the event tally all come
+                # from the same committed view, never from two
+                # transactions straddling a concurrent write.
+                conn.execute("BEGIN")
+                try:
+                    owner = conn.execute(
+                        "SELECT status, chain_hash FROM requests "
+                        "WHERE tenant_id = ? AND request_id = ?",
+                        (tenant_id, request_id),
+                    ).fetchone()
+                    if owner is None:
+                        # Identical outcome for unknown ids and
+                        # cross-tenant lookups.
+                        raise RequestNotFound("request not found")
+                    rows = conn.execute(
+                        "SELECT seq, status, occurred_at, chain_hash "
+                        "FROM status_events "
+                        "WHERE tenant_id = ? AND request_id = ? ORDER BY seq",
+                        (tenant_id, request_id),
+                    ).fetchall()
+                    conn.execute("COMMIT")
+                except BaseException:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
+            except RequestNotFound:
+                raise
+            except sqlite3.Error:
+                # Never surface the database engine's own error text.
+                raise _storage_failure() from None
+        finally:
+            self._release(conn)
+
+        current_status, anchored_head = owner
+        # A request row whose current status is not text is corrupt
+        # persisted state: the snapshot cannot be reported whole.
+        if not isinstance(current_status, str):
+            raise _storage_failure()
+        # A persisted head that is not a well-formed digest is reported
+        # as null and can never verify; the read itself still succeeds.
+        chain_hash = anchored_head if _is_chain_hash(anchored_head) else None
+
+        # Replay the in-database chain only, with the same strict
+        # criteria as _verify_evidence. Any single discrepancy -- a
+        # malformed row, a gap, a wrong hash, a head mismatch or a
+        # status mismatch -- settles the verdict as False; the read
+        # still succeeds.
+        verified = False
+        if chain_hash is not None and rows:
+            predecessor = _GENESIS_PREDECESSOR
+            links_ok = True
+            for expected_seq, row in enumerate(rows):
+                seq, event_status, occurred_at, stored_hash = row
+                if (
+                    not isinstance(seq, int)
+                    or isinstance(seq, bool)
+                    or seq != expected_seq
+                    or not isinstance(event_status, str)
+                    or not isinstance(occurred_at, str)
+                    or not _is_chain_hash(stored_hash)
+                ):
+                    links_ok = False
+                    break
+                recomputed = _chain_hash(
+                    tenant_id,
+                    request_id,
+                    seq,
+                    event_status,
+                    occurred_at,
+                    predecessor,
+                )
+                # Constant-time comparison; either mismatch breaks the chain.
+                if not hmac.compare_digest(recomputed, stored_hash):
+                    links_ok = False
+                    break
+                predecessor = stored_hash
+            if (
+                links_ok
+                and hmac.compare_digest(predecessor, chain_hash)
+                and rows[-1][1] == current_status
+            ):
+                verified = True
+
+        return {
+            "request_id": request_id,
+            "status": current_status,
+            "event_count": len(rows),
+            "chain_hash": chain_hash,
+            "verified": verified,
+        }
+
     def _load_chain_head(
         self, tenant_id: str, request_id: str
     ) -> tuple[str, str, int]:

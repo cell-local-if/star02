@@ -1,7 +1,7 @@
 """HTTP layer for deletion-request acceptance, lookup, observation and
 single-request reconciliation.
 
-The service exposes eight business endpoints:
+The service exposes nine business endpoints:
 
 * ``POST /requests`` -- accept a deletion request for a tenant. The JSON
   body must carry non-empty ``tenant_id``, ``subject_id`` and
@@ -57,6 +57,24 @@ The service exposes eight business endpoints:
   fault or a corrupt ledger answers 503 and never a partial page or a
   pseudo digest. The read never advances state, never creates an
   attempt or a tombstone and never changes the audit chain.
+* ``GET /requests/{request_id}/evidence`` -- read-only publication of
+  the request's integrity evidence. The tenant follows the existing
+  ``X-Tenant-Id``/query rule. The single-line JSON body carries exactly
+  ``request_id``, ``status``, ``event_count``, ``chain_hash`` and
+  ``verified`` in that order: ``status`` and ``event_count`` are the
+  current state and status-event tally of one committed snapshot,
+  ``chain_hash`` is the snapshot's persisted 64-lowercase-hex chain
+  head (``null`` when the persisted head is not a well-formed digest),
+  and ``verified`` is ``true`` only when the same snapshot's chain
+  recomputes link by link from the genesis predecessor, the sequences
+  run gap-free from zero, the final link equals the request record's
+  anchored head and the final event's status equals the current
+  status. A deleted, altered, inserted, reordered or rebound event --
+  or a malformed persisted head -- still answers 200 with ``verified``
+  ``false``; an invalid, unknown or cross-tenant request id answers 404
+  and a storage fault or an unreadable snapshot answers 503. The read
+  never creates or modifies a request, event, attempt, tombstone,
+  receipt, catalog version or audit anchor.
 * ``GET /policy-catalog/versions`` -- read-only publication of the
   tenant's policy-catalog version history, without any subject detail.
   The tenant follows the existing ``X-Tenant-Id``/query rule; the query
@@ -111,13 +129,14 @@ audit inspection (:meth:`RequestStore.audit_inspection` and
 :meth:`RequestStore.audit_inspection_summary`) exist only on
 the storage layer and are deliberately not exposed over HTTP: over HTTP
 the service opens request acceptance, the acceptance-receipt lookup, the
-read-only tenant-scoped listing, the three read-only observation reads,
+read-only tenant-scoped listing, the four read-only observation reads,
 the single-request execution reconciliation and the read-only
 policy-catalog version history described above. The
 current-status lookup (:meth:`RequestStore.get_status`), the
 tenant-scoped listing (:meth:`RequestStore.list_requests`), the
 execution log (:meth:`RequestStore.get_execution_log`), the tombstone
 page read (:meth:`RequestStore.page_deletion_tombstones`), the
+integrity-evidence read (:meth:`RequestStore.get_request_evidence`), the
 single-request reconciliation
 (:meth:`RequestStore.reconcile_execution`) and the catalog version
 history (:meth:`RequestStore.audit_policy_catalog`) back their HTTP
@@ -134,7 +153,9 @@ rendering exactly ``request_id``, ``status`` and ``created_at``. The
 tombstone page read renders exactly ``request_id``, ``tombstones``,
 ``recorded_at``, ``evidence_digest`` and ``next_cursor``, each
 tombstone rendering exactly ``adapter_id``, ``scope``, ``operation_id``,
-``outcome``, ``proof_digest`` and ``recorded_at``. The policy-catalog
+``outcome``, ``proof_digest`` and ``recorded_at``. The evidence read
+renders exactly ``request_id``, ``status``, ``event_count``,
+``chain_hash`` and ``verified``. The policy-catalog
 history read renders exactly ``versions``, each version rendering
 exactly ``version``, ``effective_at``, ``rule_count``,
 ``exception_count`` and ``status``.
@@ -155,7 +176,7 @@ for a configured principal: a missing/malformed/unknown token answers
 endpoint, or acting on a tenant other than its own ``tenant_id``,
 answers ``403 forbidden``. ``POST /requests`` requires
 ``request:submit`` and the target tenant is the body's ``tenant_id``;
-each of the five GET endpoints requires ``request:read`` and the target
+each of the six GET endpoints requires ``request:read`` and the target
 tenant follows the existing ``X-Tenant-Id``/query rule; the
 single-request reconciliation ``POST /requests/{request_id}/reconcile``
 requires ``request:reconcile`` and its target tenant follows the same
@@ -205,6 +226,7 @@ _POLICY_CATALOG_VERSIONS_PATH = "/policy-catalog/versions"
 _STATUS_RESOURCE = "status"
 _EXECUTION_LOG_RESOURCE = "execution-log"
 _TOMBSTONES_RESOURCE = "tombstones"
+_EVIDENCE_RESOURCE = "evidence"
 _RECONCILE_RESOURCE = "reconcile"
 _TENANT_HEADER = "X-Tenant-Id"
 _AUTHORIZATION_HEADER = "Authorization"
@@ -484,6 +506,11 @@ class DeferredRequestStore:
             tenant_id, request_id, cursor, limit
         )
 
+    def get_request_evidence(self, tenant_id, request_id):
+        # Serves the read-only GET /requests/{request_id}/evidence
+        # endpoint; strictly read-only, like get_status.
+        return self._ready().get_request_evidence(tenant_id, request_id)
+
     def reconcile_execution(self, tenant_id, request_id):
         # Backs the POST /requests/{request_id}/reconcile endpoint; the
         # store's atomic commit decides the unique reconciliation outcome.
@@ -588,10 +615,11 @@ def make_handler(
                 # Empty or nested segments do not name a request.
                 if segment and "/" not in segment:
                     return "item", segment
-                # The three read-only observability sub-resources live
+                # The four read-only observability sub-resources live
                 # under a request id: /requests/{id}/status,
-                # /requests/{id}/execution-log and
-                # /requests/{id}/tombstones, alongside the single
+                # /requests/{id}/execution-log,
+                # /requests/{id}/tombstones and /requests/{id}/evidence,
+                # alongside the single
                 # reconciliation action /requests/{id}/reconcile. Deeper
                 # nesting or any other suffix stays an unknown path (404).
                 if "/" in segment:
@@ -603,6 +631,8 @@ def make_handler(
                             return "execution_log", item_id
                         if suffix == _TOMBSTONES_RESOURCE:
                             return "tombstones", item_id
+                        if suffix == _EVIDENCE_RESOURCE:
+                            return "evidence", item_id
                         if suffix == _RECONCILE_RESOURCE:
                             return "reconcile", item_id
             return None, None
@@ -790,10 +820,10 @@ def make_handler(
                     405, _METHOD_NOT_ALLOWED, allowed="POST"
                 )
                 return
-            # item (acceptance receipt), status, execution_log and
-            # tombstones are the four GET-only reads; authorization,
-            # tenant/id resolution and the resulting error ordering are
-            # shared by all of them.
+            # item (acceptance receipt), status, execution_log,
+            # tombstones and evidence are the five GET-only reads;
+            # authorization, tenant/id resolution and the resulting
+            # error ordering are shared by all of them.
             assert segment is not None
             resolved = self._resolve_read(segment)
             if resolved is None:
@@ -805,6 +835,8 @@ def make_handler(
                 self._serve_status(tenant_id, request_id)
             elif kind == "execution_log":
                 self._serve_execution_log(tenant_id, request_id)
+            elif kind == "evidence":
+                self._serve_evidence(tenant_id, request_id)
             else:
                 self._serve_tombstones(tenant_id, request_id)
 
@@ -922,6 +954,29 @@ def make_handler(
                 self._reply_error(503, _STORAGE_UNAVAILABLE)
                 return
             self._reply_execution_log(request_id, attempts)
+
+        def _serve_evidence(self, tenant_id: str, request_id: str) -> None:
+            try:
+                record = store.get_request_evidence(tenant_id, request_id)
+            except RequestNotFound:
+                # Missing ids and cross-tenant lookups are indistinguishable.
+                self._reply_error(404, _NOT_FOUND)
+                return
+            except ValueError:
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            except _StorageUnavailable:
+                _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
+                self._reply_error(503, _STORAGE_UNAVAILABLE)
+                return
+            except (sqlite3.Error, RuntimeError, OSError):
+                # A storage fault or a snapshot that cannot be read whole
+                # surfaces as the fixed-text storage failure; no partial
+                # evidence is ever rendered.
+                _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
+                self._reply_error(503, _STORAGE_UNAVAILABLE)
+                return
+            self._reply_evidence(record)
 
         def _serve_tombstones(self, tenant_id: str, request_id: str) -> None:
             # The tombstone page read shares the other GET reads'
@@ -1410,6 +1465,58 @@ def make_handler(
             body = (
                 json.dumps(
                     {"items": rendered_items, "next_cursor": next_cursor},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+            self._write_body(200, body)
+
+        def _reply_evidence(self, record: object) -> None:
+            # Whitelist and re-render every field: even a store
+            # substitute that returned extra keys could not leak a
+            # subject, a scope, an idempotency key or any other request
+            # field into the body. Shapes and types are re-checked so a
+            # corrupt snapshot never serialises into a partially-formed
+            # record.
+            if not isinstance(record, dict) or set(record) != {
+                "request_id",
+                "status",
+                "event_count",
+                "chain_hash",
+                "verified",
+            }:
+                raise RuntimeError("malformed evidence from store")
+            request_id = record["request_id"]
+            status = record["status"]
+            event_count = record["event_count"]
+            chain_hash = record["chain_hash"]
+            verified = record["verified"]
+            if (
+                not isinstance(request_id, str)
+                or not request_id
+                or not isinstance(status, str)
+                or not status
+                or not isinstance(event_count, int)
+                or isinstance(event_count, bool)
+                or event_count < 0
+                or not isinstance(verified, bool)
+            ):
+                raise RuntimeError("malformed evidence from store")
+            if chain_hash is not None and (
+                not isinstance(chain_hash, str)
+                or not _HEX_DIGEST_RE.match(chain_hash)
+            ):
+                raise RuntimeError("malformed evidence from store")
+            body = (
+                json.dumps(
+                    {
+                        "request_id": request_id,
+                        "status": status,
+                        "event_count": event_count,
+                        "chain_hash": chain_hash,
+                        "verified": verified,
+                    },
                     ensure_ascii=False,
                     separators=(",", ":"),
                 )
