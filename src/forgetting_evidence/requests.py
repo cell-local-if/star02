@@ -408,7 +408,10 @@ negative zero or a non-finite number) the caller can keep outside the
 database. The same text is also served verbatim by the read-only
 ``GET /requests/{request_id}/audit-bundle`` HTTP endpoint; the offline
 verification and diagnosis companions below remain storage-layer only,
-never routed over HTTP. The export is read-only, freezes the request chain head as
+never routed over HTTP. The strictly read-only :func:`read_audit_bundle`
+behind the ``audit-bundle`` command produces the same text from the same
+snapshot without opening the store for writes, so an operator can hand
+the evidence over offline without starting the HTTP service. The export is read-only, freezes the request chain head as
 settled at that moment (later status events never change or invalidate
 an already exported bundle, and repeated exports at the same chain head
 are byte-identical), and carries only the business fields the proof
@@ -2591,6 +2594,166 @@ def read_audit_health(
         return _audit_health_snapshot(conn, tenant_id, None, {})
     finally:
         conn.close()
+
+
+def read_audit_bundle(
+    db_path: str | os.PathLike[str],
+    tenant_id: str,
+    request_id: str,
+) -> str:
+    """Export one request's evidence bundle without ever opening for writes.
+
+    This is the strictly read-only lookup behind the ``audit-bundle``
+    command. It follows :meth:`RequestStore.export_audit_bundle`
+    semantics exactly -- the same single consistent snapshot inside one
+    explicit read-only transaction, the same full-chain trust criteria,
+    the same canonical single-line JSON text (exactly one trailing
+    newline) and the same indistinguishable :class:`RequestNotFound`
+    for invalid, unknown or cross-tenant ids -- but it never creates
+    the database, never runs schema DDL and never writes any
+    bookkeeping, so the call adds no status event, execution attempt,
+    tombstone, anchor or audit record. The file is opened read-only and
+    only committed rows are read, so a missing, unreadable, locked or
+    corrupt database surfaces as the same fixed-text :class:`OSError`
+    storage failure; the underlying exception, the path, the tenant,
+    the request id and any SQL never leak to the caller.
+
+    The command carries no anchor secrets, so the snapshot is evaluated
+    with no current or historical secret and the secret-missing outcome
+    is not held against the export: authenticating the anchors is
+    deferred to the fully offline :meth:`RequestStore.verify_audit_bundle`
+    check with the caller-held secrets. An un-anchored chain, a
+    generation association the persisted records cannot resolve, or
+    damaged or untrusted evidence still raises
+    :class:`AuditBundleUnavailable` instead of exporting, and never a
+    partial text.
+    """
+    if isinstance(db_path, os.PathLike):
+        db_path = os.fspath(db_path)
+    if not isinstance(db_path, str) or not db_path:
+        raise ValueError("storage path must be a non-empty string")
+    tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+    request_id = _require_identifier(request_id)
+    # Open the existing file read-only: a missing path fails instead of
+    # being created, and no schema, repair or bookkeeping write can ever
+    # occur.
+    uri = pathlib.Path(os.path.abspath(db_path)).as_uri() + "?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=_BUSY_TIMEOUT_MS / 1000)
+    except sqlite3.Error:
+        raise _storage_failure() from None
+    try:
+        try:
+            # One explicit read-only transaction: the request row and
+            # every piece of audit evidence are read from a single
+            # consistent snapshot, so a concurrent write can never
+            # contribute half-settled fields to the bundle.
+            conn.execute("BEGIN")
+            try:
+                owner = conn.execute(
+                    "SELECT status, chain_hash FROM requests "
+                    "WHERE tenant_id = ? AND request_id = ?",
+                    (tenant_id, request_id),
+                ).fetchone()
+                if owner is None:
+                    # Identical outcome for unknown ids and cross-tenant
+                    # lookups.
+                    raise RequestNotFound("request not found")
+                status, head = owner
+                meta_rows = conn.execute(
+                    "SELECT head_hmac FROM audit_anchor_meta"
+                ).fetchall()
+                event_rows = conn.execute(
+                    "SELECT tenant_id, request_id, seq, status, "
+                    "occurred_at, chain_hash FROM status_events "
+                    "ORDER BY tenant_id, request_id, seq"
+                ).fetchall()
+                anchor_rows = conn.execute(
+                    "SELECT commit_seq, tenant_id, request_id, seq, "
+                    "event_hash, anchor_hmac, key_generation "
+                    "FROM audit_anchors ORDER BY commit_seq"
+                ).fetchall()
+                request_rows = conn.execute(
+                    "SELECT tenant_id, request_id, status, chain_hash "
+                    "FROM requests"
+                ).fetchall()
+                generation_rows = conn.execute(
+                    "SELECT generation, key_fingerprint, effective_at "
+                    "FROM anchor_key_generations ORDER BY generation"
+                ).fetchall()
+            except BaseException:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+            conn.execute("COMMIT")
+        except RequestNotFound:
+            raise
+        except sqlite3.Error:
+            raise _storage_failure() from None
+    finally:
+        conn.close()
+
+    # Assess the settled evidence against the same full-chain criteria
+    # as the inspection sweep, purely from the one snapshot read above.
+    # The command holds no anchor secret by design, so the
+    # secret-missing outcome is filtered out: anchor authentication is
+    # the offline verifier's job, not the exporter's.
+    reasons = RequestStore._evaluate_inspection_rows(
+        tuple(meta_rows),
+        tuple(event_rows),
+        tuple(anchor_rows),
+        tuple(request_rows),
+        tuple(generation_rows),
+        None,
+        {},
+        (tenant_id, request_id),
+    )
+    reasons = [
+        reason
+        for reason in reasons
+        if reason != _ANCHOR_REASON_SECRET_MISSING
+    ]
+    # Mirror the store's generation-association gate without any secret:
+    # every generation the file's anchors name must have its irreversible
+    # fingerprint record persisted, or the bundle could not render the
+    # historical key association the offline check needs.
+    generation_ids = {
+        row[0]
+        for row in generation_rows
+        if isinstance(row[0], int) and not isinstance(row[0], bool)
+    }
+    for row in anchor_rows:
+        key_generation = row[6]
+        if key_generation is None and not generation_ids:
+            # The pre-rotation legacy shape: NULL attributions on a file
+            # whose generations table is empty.
+            continue
+        referenced = 1 if key_generation is None else key_generation
+        if (
+            not isinstance(referenced, int)
+            or isinstance(referenced, bool)
+            or referenced < 1
+            or referenced not in generation_ids
+        ):
+            reasons.append(_ANCHOR_REASON_KEY_MISSING)
+            break
+    if reasons:
+        raise AuditBundleUnavailable(_AUDIT_BUNDLE_UNAVAILABLE_MESSAGE)
+    text = _render_audit_bundle(
+        tenant_id,
+        request_id,
+        status,
+        head,
+        tuple(event_rows),
+        tuple(anchor_rows),
+        tuple(generation_rows),
+    )
+    # Log only the stable outcome: no tenant, request id, credential
+    # or SQL text ever reaches the log.
+    _log.info("audit bundle exported")
+    return text
 
 
 # Allowed request lifecycle. completed and failed are terminal; moving a
