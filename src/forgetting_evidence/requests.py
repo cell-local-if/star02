@@ -10554,6 +10554,53 @@ class RequestStore:
         """Alias of :meth:`diagnose_chain` under the audit vocabulary."""
         return self.diagnose_chain(tenant_id, request_id)
 
+    def get_request_audit_diagnosis(
+        self, tenant_id: str, request_id: str
+    ) -> dict[str, object]:
+        """Return one request's stable audit-chain diagnosis for the HTTP read.
+
+        Read-only single-request diagnosis of the *current database
+        evidence chain*: it runs the same full-chain assessment as
+        :meth:`diagnose_chain` (the per-request database links and head,
+        every external anchor's authentication under its own sealing
+        generation and the file-wide global head, so a cross-request or
+        cross-tenant substitution is visible), gated on the request
+        belonging to *tenant_id* exactly like
+        :meth:`get_request_evidence`.
+
+        The result contains exactly ``request_id``, ``trusted`` and
+        ``reasons`` in that order. ``request_id`` echoes the validated
+        request coordinate; ``reasons`` is the sorted, de-duplicated list
+        of stable, detail-free reason codes naming why the persisted
+        evidence cannot be trusted (an un-anchored chain, an anchor that
+        does not authenticate, a head mismatch, a deleted, altered,
+        inserted or reordered event, a cross-request/cross-tenant
+        rebound and the other :meth:`diagnose_chain` codes); ``trusted``
+        is true only when ``reasons`` is empty. A diagnosable chain
+        defect is a successful diagnosis with non-empty ``reasons``,
+        never an exception: only an unreadable database or a snapshot
+        that cannot be read completely raises the fixed-text
+        :class:`OSError`. Invalid, unknown and cross-tenant ids raise
+        :class:`RequestNotFound`; a non-string or empty *tenant_id*
+        raises :class:`ValueError`. The diagnosis never writes, repairs,
+        backfills, recomputes or overwrites anything; repeated reads of
+        an unchanged chain return an identical result.
+        """
+        scope = self._validate_chain_scope(tenant_id, request_id)
+        # Both coordinates are positional here, so the validated scope
+        # always names the request; _assess_chain performs the
+        # unknown/cross-tenant owner check before the read-only replay.
+        if self._mem_conn is not None:
+            with self._write_lock:
+                reasons = self._assess_chain(scope)
+        else:
+            reasons = self._assess_chain(scope)
+        return {
+            "request_id": scope[1],
+            "trusted": not reasons,
+            "reasons": reasons,
+        }
+
     @staticmethod
     def _validate_chain_scope(
         tenant_id: str | None, request_id: str | None

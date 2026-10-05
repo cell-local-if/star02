@@ -1,7 +1,7 @@
 """HTTP layer for deletion-request acceptance, lookup, observation and
 single-request reconciliation.
 
-The service exposes eleven business endpoints:
+The service exposes twelve business endpoints:
 
 * ``POST /requests`` -- accept a deletion request for a tenant. The JSON
   body must carry non-empty ``tenant_id``, ``subject_id`` and
@@ -105,6 +105,38 @@ The service exposes eleven business endpoints:
   unreadable database, a failed snapshot read or corrupt evidence
   answers 503. The read never modifies persisted evidence, never
   writes an audit event and never creates a batch.
+* ``GET /requests/{request_id}/audit-diagnosis`` -- read-only
+  diagnosis of the request's current database evidence chain, a
+  parallel entry point to ``.../evidence`` that returns stable failure
+  reasons rather than a single boolean. The tenant follows the
+  existing ``X-Tenant-Id``/query rule and the endpoint requires the
+  ``request:read`` role; the query string accepts no parameter other
+  than ``tenant_id`` -- a duplicated key, an unknown parameter or a
+  missing, empty or conflicting tenant answers 400. The single-line
+  JSON body carries exactly ``request_id``, ``trusted`` and
+  ``reasons`` in that order: ``request_id`` is the normalised
+  lower-case UUID, ``reasons`` is the de-duplicated list of stable,
+  detail-free reason codes sorted by Unicode code point, and
+  ``trusted`` is true only when ``reasons`` is empty. It runs the
+  same full-chain assessment as the storage layer's
+  :meth:`RequestStore.diagnose_chain` -- the per-request database
+  links and head, every external anchor's authentication under its
+  own sealing generation and the file-wide global head -- so an
+  un-anchored chain, an anchor that does not authenticate, an anchor
+  head mismatch, a deleted, altered, inserted or reordered event or a
+  cross-request/cross-tenant substitution all answer 200 with a
+  non-empty ``reasons`` list; these are diagnoses, never read
+  failures. Repeated reads of the same persisted chain with no new
+  writes return byte-identical bodies. The body carries no subject,
+  raw scope, idempotency key, execution credential, anchor secret,
+  SQL text or filesystem path. A malformed, unknown or cross-tenant
+  request id answers 404 with one detail-free outcome, and a trailing
+  extra path segment answers 404; an unreadable database, an
+  incomplete snapshot or a corrupt persisted record answers 503. The
+  read never repairs, backfills, recomputes or writes anything: it
+  never writes an audit event, never creates a batch and never
+  changes state, an attempt, a tombstone, a receipt, an anchor, a key
+  generation or existing evidence.
 * ``GET /policy-catalog/versions`` -- read-only publication of the
   tenant's policy-catalog version history, without any subject detail.
   The tenant follows the existing ``X-Tenant-Id``/query rule; the query
@@ -181,8 +213,9 @@ audit inspection (:meth:`RequestStore.audit_inspection` and
 :meth:`RequestStore.audit_inspection_summary`) exist only on
 the storage layer and are deliberately not exposed over HTTP: over HTTP
 the service opens request acceptance, the acceptance-receipt lookup, the
-read-only tenant-scoped listing, the five read-only observation reads,
-the read-only audit-bundle export, the single-request execution
+read-only tenant-scoped listing, the six read-only observation reads,
+the read-only audit-bundle export, the read-only single-request
+audit-chain diagnosis, the single-request execution
 reconciliation, the read-only
 policy-catalog version history and the policy-catalog publication
 described above. The
@@ -194,6 +227,8 @@ single-snapshot request evidence read
 (:meth:`RequestStore.get_request_evidence`), the
 audit-bundle export
 (:meth:`RequestStore.export_audit_bundle`), the
+single-request audit-chain diagnosis
+(:meth:`RequestStore.get_request_audit_diagnosis`), the
 single-request reconciliation
 (:meth:`RequestStore.reconcile_execution`), the catalog version
 history (:meth:`RequestStore.audit_policy_catalog`) and the catalog
@@ -211,6 +246,8 @@ listing read renders exactly ``items`` and ``next_cursor``, each item
 rendering exactly ``request_id``, ``status`` and ``created_at``. The
 evidence read renders exactly ``request_id``, ``status``,
 ``event_count``, ``chain_hash`` and ``verified``. The
+audit-diagnosis read renders exactly ``request_id``, ``trusted`` and
+``reasons``. The
 audit-bundle export renders the store's verbatim single-line compact
 bundle text with its single trailing newline. The
 tombstone page read renders exactly ``request_id``, ``tombstones``,
@@ -240,7 +277,7 @@ for a configured principal: a missing/malformed/unknown token answers
 endpoint, or acting on a tenant other than its own ``tenant_id``,
 answers ``403 forbidden``. ``POST /requests`` requires
 ``request:submit`` and the target tenant is the body's ``tenant_id``;
-each of the seven GET endpoints requires
+each of the eight GET endpoints requires
 ``request:read`` and the target tenant follows the existing
 ``X-Tenant-Id``/query rule; the
 single-request reconciliation ``POST /requests/{request_id}/reconcile``
@@ -303,6 +340,7 @@ _EXECUTION_LOG_RESOURCE = "execution-log"
 _TOMBSTONES_RESOURCE = "tombstones"
 _EVIDENCE_RESOURCE = "evidence"
 _AUDIT_BUNDLE_RESOURCE = "audit-bundle"
+_AUDIT_DIAGNOSIS_RESOURCE = "audit-diagnosis"
 _RECONCILE_RESOURCE = "reconcile"
 _TENANT_HEADER = "X-Tenant-Id"
 _AUTHORIZATION_HEADER = "Authorization"
@@ -359,6 +397,12 @@ _POLICY_CATALOG_QUERY_PARAMS = frozenset({"tenant_id"})
 # parameter, or any duplicated key, is an invalid request.
 _AUDIT_BUNDLE_QUERY_PARAMS = frozenset({"tenant_id"})
 
+# The query parameters the GET /requests/{request_id}/audit-diagnosis
+# read understand: only a single ``tenant_id``, which keeps the
+# historical header-or-query resolution. Any other parameter or any
+# duplicated key is an invalid request.
+_AUDIT_DIAGNOSIS_QUERY_PARAMS = frozenset({"tenant_id"})
+
 # The JSON body keys of the POST /policy-catalog/versions publication:
 # exactly the tenant and the two catalogs, nothing else.
 _POLICY_CATALOG_PUBLISH_KEYS = frozenset(
@@ -373,6 +417,12 @@ _TOMBSTONE_OUTCOMES = frozenset({"deleted", "absent"})
 # A tombstone proof digest and the whole-ledger evidence digest are 64
 # lowercase hexadecimal characters.
 _HEX_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+
+# The stable, detail-free audit-chain diagnosis reason codes use only
+# lowercase ASCII letters, digits and underscores, so a corrupt or
+# substituted store can never serialise a tenant, a request id, a path,
+# SQL text or any other request field as a "reason".
+_DIAGNOSIS_REASON_RE = re.compile(r"^[a-z0-9_]+$")
 
 # Shape of the UTC RFC3339 timestamps an exported audit bundle carries,
 # mirrored from the storage layer's renderer.
@@ -700,6 +750,13 @@ class DeferredRequestStore:
         # snapshot and the read never writes anything.
         return self._ready().export_audit_bundle(tenant_id, request_id)
 
+    def get_request_audit_diagnosis(self, tenant_id, request_id):
+        # Serves the read-only GET /requests/{request_id}/audit-diagnosis
+        # endpoint; the current database evidence chain is diagnosed
+        # from a read-only snapshot and the read never writes, repairs,
+        # backfills or recomputes anything.
+        return self._ready().get_request_audit_diagnosis(tenant_id, request_id)
+
 
 def _normalize_request_id(value: str) -> str:
     """Validate a request id as a UUID and return its canonical text."""
@@ -761,12 +818,13 @@ def make_handler(
                 # Empty or nested segments do not name a request.
                 if segment and "/" not in segment:
                     return "item", segment
-                # The five read-only observability sub-resources live
+                # The six read-only observability sub-resources live
                 # under a request id: /requests/{id}/status,
                 # /requests/{id}/execution-log,
                 # /requests/{id}/tombstones,
-                # /requests/{id}/evidence and
-                # /requests/{id}/audit-bundle, alongside the single
+                # /requests/{id}/evidence,
+                # /requests/{id}/audit-bundle and
+                # /requests/{id}/audit-diagnosis, alongside the single
                 # reconciliation action /requests/{id}/reconcile. Deeper
                 # nesting or any other suffix stays an unknown path (404).
                 if "/" in segment:
@@ -782,6 +840,8 @@ def make_handler(
                             return "evidence", item_id
                         if suffix == _AUDIT_BUNDLE_RESOURCE:
                             return "audit_bundle", item_id
+                        if suffix == _AUDIT_DIAGNOSIS_RESOURCE:
+                            return "audit_diagnosis", item_id
                         if suffix == _RECONCILE_RESOURCE:
                             return "reconcile", item_id
             return None, None
@@ -976,9 +1036,10 @@ def make_handler(
                 )
                 return
             # item (acceptance receipt), status, execution_log,
-            # tombstones, evidence and audit_bundle are the six GET-only
-            # reads; authorization, tenant/id resolution and the
-            # resulting error ordering are shared by all of them.
+            # tombstones, evidence, audit_bundle and audit_diagnosis are
+            # the seven GET-only reads; authorization, tenant/id
+            # resolution and the resulting error ordering are shared by
+            # all of them.
             assert segment is not None
             resolved = self._resolve_read(segment)
             if resolved is None:
@@ -994,6 +1055,8 @@ def make_handler(
                 self._serve_evidence(tenant_id, request_id)
             elif kind == "audit_bundle":
                 self._serve_audit_bundle(tenant_id, request_id)
+            elif kind == "audit_diagnosis":
+                self._serve_audit_diagnosis(tenant_id, request_id)
             else:
                 self._serve_tombstones(tenant_id, request_id)
 
@@ -1195,6 +1258,66 @@ def make_handler(
             """
             params = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
             if not set(params) <= _AUDIT_BUNDLE_QUERY_PARAMS:
+                raise _BadRequest("unknown query parameter")
+            for values in params.values():
+                if len(values) != 1:
+                    raise _BadRequest("duplicate query parameter")
+
+        def _serve_audit_diagnosis(
+            self, tenant_id: str, request_id: str
+        ) -> None:
+            # The audit-chain diagnosis shares the other GET reads'
+            # authorization and tenant/id resolution (done by the
+            # caller); the tenant-only query gate runs here, before
+            # storage is touched. The store diagnoses the current
+            # database evidence chain from a read-only snapshot; a
+            # diagnosable chain defect is still a 200 with non-empty
+            # reasons, never a storage fault, and the read never writes,
+            # repairs, backfills or recomputes anything.
+            try:
+                self._audit_diagnosis_query_gate()
+            except _BadRequest:
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            try:
+                record = store.get_request_audit_diagnosis(
+                    tenant_id, request_id
+                )
+            except RequestNotFound:
+                # Malformed, unknown and cross-tenant ids share one
+                # detail-free outcome.
+                self._reply_error(404, _NOT_FOUND)
+                return
+            except ValueError:
+                # Defence in depth: the HTTP validation above is
+                # authoritative, but a rejected store call reads nothing
+                # and maps to the same client error.
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            except _StorageUnavailable:
+                _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
+                self._reply_error(503, _STORAGE_UNAVAILABLE)
+                return
+            except (sqlite3.Error, RuntimeError, OSError):
+                # An unreadable database, an incomplete snapshot or a
+                # corrupt persisted record surface as the fixed-text
+                # storage error; sqlite text (locks, malformed images,
+                # paths) must never reach the client.
+                _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
+                self._reply_error(503, _STORAGE_UNAVAILABLE)
+                return
+            self._reply_audit_diagnosis(record)
+
+        def _audit_diagnosis_query_gate(self) -> None:
+            """Reject any query parameter other than a single ``tenant_id``.
+
+            The diagnosis takes no business parameters; ``tenant_id``
+            keeps its historical header-or-query resolution in
+            ``_tenant_id``. An unknown parameter or any duplicated key
+            (including ``tenant_id`` itself) is a bad request.
+            """
+            params = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+            if not set(params) <= _AUDIT_DIAGNOSIS_QUERY_PARAMS:
                 raise _BadRequest("unknown query parameter")
             for values in params.values():
                 if len(values) != 1:
@@ -1735,6 +1858,60 @@ def make_handler(
                         "event_count": event_count,
                         "chain_hash": chain_hash,
                         "verified": verified,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+            self._write_body(200, body)
+
+        def _reply_audit_diagnosis(self, record: object) -> None:
+            # Whitelist and re-render every field: even a store
+            # substitute that returned extra keys could not leak a
+            # subject, a raw scope, an idempotency key, a claim
+            # credential, an anchor secret, SQL text or a path into the
+            # body. Shapes and types are re-checked so a corrupt snapshot
+            # never serialises into a partially-formed diagnosis; the
+            # reasons are re-validated against the fixed stable-code
+            # vocabulary shape, de-duplicated and re-sorted by Unicode
+            # code point, and trusted is re-derived so it can only be
+            # true for an empty reason list. Field order is fixed:
+            # request_id, trusted, reasons.
+            if not isinstance(record, dict) or set(record) != {
+                "request_id",
+                "trusted",
+                "reasons",
+            }:
+                raise RuntimeError("malformed audit diagnosis from store")
+            request_id = record["request_id"]
+            trusted = record["trusted"]
+            reasons = record["reasons"]
+            if (
+                not isinstance(request_id, str)
+                or not request_id
+                or not isinstance(trusted, bool)
+                or not isinstance(reasons, list)
+            ):
+                raise RuntimeError("malformed audit diagnosis from store")
+            rendered_reasons: list[str] = []
+            for reason in reasons:
+                if (
+                    not isinstance(reason, str)
+                    or not reason
+                    or not _DIAGNOSIS_REASON_RE.match(reason)
+                ):
+                    raise RuntimeError("malformed audit diagnosis from store")
+                rendered_reasons.append(reason)
+            # Stable presentation: de-duplicate, sort by Unicode code
+            # point and re-derive the trust flag from the result.
+            rendered_reasons = sorted(set(rendered_reasons))
+            body = (
+                json.dumps(
+                    {
+                        "request_id": request_id,
+                        "trusted": not rendered_reasons,
+                        "reasons": rendered_reasons,
                     },
                     ensure_ascii=False,
                     separators=(",", ":"),
