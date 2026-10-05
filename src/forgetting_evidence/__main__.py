@@ -9,9 +9,11 @@ from .httpapi import (
     load_auth_config,
 )
 from .requests import (
+    AuditBundleUnavailable,
     BackupConflict,
     RequestNotFound,
     RestoreConflict,
+    read_audit_bundle,
     read_audit_health,
     read_request_evidence,
     read_request_status,
@@ -36,6 +38,8 @@ _EVIDENCE_USAGE = "evidence_usage"
 _AUDIT_HEALTH_USAGE = "audit_health_usage"
 # Backup shares the same rule: fixed, detail-free markers only.
 _BACKUP_USAGE = "backup_usage"
+# Audit-bundle shares the same rule: fixed, detail-free markers only.
+_AUDIT_BUNDLE_USAGE = "audit_bundle_usage"
 
 _FLAG_ALIASES = {
     "--db": "db",
@@ -214,6 +218,43 @@ def _run_audit_health(args: list[str]) -> int:
     return 0
 
 
+def _run_audit_bundle(args: list[str]) -> int:
+    # Audit-bundle accepts the exact same two invocation styles as
+    # status and evidence -- three positionals or the three named flags
+    # -- so the three share one parser; mixing styles, duplicates, empty
+    # values, unknown flags or a wrong arity never reach storage.
+    parsed = _parse_status_args(args)
+    if parsed is None:
+        print(_AUDIT_BUNDLE_USAGE, file=sys.stderr)
+        return 2
+    # Strictly read-only like status: the database is never created,
+    # migrated or repaired, and the whole export is read from one
+    # consistent snapshot. An invalid, unknown or cross-tenant request
+    # id is indistinguishable from a missing one; a request whose chain
+    # has no settled anchors or key-generation records yet, or whose
+    # evidence is damaged, is the single unavailable marker; every
+    # storage problem collapses to the single fixed failure marker. The
+    # path, the tenant, the request id and any underlying error are
+    # never printed, and stdout stays empty on every failure.
+    try:
+        text = read_audit_bundle(
+            parsed["db"], parsed["tenant_id"], parsed["request_id"]
+        )
+    except RequestNotFound:
+        print("bundle_not_found", file=sys.stderr)
+        return 3
+    except AuditBundleUnavailable:
+        print("bundle_unavailable", file=sys.stderr)
+        return 4
+    except (ValueError, OSError):
+        print("bundle_failed", file=sys.stderr)
+        return 2
+    # The exported text already ends with exactly one newline; stdout
+    # carries exactly that text and nothing more.
+    sys.stdout.write(text)
+    return 0
+
+
 def _parse_serve_args(args: list[str]) -> dict[str, str] | None:
     values: dict[str, str] = {}
     positionals: list[str] = []
@@ -370,6 +411,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_evidence(args[1:])
     if args and args[0] == "audit-health":
         return _run_audit_health(args[1:])
+    if args and args[0] == "audit-bundle":
+        return _run_audit_bundle(args[1:])
     print(_USAGE, file=sys.stderr)
     return 2
 
