@@ -132,6 +132,27 @@ The service exposes twelve business endpoints:
   unreadable database, a failed snapshot read or corrupt evidence
   answers 503. The read never modifies persisted evidence, never
   writes an audit event and never creates a batch.
+  The export also supports conditional reads: every 200 response
+  carries a strong ``ETag`` computed as the SHA-256 digest of the exact
+  body bytes, rendered as the double-quoted ``sha256:`` prefix plus 64
+  lowercase hexadecimal characters, so the same body yields the same
+  tag across repeated reads and process restarts and any byte change
+  changes the tag. A request whose ``If-None-Match`` header holds a
+  comma-separated list of entity tags answers ``304 Not Modified`` with
+  an empty body, ``Content-Length: 0`` and the same ``ETag`` when one
+  candidate -- stripped of surrounding whitespace -- is a double-quoted
+  tag exactly equal to the current one, or is ``*`` while the bundle is
+  exportable; a weak ``W/`` tag, a non-matching tag or a list in which
+  nothing matches answers the full 200 body. More than one
+  ``If-None-Match`` header, an empty field value, a control character
+  or a value that is neither a legal double-quoted entity tag nor ``*``
+  answers 400 ``invalid_request`` after authentication, tenant and
+  query validation, without reading or changing storage. The
+  conditional evaluation never overrides the existing outcomes: a
+  malformed, unknown or cross-tenant id still answers 404, an
+  unavailable bundle still answers 409 and a storage fault still
+  answers 503, and a conditional read never writes to the database,
+  generates an event or changes the rendered bytes.
 * ``GET /policy-catalog/versions`` -- read-only publication of the
   tenant's policy-catalog version history, without any subject detail.
   The tenant follows the existing ``X-Tenant-Id``/query rule; the query
@@ -299,6 +320,7 @@ a response, a log record or a raised exception message.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -339,6 +361,21 @@ _RECONCILE_RESOURCE = "reconcile"
 _TENANT_HEADER = "X-Tenant-Id"
 _AUTHORIZATION_HEADER = "Authorization"
 _BEARER_PREFIX = "Bearer "
+_IF_NONE_MATCH_HEADER = "If-None-Match"
+_ETAG_HEADER = "ETag"
+
+# The strong entity tag of an audit-bundle export: the double-quoted
+# ``sha256:`` prefix followed by the 64 lowercase hexadecimal characters
+# of the SHA-256 digest over the exact body bytes. The same body bytes
+# always yield the same tag, so the tag survives a process restart as
+# long as the rendered bundle text does.
+_ETAG_VALUE_PREFIX = "sha256:"
+
+# A legal opaque tag: DQUOTE, then any run of etagc characters (%x21 --
+# ``!`` -- or %x23-7E, i.e. visible characters except DQUOTE, plus
+# obs-text), then DQUOTE. A ``W/``-prefixed weak tag is recognised
+# separately so it can be accepted syntactically yet never strong-match.
+_OPAQUE_TAG_RE = re.compile(r'^"[\x21\x23-\x7e\x80-\xff]*"$')
 
 # Reject oversized request bodies before they reach the database layer.
 _MAX_BODY_BYTES = 1 << 20  # 1 MiB
@@ -747,6 +784,18 @@ def _normalize_request_id(value: str) -> str:
     # Accept upper-case spellings but look the store up under the same
     # canonical form uuid4() rows were written with.
     return value.lower()
+
+
+def _audit_bundle_etag(body: bytes) -> str:
+    """Strong entity tag for an audit-bundle body.
+
+    The value is the double-quoted ``sha256:`` prefix followed by the 64
+    lowercase hexadecimal characters of the SHA-256 digest over the exact
+    body bytes, so identical bodies yield identical tags across repeated
+    reads and process restarts, and any byte change changes the tag.
+    """
+    digest = hashlib.sha256(body).hexdigest()
+    return f'"{_ETAG_VALUE_PREFIX}{digest}"'
 
 
 def build_server(
@@ -1242,13 +1291,20 @@ def make_handler(
         def _serve_audit_bundle(self, tenant_id: str, request_id: str) -> None:
             # The audit-bundle export shares the other GET reads'
             # authorization and tenant/id resolution (done by the
-            # caller); the tenant-only query gate runs here, before
-            # storage is touched. The store freezes the settled chain
-            # from one committed snapshot; the read never writes
-            # anything.
+            # caller); the tenant-only query gate and the If-None-Match
+            # header validation run here, before storage is touched. The
+            # store freezes the settled chain from one committed
+            # snapshot; the read never writes anything.
             try:
                 self._audit_bundle_query_gate()
             except _BadRequest:
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            try:
+                candidates = self._if_none_match_candidates()
+            except _BadRequest:
+                # A malformed conditional header is rejected without
+                # reading or changing any stored evidence.
                 self._reply_error(400, _INVALID_REQUEST)
                 return
             try:
@@ -1282,7 +1338,49 @@ def make_handler(
                 _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
                 self._reply_error(503, _STORAGE_UNAVAILABLE)
                 return
-            self._reply_audit_bundle(text)
+            self._reply_audit_bundle(text, candidates)
+
+        def _if_none_match_candidates(self) -> list[str] | None:
+            """Validate the ``If-None-Match`` request header, if present.
+
+            Returns ``None`` when the header is absent; otherwise the
+            list of candidate values, each either ``*``, a strong
+            double-quoted entity tag or a syntactically legal ``W/`` weak
+            tag (which is accepted but never strong-matches). More than
+            one header field, an empty field value, a control character
+            or an item that is neither a legal double-quoted entity tag
+            nor ``*`` is a bad request.
+            """
+            values = self.headers.get_all(_IF_NONE_MATCH_HEADER)
+            if values is None:
+                return None
+            if len(values) != 1:
+                raise _BadRequest("multiple If-None-Match headers")
+            value = values[0]
+            # A horizontal tab is ordinary header whitespace; every other
+            # control character (and DEL) is malformed.
+            if any(
+                ord(char) < 0x20 and char != "\t" or ord(char) == 0x7F
+                for char in value
+            ):
+                raise _BadRequest("control character in If-None-Match")
+            if not value.strip(" \t"):
+                raise _BadRequest("empty If-None-Match")
+            candidates: list[str] = []
+            for item in value.split(","):
+                item = item.strip(" \t")
+                if item == "*":
+                    candidates.append(item)
+                    continue
+                if item.startswith("W/") and _OPAQUE_TAG_RE.match(item[2:]):
+                    # Legal syntax, but a weak tag never strong-matches.
+                    candidates.append(item)
+                    continue
+                if _OPAQUE_TAG_RE.match(item):
+                    candidates.append(item)
+                    continue
+                raise _BadRequest("invalid entity tag in If-None-Match")
+            return candidates
 
         def _audit_bundle_query_gate(self) -> None:
             """Reject any query parameter other than a single ``tenant_id``.
@@ -1873,7 +1971,9 @@ def make_handler(
             ).encode("utf-8")
             self._write_body(200, body)
 
-        def _reply_audit_bundle(self, text: object) -> None:
+        def _reply_audit_bundle(
+            self, text: object, if_none_match: list[str] | None = None
+        ) -> None:
             # The body is the store's verbatim single-line compact JSON
             # text with its single trailing newline. It is still
             # re-validated field by field before it is emitted: a
@@ -1905,7 +2005,19 @@ def make_handler(
             )
             if text != canonical:
                 raise RuntimeError("malformed audit bundle from store")
-            self._write_body(200, text.encode("utf-8"))
+            body = text.encode("utf-8")
+            # The strong validator is computed over the exact body bytes,
+            # so it is stable across repeated reads and process restarts
+            # for the same rendered text and changes with any byte.
+            etag = _audit_bundle_etag(body)
+            if if_none_match is not None and (
+                "*" in if_none_match or etag in if_none_match
+            ):
+                # A conditional hit answers 304 with no body and the same
+                # ETag; weak tags never reach this branch.
+                self._write_body(304, b"", etag=etag)
+                return
+            self._write_body(200, body, etag=etag)
 
         def _validate_audit_bundle_payload(self, payload: object) -> None:
             # Whitelist and re-check every field of the bundle shape the
@@ -2261,12 +2373,15 @@ def make_handler(
             body: bytes,
             allowed: str | None = None,
             headless: bool = False,
+            etag: str | None = None,
         ) -> None:
             try:
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 if allowed is not None:
                     self.send_header("Allow", allowed)
+                if etag is not None:
+                    self.send_header(_ETAG_HEADER, etag)
                 self.send_header("Content-Length", str(len(body)))
                 if self.close_connection:
                     # Tell the client explicitly when a request left an
