@@ -1,7 +1,7 @@
 """HTTP layer for deletion-request acceptance, lookup, observation and
-single-request reconciliation.
+single-request and batched reconciliation.
 
-The service exposes thirteen business endpoints:
+The service exposes fourteen business endpoints:
 
 * ``POST /requests`` -- accept a deletion request for a tenant. The JSON
   body must carry non-empty ``tenant_id``, ``subject_id`` and
@@ -227,20 +227,40 @@ The service exposes thirteen business endpoints:
   timestamps; concurrent calls leave the unique outcome to the store's
   atomic commit. No subject, scope, idempotency key, worker, lease
   credential or attempt detail is ever exposed.
+* ``POST /reconcile`` -- reconcile the tenant's pending requests in
+  resumable batches by calling the storage layer's
+  :meth:`RequestStore.reconcile_batch`. The tenant follows the existing
+  ``X-Tenant-Id``/query rule; the only query parameters are ``cursor``
+  and ``limit`` (1..1000, default 100), each at most once. The endpoint
+  takes no body: a missing ``Content-Length`` or a length of zero means
+  there is no body; any other body answers 400. Without a cursor a new
+  persistent batch is created; with a cursor the batch it names is
+  resumed from its durably committed position, so a retry after an
+  interruption continues instead of restarting and never rewrites an
+  already committed item. On success the single-line JSON body carries
+  exactly ``batch_id``, ``next_cursor``, ``finished`` and ``items`` in
+  that order: ``next_cursor`` is the opaque continuation string while
+  the sweep is incomplete and ``null`` once it is finished,
+  ``finished`` is the matching boolean, and ``items`` lists this call's
+  reconciled non-accepted requests in ascending acceptance order, each
+  carrying exactly ``request_id`` and ``status``. An unknown or
+  duplicated query parameter, a missing or empty tenant, an invalid
+  ``limit``, a non-empty body or a malformed, unknown or cross-tenant
+  cursor answers 400 and neither advances a batch nor changes a
+  request; an unreadable database, corrupt persisted batch state or a
+  failed commit answers 503 and never leaves a half-settled item.
 
 The observation endpoints never advance state, create an attempt or
 write any bookkeeping; they only read persisted rows, so their answers
 match the persisted records after a restart. They never expose a lease
 credential, worker identity, subject, scope or any other request field.
-Only the single-request reconcile endpoint may converge execution state,
-through the storage layer's existing atomic semantics; no batch
-reconciliation is exposed over HTTP.
+Only the two reconcile endpoints may converge execution state,
+through the storage layer's existing atomic semantics.
 
 Status advancement (:meth:`RequestStore.transition`), the execution
 orchestration (:meth:`RequestStore.claim_next`,
 :meth:`RequestStore.finish_claim`, :meth:`RequestStore.renew_lease`,
 :meth:`RequestStore.transfer_claim`,
-:meth:`RequestStore.reconcile_batch`,
 :meth:`RequestStore.migrate_execution_leases`) and the deletion receipts
 (:meth:`RequestStore.generate_receipt`,
 :meth:`RequestStore.verify_receipt`,
@@ -270,7 +290,8 @@ audit-bundle export
 read-only deletion-receipt recovery
 (:meth:`RequestStore.get_receipt`), the
 single-request reconciliation
-(:meth:`RequestStore.reconcile_execution`), the catalog version
+(:meth:`RequestStore.reconcile_execution`), the batched reconciliation
+(:meth:`RequestStore.reconcile_batch`), the catalog version
 history (:meth:`RequestStore.audit_policy_catalog`) and the catalog
 publication (:meth:`RequestStore.publish_policy_catalog`) back their
 HTTP
@@ -281,7 +302,9 @@ newline. Acceptance, receipt lookup, the status read and a successful
 reconcile render exactly ``request_id``, ``status`` and ``created_at``
 (in that order); the same idempotent request and every lookup return
 byte-identical bodies. The execution-log read renders exactly
-``request_id`` and ``attempts``. The
+``request_id`` and ``attempts``. The batch reconcile renders exactly
+``batch_id``, ``next_cursor``, ``finished`` and ``items``, each item
+rendering exactly ``request_id`` and ``status``. The
 listing read renders exactly ``items`` and ``next_cursor``, each item
 rendering exactly ``request_id``, ``status`` and ``created_at``. The
 evidence read renders exactly ``request_id``, ``status``,
@@ -327,7 +350,10 @@ each of the nine GET endpoints requires
 ``X-Tenant-Id``/query rule; the
 single-request reconciliation ``POST /requests/{request_id}/reconcile``
 requires ``request:reconcile`` and its target tenant follows the same
-existing ``X-Tenant-Id``/query rule; the policy-catalog history
+existing ``X-Tenant-Id``/query rule; the
+batch reconciliation ``POST /reconcile`` requires
+``request:reconcile`` and its target tenant follows the same existing
+``X-Tenant-Id``/query rule; the policy-catalog history
 ``GET /policy-catalog/versions`` requires ``policy:read`` and its
 target tenant follows the same existing ``X-Tenant-Id``/query rule;
 the policy-catalog publication ``POST /policy-catalog/versions``
@@ -382,6 +408,7 @@ _log = logging.getLogger(__name__)
 _COLLECTION_PATH = "/requests"
 _ITEM_PATH_PREFIX = "/requests/"
 _POLICY_CATALOG_VERSIONS_PATH = "/policy-catalog/versions"
+_RECONCILE_BATCH_PATH = "/reconcile"
 _STATUS_RESOURCE = "status"
 _EXECUTION_LOG_RESOURCE = "execution-log"
 _TOMBSTONES_RESOURCE = "tombstones"
@@ -457,6 +484,17 @@ _AUDIT_DIAGNOSIS_QUERY_PARAMS = frozenset({"tenant_id"})
 # header-or-query resolution and is validated separately. Any other
 # parameter, or any duplicated key, is an invalid request.
 _DELETION_RECEIPT_QUERY_PARAMS = frozenset({"tenant_id"})
+
+# The query parameters the POST /reconcile batched reconciliation
+# understands; anything else is an invalid request. ``tenant_id`` keeps
+# its historical header-or-query resolution and is validated separately.
+_RECONCILE_BATCH_QUERY_PARAMS = frozenset({"tenant_id", "cursor", "limit"})
+
+# The only statuses a reconciled batch item may serialise: accepted rows
+# are skipped without an item and terminal rows are never swept, so an
+# item is a processing request that either kept its live lease or was
+# compensated to failed.
+_RECONCILE_ITEM_STATUSES = frozenset({"processing", "failed"})
 
 # The JSON body keys of the POST /policy-catalog/versions publication:
 # exactly the tenant and the two catalogs, nothing else.
@@ -757,8 +795,8 @@ class DeferredRequestStore:
         return self._ready().reconcile_execution(tenant_id, request_id)
 
     def reconcile_batch(self, tenant_id, cursor=None, limit=None):
-        # Batched, resumable reconciliation is storage-layer only; like the
-        # rest of the execution orchestration it is never routed over HTTP.
+        # Backs the POST /reconcile endpoint; the store's per-item atomic
+        # commits decide the unique reconciliation outcome.
         return self._ready().reconcile_batch(tenant_id, cursor, limit)
 
     def migrate_execution_leases(self, tenant_id, cursor=None, limit=None):
@@ -877,6 +915,8 @@ def make_handler(
                 return "collection", None
             if path == _POLICY_CATALOG_VERSIONS_PATH:
                 return "policy_catalog_versions", None
+            if path == _RECONCILE_BATCH_PATH:
+                return "reconcile_batch", None
             if path.startswith(_ITEM_PATH_PREFIX):
                 segment = path[len(_ITEM_PATH_PREFIX) :]
                 # Empty or nested segments do not name a request.
@@ -965,12 +1005,13 @@ def make_handler(
                 # tenant-scoped listing); the policy-catalog path accepts
                 # POST (publication) and GET (the version history); the
                 # item and the read-only sub-resources are GET-only; the
-                # reconcile action is POST-only.
+                # single-request and batched reconcile actions are
+                # POST-only.
                 if kind == "collection":
                     allowed = "GET, POST"
                 elif kind == "policy_catalog_versions":
                     allowed = "GET, POST"
-                elif kind == "reconcile":
+                elif kind in ("reconcile", "reconcile_batch"):
                     allowed = "POST"
                 else:
                     allowed = "GET"
@@ -1037,6 +1078,9 @@ def make_handler(
                 assert segment is not None
                 self._serve_reconcile(segment)
                 return
+            if kind == "reconcile_batch":
+                self._serve_reconcile_batch()
+                return
             if kind == "policy_catalog_versions":
                 self._serve_policy_catalog_publish()
                 return
@@ -1098,6 +1142,12 @@ def make_handler(
                 return
             if kind == "reconcile":
                 # The reconciliation action is POST-only.
+                self._reply_error(
+                    405, _METHOD_NOT_ALLOWED, allowed="POST"
+                )
+                return
+            if kind == "reconcile_batch":
+                # The batched reconciliation action is POST-only.
                 self._reply_error(
                     405, _METHOD_NOT_ALLOWED, allowed="POST"
                 )
@@ -1681,6 +1731,86 @@ def make_handler(
             # created_at, nothing else.
             self._reply_status(record)
 
+        def _serve_reconcile_batch(self) -> None:
+            # The batched reconcile shares the read endpoints'
+            # authorization and tenant resolution: authentication first,
+            # then the tenant (header or query) and its match against the
+            # principal, then the query-parameter gate and the empty-body
+            # gate, then storage. A rejected call never creates or
+            # advances a batch and never changes a request.
+            principal = self._authorize(_ROLE_RECONCILE)
+            if principal is None:
+                return
+            try:
+                tenant_id = self._tenant_id()
+            except _BadRequest:
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            if not self._tenant_allowed(principal[0], tenant_id):
+                return
+            try:
+                batch_args = self._reconcile_batch_args()
+                self._read_empty_body()
+            except _BadRequest:
+                # A rejected body has been consumed (or the connection is
+                # marked for close when it cannot be) before the error.
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            try:
+                result = store.reconcile_batch(tenant_id, **batch_args)
+            except ValueError:
+                # The store's fixed-text batch ValueError covers every
+                # invalid limit or cursor shape, including a cursor bound
+                # to another tenant or a batch that never existed.
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            except _StorageUnavailable:
+                _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
+                self._reply_error(503, _STORAGE_UNAVAILABLE)
+                return
+            except (sqlite3.Error, RuntimeError, OSError):
+                # Corrupt persisted batch state and every storage fault
+                # surface as the fixed-text OSError; sqlite text (locks,
+                # malformed images, paths) must never reach the client,
+                # and the store guarantees no half-settled item.
+                _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
+                self._reply_error(503, _STORAGE_UNAVAILABLE)
+                return
+            self._reply_reconcile_batch(result)
+
+        def _reconcile_batch_args(self) -> dict[str, object]:
+            """Validate the batch-reconcile query string into store arguments.
+
+            Only ``tenant_id``, ``cursor`` and ``limit`` may appear, each
+            at most once (``tenant_id`` keeps its historical
+            header-or-query resolution in ``_tenant_id``). Every other
+            shape is a bad request; the store re-validates the values
+            themselves as defence in depth.
+            """
+            params = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+            if not set(params) <= _RECONCILE_BATCH_QUERY_PARAMS:
+                raise _BadRequest("unknown query parameter")
+            batch_args: dict[str, object] = {}
+            for name in ("tenant_id", "cursor", "limit"):
+                values = params.get(name)
+                if values is None:
+                    continue
+                if len(values) != 1:
+                    raise _BadRequest(f"duplicate {name}")
+                value = values[0]
+                if name == "limit":
+                    # Far more digits than the 1..1000 domain can ever
+                    # hold is a bad request, not a storage fault (and an
+                    # unbounded digit string must never reach int()).
+                    if not _LIST_LIMIT_RE.match(value) or len(value) > 10:
+                        raise _BadRequest("invalid limit")
+                    batch_args["limit"] = int(value)
+                elif name == "cursor":
+                    if not value:
+                        raise _BadRequest("invalid cursor")
+                    batch_args["cursor"] = value
+            return batch_args
+
         def _serve_list(self) -> None:
             # The tenant-scoped listing shares the read endpoints'
             # authorization and tenant resolution: authentication first,
@@ -1979,6 +2109,75 @@ def make_handler(
             # field order as the acceptance receipt; only the status value
             # differs. Reuse the same strict renderer.
             self._reply_receipt(200, record)
+
+        def _reply_reconcile_batch(self, result: object) -> None:
+            # Whitelist and re-render every field: even a store substitute
+            # that returned extra keys could not leak a subject, a scope,
+            # an idempotency key, a worker, a credential or any other
+            # request field into the body. Shapes and types are re-checked
+            # so a corrupt result never serialises into a partially-formed
+            # record. Field order is fixed: batch_id, next_cursor,
+            # finished, items; each item renders exactly request_id and
+            # status.
+            if not isinstance(result, dict) or set(result) != {
+                "batch_id",
+                "next_cursor",
+                "finished",
+                "items",
+            }:
+                raise RuntimeError("malformed reconcile batch from store")
+            batch_id = result["batch_id"]
+            next_cursor = result["next_cursor"]
+            finished = result["finished"]
+            items = result["items"]
+            if (
+                not isinstance(batch_id, str)
+                or not batch_id
+                or not isinstance(finished, bool)
+                or not isinstance(items, list)
+            ):
+                raise RuntimeError("malformed reconcile batch from store")
+            if next_cursor is not None and (
+                not isinstance(next_cursor, str) or not next_cursor
+            ):
+                raise RuntimeError("malformed reconcile batch from store")
+            # A finished sweep carries no continuation cursor; an
+            # unfinished one always does.
+            if finished != (next_cursor is None):
+                raise RuntimeError("malformed reconcile batch from store")
+            rendered_items: list[dict[str, str]] = []
+            for item in items:
+                if not isinstance(item, dict) or set(item) != {
+                    "request_id",
+                    "status",
+                }:
+                    raise RuntimeError("malformed reconcile batch from store")
+                request_id = item["request_id"]
+                status = item["status"]
+                if (
+                    not isinstance(request_id, str)
+                    or not request_id
+                    or not isinstance(status, str)
+                    or status not in _RECONCILE_ITEM_STATUSES
+                ):
+                    raise RuntimeError("malformed reconcile batch from store")
+                rendered_items.append(
+                    {"request_id": request_id, "status": status}
+                )
+            body = (
+                json.dumps(
+                    {
+                        "batch_id": batch_id,
+                        "next_cursor": next_cursor,
+                        "finished": finished,
+                        "items": rendered_items,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+            self._write_body(200, body)
 
         def _reply_execution_log(
             self, request_id: str, attempts: list[dict[str, object]]
