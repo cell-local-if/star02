@@ -132,6 +132,26 @@ The service exposes twelve business endpoints:
   unreadable database, a failed snapshot read or corrupt evidence
   answers 503. The read never modifies persisted evidence, never
   writes an audit event and never creates a batch.
+  The export also honours HTTP conditional reads: every 200 response
+  carries a strong ``ETag`` of the form ``"sha256:<64 lowercase hex>"``
+  computed over the exact body bytes, so the same body always yields
+  the same tag -- across repeat reads, concurrent readers and process
+  restarts -- and any body change yields a different tag. A request
+  may send one ``If-None-Match`` header holding a comma-separated list
+  of entity tags; when any whitespace-stripped double-quoted tag is
+  exactly equal to the current tag, or a tag is ``*`` and the bundle
+  is exportable, the answer is ``304`` with no body, a zero
+  ``Content-Length`` and the same ``ETag`` instead of the full 200
+  body. Non-matching tags, lists where no tag matches and weak
+  ``W/``-prefixed tags all receive the full 200 body. More than one
+  ``If-None-Match`` header, an empty field value, a control character
+  or a value that is neither a legal double-quoted entity tag nor
+  ``*`` answers 400 with exactly ``invalid_request`` after
+  authentication, tenant and query validation but before any storage
+  access. The 404/409/503 outcomes above still take precedence over
+  the conditional evaluation: the tag is only compared once the
+  bundle has been exported, and the conditional read never writes to
+  the database, generates an event or changes the exported bytes.
 * ``GET /policy-catalog/versions`` -- read-only publication of the
   tenant's policy-catalog version history, without any subject detail.
   The tenant follows the existing ``X-Tenant-Id``/query rule; the query
@@ -299,6 +319,7 @@ a response, a log record or a raised exception message.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -338,6 +359,7 @@ _AUDIT_BUNDLE_RESOURCE = "audit-bundle"
 _RECONCILE_RESOURCE = "reconcile"
 _TENANT_HEADER = "X-Tenant-Id"
 _AUTHORIZATION_HEADER = "Authorization"
+_IF_NONE_MATCH_HEADER = "If-None-Match"
 _BEARER_PREFIX = "Bearer "
 
 # Reject oversized request bodies before they reach the database layer.
@@ -1242,12 +1264,13 @@ def make_handler(
         def _serve_audit_bundle(self, tenant_id: str, request_id: str) -> None:
             # The audit-bundle export shares the other GET reads'
             # authorization and tenant/id resolution (done by the
-            # caller); the tenant-only query gate runs here, before
-            # storage is touched. The store freezes the settled chain
-            # from one committed snapshot; the read never writes
-            # anything.
+            # caller); the tenant-only query gate and the If-None-Match
+            # header validation run here, before storage is touched.
+            # The store freezes the settled chain from one committed
+            # snapshot; the read never writes anything.
             try:
                 self._audit_bundle_query_gate()
+                if_none_match = self._if_none_match_tags()
             except _BadRequest:
                 self._reply_error(400, _INVALID_REQUEST)
                 return
@@ -1282,7 +1305,70 @@ def make_handler(
                 _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
                 self._reply_error(503, _STORAGE_UNAVAILABLE)
                 return
-            self._reply_audit_bundle(text)
+            self._reply_audit_bundle(text, if_none_match)
+
+        def _if_none_match_tags(self) -> list[str] | None:
+            """Validate the optional ``If-None-Match`` header into tags.
+
+            Returns ``None`` when the header is absent. A single header
+            carries a comma-separated list whose entries -- after
+            stripping surrounding whitespace -- must each be ``*`` or a
+            legal (optionally weak) double-quoted entity tag. More than
+            one header, an empty field value, a control character or
+            any other shape is a bad request rejected before storage is
+            touched.
+            """
+            values = self.headers.get_all(_IF_NONE_MATCH_HEADER)
+            if values is None:
+                return None
+            if len(values) != 1:
+                raise _BadRequest("multiple If-None-Match headers")
+            value = values[0].strip(" \t")
+            if not value:
+                raise _BadRequest("empty If-None-Match")
+            # Horizontal tab is list whitespace; every other control
+            # character (and DEL) is rejected outright.
+            if any(
+                (ord(char) < 0x20 and char != "\t") or ord(char) == 0x7F
+                for char in value
+            ):
+                raise _BadRequest("control character in If-None-Match")
+            tags: list[str] = []
+            pos = 0
+            end = len(value)
+            while True:
+                start = pos
+                if value.startswith("W/", pos):
+                    pos += 2
+                if pos < end and value[pos] == '"':
+                    close = value.find('"', pos + 1)
+                    if close == -1:
+                        raise _BadRequest("invalid entity tag")
+                    inner = value[pos + 1 : close]
+                    # etagc excludes DQUOTE (structural here) and SP;
+                    # control characters were rejected above.
+                    if any(ord(char) <= 0x20 for char in inner):
+                        raise _BadRequest("invalid entity tag")
+                    pos = close + 1
+                elif pos == start and pos < end and value[pos] == "*":
+                    pos += 1
+                else:
+                    raise _BadRequest("invalid entity tag")
+                tags.append(value[start:pos])
+                # Optional whitespace, then the next comma or the end.
+                while pos < end and value[pos] in " \t":
+                    pos += 1
+                if pos == end:
+                    break
+                if value[pos] != ",":
+                    raise _BadRequest("invalid entity tag list")
+                pos += 1
+                while pos < end and value[pos] in " \t":
+                    pos += 1
+                if pos == end:
+                    # A trailing comma leaves an empty field.
+                    raise _BadRequest("empty entity tag")
+            return tags
 
         def _audit_bundle_query_gate(self) -> None:
             """Reject any query parameter other than a single ``tenant_id``.
@@ -1873,7 +1959,9 @@ def make_handler(
             ).encode("utf-8")
             self._write_body(200, body)
 
-        def _reply_audit_bundle(self, text: object) -> None:
+        def _reply_audit_bundle(
+            self, text: object, if_none_match: list[str] | None = None
+        ) -> None:
             # The body is the store's verbatim single-line compact JSON
             # text with its single trailing newline. It is still
             # re-validated field by field before it is emitted: a
@@ -1905,7 +1993,32 @@ def make_handler(
             )
             if text != canonical:
                 raise RuntimeError("malformed audit bundle from store")
-            self._write_body(200, text.encode("utf-8"))
+            body = text.encode("utf-8")
+            # The strong ETag is the SHA-256 of the exact body bytes, so
+            # the same bytes always yield the same tag -- across repeat
+            # reads, concurrent readers and process restarts -- and any
+            # byte change yields a different tag.
+            etag = '"sha256:' + hashlib.sha256(body).hexdigest() + '"'
+            if if_none_match is not None and _entity_tags_match(
+                if_none_match, etag
+            ):
+                self._reply_not_modified(etag)
+                return
+            self._write_body(200, body, etag=etag)
+
+        def _reply_not_modified(self, etag: str) -> None:
+            # A conditional hit: no body, a zero Content-Length and the
+            # same strong ETag the full 200 response would carry.
+            try:
+                self.send_response(304)
+                self.send_header("ETag", etag)
+                self.send_header("Content-Length", "0")
+                if self.close_connection:
+                    self.send_header("Connection", "close")
+                self.end_headers()
+            except OSError:
+                # The client went away mid-response; nothing to report.
+                self.close_connection = True
 
         def _validate_audit_bundle_payload(self, payload: object) -> None:
             # Whitelist and re-check every field of the bundle shape the
@@ -2261,12 +2374,15 @@ def make_handler(
             body: bytes,
             allowed: str | None = None,
             headless: bool = False,
+            etag: str | None = None,
         ) -> None:
             try:
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 if allowed is not None:
                     self.send_header("Allow", allowed)
+                if etag is not None:
+                    self.send_header("ETag", etag)
                 self.send_header("Content-Length", str(len(body)))
                 if self.close_connection:
                     # Tell the client explicitly when a request left an
@@ -2308,6 +2424,24 @@ def make_handler(
             return
 
     return _DeletionRequestHandler
+
+
+def _entity_tags_match(tags: list[str], etag: str) -> bool:
+    """Strong comparison of validated ``If-None-Match`` tags against *etag*.
+
+    ``*`` matches any currently exportable representation; a
+    double-quoted tag matches only on exact equality with the current
+    strong tag; weak ``W/``-prefixed tags never match the strong
+    comparison and are skipped.
+    """
+    for tag in tags:
+        if tag == "*":
+            return True
+        if tag.startswith("W/"):
+            continue
+        if tag == etag:
+            return True
+    return False
 
 
 def _require_string(payload: dict, key: str) -> str:
