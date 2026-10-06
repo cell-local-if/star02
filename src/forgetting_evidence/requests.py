@@ -398,6 +398,18 @@ missing, unreadable, incomplete or inconsistent snapshot and every copy
 or atomic-landing failure raises the fixed-text :class:`OSError`
 ``restore_failed``.
 
+Before any restore, the strictly read-only :func:`verify_backup` entry
+judges a candidate snapshot against the same complete table structure
+and SQLite consistency requirements without touching the business
+database, creating a temporary file or changing a single byte of the
+candidate. Its verdict is one compact JSON line -- ``valid``,
+``tables_ok``, ``integrity_ok`` and a sorted, de-duplicated
+``reasons`` list drawn only from ``missing_tables``,
+``integrity_check_failed``, ``not_sqlite`` and ``read_failed`` -- so a
+caller can decide whether a restore is worth attempting; invalid path
+arguments raise :class:`ValueError` with the same fixed, path-free
+text, and no outcome ever leaks a path, SQL text or engine detail.
+
 Portable audit evidence bundles close the audit capability.
 :meth:`RequestStore.export_audit_bundle` freezes one
 request's currently settled chain -- the request id, the snapshot
@@ -569,6 +581,7 @@ __all__ = [
     "RequestStore",
     "restore_backup",
     "run_backup",
+    "verify_backup",
     "read_request_status",
     "IdempotencyConflict",
     "RequestNotFound",
@@ -2227,6 +2240,132 @@ def run_backup(
             source.close()
 
     return _land_validated_backup(target_path, parent, _populate)
+
+
+# The closed set of reason codes a backup verification verdict can
+# carry. They never embed a path, SQL text or engine error detail.
+_VERIFY_REASON_MISSING_TABLES = "missing_tables"
+_VERIFY_REASON_INTEGRITY = "integrity_check_failed"
+_VERIFY_REASON_NOT_SQLITE = "not_sqlite"
+_VERIFY_REASON_READ = "read_failed"
+
+# Every complete storage image begins with the SQLite file magic; a
+# candidate without it is not a queryable SQLite image at all.
+_SQLITE_HEADER = b"SQLite format 3\x00"
+
+
+def verify_backup(
+    snapshot_path: str | os.PathLike[str],
+) -> str:
+    """Verify a candidate snapshot as a complete storage image, read-only.
+
+    This is the strictly read-only pre-restore check: it opens only the
+    candidate file, never the business database, and it never creates a
+    temporary file, repairs, restores or overwrites anything. The
+    candidate is judged against the same complete table structure and
+    SQLite consistency requirements :func:`run_backup` and
+    :func:`restore_backup` enforce, and the verdict is returned as one
+    compact JSON line with exactly the fields ``valid``, ``tables_ok``,
+    ``integrity_ok`` and ``reasons``:
+
+    - ``tables_ok`` is true only when the candidate carries every table
+      the backup contract requires (extra tables are allowed);
+    - ``integrity_ok`` is true only when SQLite's own
+      ``integrity_check`` returns the single row ``ok``;
+    - ``valid`` is exactly ``tables_ok and integrity_ok``;
+    - ``reasons`` lists the failures out of ``missing_tables`` (a
+      required table is absent), ``integrity_check_failed`` (the
+      consistency check did not return ``ok``), ``not_sqlite`` (the
+      candidate is not a queryable SQLite image) and ``read_failed``
+      (the file is missing, unreadable or could not be read), sorted
+      and de-duplicated; a candidate missing tables *and* failing the
+      consistency check reports both.
+
+    The check is repeatable: verifying the same path again produces the
+    same JSON, and the candidate's bytes, timestamps and every business
+    state are left untouched. An empty, non-string, in-memory or
+    NUL-bearing path, or a path naming a directory, raises
+    :class:`ValueError` before anything is read; the fixed message never
+    embeds the path, and neither the verdict nor any error ever leaks a
+    path, SQL text, engine detail, subject, scope or key material.
+    """
+    snapshot_path = _validate_restore_path(snapshot_path, "snapshot")
+    # A directory presented as the candidate uses a directory as a
+    # file: caller error, never a verification outcome.
+    if os.path.isdir(snapshot_path):
+        raise ValueError("snapshot path must be a usable file path")
+
+    reasons: list[str] = []
+    tables_ok = False
+    integrity_ok = False
+
+    if not os.path.isfile(snapshot_path):
+        # A missing path or a non-regular file can never be read as a
+        # snapshot.
+        reasons.append(_VERIFY_REASON_READ)
+    else:
+        try:
+            with open(snapshot_path, "rb") as handle:
+                header = handle.read(len(_SQLITE_HEADER))
+        except OSError:
+            header = None
+        if header is None:
+            reasons.append(_VERIFY_REASON_READ)
+        elif header != _SQLITE_HEADER:
+            reasons.append(_VERIFY_REASON_NOT_SQLITE)
+        else:
+            # Open the candidate itself read-only: a read failure is a
+            # read failure, and anything SQLite cannot query is not a
+            # storage image. No temporary file is ever created.
+            uri = (
+                pathlib.Path(os.path.abspath(snapshot_path)).as_uri()
+                + "?mode=ro"
+            )
+            try:
+                conn = sqlite3.connect(
+                    uri, uri=True, timeout=_BUSY_TIMEOUT_MS / 1000
+                )
+            except sqlite3.Error:
+                conn = None
+            if conn is None:
+                reasons.append(_VERIFY_REASON_READ)
+            else:
+                try:
+                    try:
+                        names = {
+                            row[0]
+                            for row in conn.execute(
+                                "SELECT name FROM sqlite_master "
+                                "WHERE type = 'table'"
+                            )
+                        }
+                    except sqlite3.Error:
+                        names = None
+                    if names is None:
+                        reasons.append(_VERIFY_REASON_NOT_SQLITE)
+                    else:
+                        tables_ok = _BACKUP_TABLES.issubset(names)
+                        if not tables_ok:
+                            reasons.append(_VERIFY_REASON_MISSING_TABLES)
+                        try:
+                            checks = conn.execute(
+                                "PRAGMA integrity_check"
+                            ).fetchall()
+                        except sqlite3.Error:
+                            checks = None
+                        integrity_ok = checks == [("ok",)]
+                        if not integrity_ok:
+                            reasons.append(_VERIFY_REASON_INTEGRITY)
+                finally:
+                    conn.close()
+
+    verdict = {
+        "valid": tables_ok and integrity_ok,
+        "tables_ok": tables_ok,
+        "integrity_ok": integrity_ok,
+        "reasons": sorted(set(reasons)),
+    }
+    return json.dumps(verdict, ensure_ascii=False, separators=(",", ":"))
 
 
 def read_request_status(
