@@ -174,7 +174,9 @@ record, storage-layer only like the rest of the orchestration:
   them, while a new receipt is only ever signed by the active key.
 * :meth:`RequestStore.get_receipt` recovers the already-settled first
   receipt through a strictly read-only storage entry point that takes
-  no signature key. A request with a receipt returns the stored first
+  no signature key; it also backs the read-only
+  ``GET /requests/{request_id}/deletion-receipt`` HTTP endpoint. A
+  request with a receipt returns the stored first
   text byte-for-byte -- never recomputed, reordered or re-signed -- so
   the same bytes come back before and after a key rotation, for a
   receipt verifiable only under a historical generation, and after the
@@ -12350,7 +12352,9 @@ class RequestStore:
     def get_receipt(self, tenant_id: str, request_id: str) -> str:
         """Recover the already-settled first deletion receipt, read-only.
 
-        Storage-layer only; never routed over HTTP. A caller that lost
+        Backs the read-only ``GET /requests/{request_id}/deletion-receipt``
+        HTTP endpoint and remains a storage-layer method as well. A
+        caller that lost
         the first :meth:`generate_receipt` result recovers it by tenant
         and request id alone: no signature key is presented, and the
         read is unaffected by the tenant's current receipt key

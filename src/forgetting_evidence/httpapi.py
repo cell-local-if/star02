@@ -1,7 +1,7 @@
 """HTTP layer for deletion-request acceptance, lookup, observation and
 single-request reconciliation.
 
-The service exposes twelve business endpoints:
+The service exposes thirteen business endpoints:
 
 * ``POST /requests`` -- accept a deletion request for a tenant. The JSON
   body must carry non-empty ``tenant_id``, ``subject_id`` and
@@ -152,6 +152,30 @@ The service exposes twelve business endpoints:
   the conditional evaluation: the tag is only compared once the
   bundle has been exported, and the conditional read never writes to
   the database, generates an event or changes the exported bytes.
+* ``GET /requests/{request_id}/deletion-receipt`` -- read-only
+  publication of the request's already-settled deletion execution
+  receipt, so a caller recovers the frozen receipt without ever
+  touching a signature key. The tenant follows the existing
+  ``X-Tenant-Id``/query rule and the endpoint requires the
+  ``request:read`` role; the query string accepts no parameter other
+  than ``tenant_id`` -- a duplicated key, an unknown parameter or a
+  missing or empty tenant answers 400. The body is the verbatim
+  single-line compact UTF-8 JSON text (with its single trailing
+  newline) returned by :meth:`RequestStore.get_receipt` for the same
+  tenant and request -- exactly ``tenant_id``, ``request_id``,
+  ``created_at``, ``completed_at``, ``scope_digest``,
+  ``attempt_digest`` and ``tag`` in that fixed order, never wrapped,
+  re-ordered, indented or recomputed. Repeated reads, reads across a
+  process rebuild, concurrent reads and reads before and after a
+  receipt key rotation all return byte-identical bodies, and no
+  subject, raw scope, idempotency key, signature key, key fingerprint
+  or execution credential is ever exposed. A malformed, unknown or
+  cross-tenant request id answers 404 with one detail-free outcome; a
+  request that exists but has no settled first receipt answers 409
+  with exactly ``receipt_unavailable``; an unreadable database, a
+  corrupt persisted receipt or an inconsistent snapshot answers 503.
+  The read never mints a receipt, never registers a key generation,
+  never advances any state and never rewrites any evidence.
 * ``GET /policy-catalog/versions`` -- read-only publication of the
   tenant's policy-catalog version history, without any subject detail.
   The tenant follows the existing ``X-Tenant-Id``/query rule; the query
@@ -229,7 +253,7 @@ the storage layer and are deliberately not exposed over HTTP: over HTTP
 the service opens request acceptance, the acceptance-receipt lookup, the
 read-only tenant-scoped listing, the six read-only observation reads,
 the read-only audit-chain diagnosis, the read-only audit-bundle export,
-the single-request execution
+the read-only deletion-receipt recovery, the single-request execution
 reconciliation, the read-only
 policy-catalog version history and the policy-catalog publication
 described above. The
@@ -243,6 +267,8 @@ read-only audit-chain diagnosis
 (:meth:`RequestStore.diagnose_chain`), the
 audit-bundle export
 (:meth:`RequestStore.export_audit_bundle`), the
+read-only deletion-receipt recovery
+(:meth:`RequestStore.get_receipt`), the
 single-request reconciliation
 (:meth:`RequestStore.reconcile_execution`), the catalog version
 history (:meth:`RequestStore.audit_policy_catalog`) and the catalog
@@ -264,6 +290,10 @@ audit-diagnosis read renders exactly ``request_id``, ``trusted`` and
 ``reasons``. The
 audit-bundle export renders the store's verbatim single-line compact
 bundle text with its single trailing newline. The
+deletion-receipt read renders the store's verbatim single-line compact
+receipt text with its single trailing newline: exactly ``tenant_id``,
+``request_id``, ``created_at``, ``completed_at``, ``scope_digest``,
+``attempt_digest`` and ``tag`` in that order. The
 tombstone page read renders exactly ``request_id``, ``tombstones``,
 ``recorded_at``, ``evidence_digest`` and ``next_cursor``, each
 tombstone rendering exactly ``adapter_id``, ``scope``, ``operation_id``,
@@ -277,7 +307,8 @@ Error responses are single-line JSON objects with exactly one key,
 
 ``invalid_request`` (400), ``unauthorized`` (401), ``forbidden``
 (403), ``idempotency_conflict`` (409), ``policy_catalog_conflict``
-(409), ``audit_bundle_unavailable`` (409), ``not_found`` (404),
+(409), ``audit_bundle_unavailable`` (409), ``receipt_unavailable``
+(409), ``not_found`` (404),
 ``method_not_allowed`` (405) and
 ``storage_unavailable`` (503).
 
@@ -291,7 +322,7 @@ for a configured principal: a missing/malformed/unknown token answers
 endpoint, or acting on a tenant other than its own ``tenant_id``,
 answers ``403 forbidden``. ``POST /requests`` requires
 ``request:submit`` and the target tenant is the body's ``tenant_id``;
-each of the eight GET endpoints requires
+each of the nine GET endpoints requires
 ``request:read`` and the target tenant follows the existing
 ``X-Tenant-Id``/query rule; the
 single-request reconciliation ``POST /requests/{request_id}/reconcile``
@@ -332,6 +363,7 @@ from .requests import (
     AuditBundleUnavailable,
     IdempotencyConflict,
     PolicyCatalogConflict,
+    ReceiptUnavailable,
     RequestNotFound,
     RequestStore,
 )
@@ -356,6 +388,7 @@ _TOMBSTONES_RESOURCE = "tombstones"
 _EVIDENCE_RESOURCE = "evidence"
 _AUDIT_DIAGNOSIS_RESOURCE = "audit-diagnosis"
 _AUDIT_BUNDLE_RESOURCE = "audit-bundle"
+_DELETION_RECEIPT_RESOURCE = "deletion-receipt"
 _RECONCILE_RESOURCE = "reconcile"
 _TENANT_HEADER = "X-Tenant-Id"
 _AUTHORIZATION_HEADER = "Authorization"
@@ -419,6 +452,12 @@ _AUDIT_BUNDLE_QUERY_PARAMS = frozenset({"tenant_id"})
 # parameter, or any duplicated key, is an invalid request.
 _AUDIT_DIAGNOSIS_QUERY_PARAMS = frozenset({"tenant_id"})
 
+# The query parameters the GET /requests/{request_id}/deletion-receipt
+# read understands: only ``tenant_id``, which keeps its historical
+# header-or-query resolution and is validated separately. Any other
+# parameter, or any duplicated key, is an invalid request.
+_DELETION_RECEIPT_QUERY_PARAMS = frozenset({"tenant_id"})
+
 # The JSON body keys of the POST /policy-catalog/versions publication:
 # exactly the tenant and the two catalogs, nothing else.
 _POLICY_CATALOG_PUBLISH_KEYS = frozenset(
@@ -458,6 +497,20 @@ _AUDIT_BUNDLE_GENERATION_FIELDS = frozenset(
     {"generation", "key_fingerprint", "effective_at"}
 )
 
+# The exact field set and order of a deletion receipt, mirrored from the
+# storage layer's renderer so a corrupt or substituted store can never
+# serialise a subject, a raw scope, an idempotency key, a credential or
+# any key material into the body.
+_DELETION_RECEIPT_FIELDS = (
+    "tenant_id",
+    "request_id",
+    "created_at",
+    "completed_at",
+    "scope_digest",
+    "attempt_digest",
+    "tag",
+)
+
 _UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -471,6 +524,7 @@ _METHOD_NOT_ALLOWED = "method_not_allowed"
 _IDEMPOTENCY_CONFLICT = "idempotency_conflict"
 _POLICY_CATALOG_CONFLICT = "policy_catalog_conflict"
 _AUDIT_BUNDLE_UNAVAILABLE = "audit_bundle_unavailable"
+_RECEIPT_UNAVAILABLE = "receipt_unavailable"
 _STORAGE_UNAVAILABLE = "storage_unavailable"
 
 
@@ -761,6 +815,12 @@ class DeferredRequestStore:
         # snapshot and the read never writes anything.
         return self._ready().export_audit_bundle(tenant_id, request_id)
 
+    def get_receipt(self, tenant_id, request_id):
+        # Serves the read-only GET /requests/{request_id}/deletion-receipt
+        # endpoint; the settled first receipt is recovered byte-for-byte
+        # without any signature key and the read never writes anything.
+        return self._ready().get_receipt(tenant_id, request_id)
+
 
 def _normalize_request_id(value: str) -> str:
     """Validate a request id as a UUID and return its canonical text."""
@@ -822,13 +882,14 @@ def make_handler(
                 # Empty or nested segments do not name a request.
                 if segment and "/" not in segment:
                     return "item", segment
-                # The six read-only observability sub-resources live
+                # The seven read-only observability sub-resources live
                 # under a request id: /requests/{id}/status,
                 # /requests/{id}/execution-log,
                 # /requests/{id}/tombstones,
                 # /requests/{id}/evidence,
-                # /requests/{id}/audit-diagnosis and
-                # /requests/{id}/audit-bundle, alongside the single
+                # /requests/{id}/audit-diagnosis,
+                # /requests/{id}/audit-bundle and
+                # /requests/{id}/deletion-receipt, alongside the single
                 # reconciliation action /requests/{id}/reconcile. Deeper
                 # nesting or any other suffix stays an unknown path (404).
                 if "/" in segment:
@@ -846,6 +907,8 @@ def make_handler(
                             return "audit_diagnosis", item_id
                         if suffix == _AUDIT_BUNDLE_RESOURCE:
                             return "audit_bundle", item_id
+                        if suffix == _DELETION_RECEIPT_RESOURCE:
+                            return "deletion_receipt", item_id
                         if suffix == _RECONCILE_RESOURCE:
                             return "reconcile", item_id
             return None, None
@@ -1040,10 +1103,10 @@ def make_handler(
                 )
                 return
             # item (acceptance receipt), status, execution_log,
-            # tombstones, evidence, audit_diagnosis and audit_bundle are
-            # the seven GET-only reads; authorization, tenant/id
-            # resolution and the resulting error ordering are shared by
-            # all of them.
+            # tombstones, evidence, audit_diagnosis, audit_bundle and
+            # deletion_receipt are the eight GET-only reads;
+            # authorization, tenant/id resolution and the resulting
+            # error ordering are shared by all of them.
             assert segment is not None
             resolved = self._resolve_read(segment)
             if resolved is None:
@@ -1061,6 +1124,8 @@ def make_handler(
                 self._serve_audit_diagnosis(tenant_id, request_id)
             elif kind == "audit_bundle":
                 self._serve_audit_bundle(tenant_id, request_id)
+            elif kind == "deletion_receipt":
+                self._serve_deletion_receipt(tenant_id, request_id)
             else:
                 self._serve_tombstones(tenant_id, request_id)
 
@@ -1384,6 +1449,119 @@ def make_handler(
             for values in params.values():
                 if len(values) != 1:
                     raise _BadRequest("duplicate query parameter")
+
+        def _serve_deletion_receipt(self, tenant_id: str, request_id: str) -> None:
+            # The deletion-receipt read shares the other GET reads'
+            # authorization and tenant/id resolution (done by the
+            # caller); the tenant-only query gate runs here, before
+            # storage is touched. The store recovers the already-settled
+            # first receipt strictly read-only: the read never mints a
+            # receipt, never registers a key generation and never
+            # advances any state, and no signature key is presented.
+            try:
+                self._deletion_receipt_query_gate()
+            except _BadRequest:
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            try:
+                text = store.get_receipt(tenant_id, request_id)
+            except RequestNotFound:
+                # Malformed, unknown and cross-tenant ids share one
+                # detail-free outcome.
+                self._reply_error(404, _NOT_FOUND)
+                return
+            except ValueError:
+                # Defence in depth: the HTTP validation above is
+                # authoritative, but a rejected store call reads nothing
+                # and maps to the same client error.
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            except ReceiptUnavailable:
+                # The request exists but no first receipt has settled:
+                # accepted, processing, failed or completed without a
+                # settled execution record all share this one outcome.
+                self._reply_error(409, _RECEIPT_UNAVAILABLE)
+                return
+            except _StorageUnavailable:
+                _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
+                self._reply_error(503, _STORAGE_UNAVAILABLE)
+                return
+            except (sqlite3.Error, RuntimeError, OSError):
+                # An unreadable database, a corrupt persisted receipt or
+                # a snapshot that cannot be taken consistently surfaces
+                # as the fixed-text storage error; sqlite text (locks,
+                # malformed images, paths) must never reach the client.
+                _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
+                self._reply_error(503, _STORAGE_UNAVAILABLE)
+                return
+            self._reply_deletion_receipt(text)
+
+        def _deletion_receipt_query_gate(self) -> None:
+            """Reject any query parameter other than a single ``tenant_id``.
+
+            The receipt read takes no business parameters; ``tenant_id``
+            keeps its historical header-or-query resolution in
+            ``_tenant_id``. An unknown parameter or any duplicated key
+            (including ``tenant_id`` itself) is a bad request.
+            """
+            params = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+            if not set(params) <= _DELETION_RECEIPT_QUERY_PARAMS:
+                raise _BadRequest("unknown query parameter")
+            for values in params.values():
+                if len(values) != 1:
+                    raise _BadRequest("duplicate query parameter")
+
+        def _reply_deletion_receipt(self, text: object) -> None:
+            # The body is the store's verbatim single-line compact JSON
+            # text with its single trailing newline. It is still
+            # re-validated field by field before it is emitted: a
+            # corrupt or substituted store must never serialise a
+            # subject, a raw scope, an idempotency key, a worker, a
+            # credential, a key fingerprint or any key material into the
+            # body, and a malformed receipt surfaces as the stable
+            # storage code, never as a partial text.
+            if (
+                not isinstance(text, str)
+                or not text.endswith("\n")
+                or text.endswith("\n\n")
+                or "\n" in text[:-1]
+                or "\r" in text
+            ):
+                raise RuntimeError("malformed deletion receipt from store")
+            try:
+                payload = json.loads(text[:-1])
+            except ValueError:
+                raise RuntimeError("malformed deletion receipt from store") from None
+            if not isinstance(payload, dict) or set(payload) != set(
+                _DELETION_RECEIPT_FIELDS
+            ):
+                raise RuntimeError("malformed deletion receipt from store")
+            for name in _DELETION_RECEIPT_FIELDS:
+                value = payload[name]
+                if not isinstance(value, str) or not value:
+                    raise RuntimeError("malformed deletion receipt from store")
+            for name in ("created_at", "completed_at"):
+                if not _RFC3339_RE.match(payload[name]):
+                    raise RuntimeError("malformed deletion receipt from store")
+            for name in ("scope_digest", "attempt_digest", "tag"):
+                if not _HEX_DIGEST_RE.match(payload[name]):
+                    raise RuntimeError("malformed deletion receipt from store")
+            # The emitted bytes must be exactly the compact single-line
+            # rendering of the validated payload in the fixed field
+            # order; anything else (extra whitespace, a reserialised
+            # duplicate key, a reordered field) is not the store's
+            # verbatim text.
+            canonical = (
+                json.dumps(
+                    {name: payload[name] for name in _DELETION_RECEIPT_FIELDS},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+            if text != canonical:
+                raise RuntimeError("malformed deletion receipt from store")
+            self._write_body(200, text.encode("utf-8"))
 
         def _serve_tombstones(self, tenant_id: str, request_id: str) -> None:
             # The tombstone page read shares the other GET reads'
