@@ -12350,7 +12350,9 @@ class RequestStore:
     def get_receipt(self, tenant_id: str, request_id: str) -> str:
         """Recover the already-settled first deletion receipt, read-only.
 
-        Storage-layer only; never routed over HTTP. A caller that lost
+        Backs the read-only ``GET /requests/{request_id}/deletion-receipt``
+        HTTP endpoint and remains a storage-layer method as well. A caller
+        that lost
         the first :meth:`generate_receipt` result recovers it by tenant
         and request id alone: no signature key is presented, and the
         read is unaffected by the tenant's current receipt key
