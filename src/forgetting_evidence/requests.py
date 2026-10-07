@@ -2905,6 +2905,94 @@ def read_audit_bundle(
     return text
 
 
+def read_deletion_receipt(
+    db_path: str | os.PathLike[str],
+    tenant_id: str,
+    request_id: str,
+) -> str:
+    """Recover the settled first deletion receipt without opening for writes.
+
+    This is the strictly read-only lookup behind the ``deletion-receipt``
+    command. It follows :meth:`RequestStore.get_receipt` semantics
+    exactly -- the same ownership probe and receipt row read in one
+    consistent snapshot, the same strict persisted-record check (the
+    stored text must parse as a receipt and be exactly its canonical
+    rendering), the same byte-for-byte recovery with no signature key
+    and no dependence on the tenant's current receipt key generation,
+    and the same indistinguishable :class:`RequestNotFound` for invalid,
+    unknown, cross-tenant or never-accepted ids -- but it never creates
+    the database, never runs schema DDL and never writes any
+    bookkeeping, so the call never mints a missing receipt, never
+    registers a generation-1 key, and adds no status event, execution
+    attempt, anchor or audit record. A request that exists but has no
+    first receipt -- accepted, processing or failed, or completed in
+    status without a settled completed execution record -- raises
+    :class:`ReceiptUnavailable`. The file is opened read-only and only
+    committed rows are read, so a missing, unreadable, locked or corrupt
+    database -- or a stored receipt that cannot be rebuilt to the
+    receipt specification -- surfaces as the same fixed-text
+    :class:`OSError` storage failure; the underlying exception, the
+    path, the tenant, the request id, the receipt content and any SQL
+    never leak to the caller.
+    """
+    if isinstance(db_path, os.PathLike):
+        db_path = os.fspath(db_path)
+    if not isinstance(db_path, str) or not db_path:
+        raise ValueError("storage path must be a non-empty string")
+    tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+    request_id = _require_identifier(request_id)
+    # Open the existing file read-only: a missing path fails instead of
+    # being created, and no schema, repair or bookkeeping write can ever
+    # occur.
+    uri = pathlib.Path(os.path.abspath(db_path)).as_uri() + "?mode=ro"
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=_BUSY_TIMEOUT_MS / 1000)
+    except sqlite3.Error:
+        raise _storage_failure() from None
+    try:
+        try:
+            # One explicit read-only transaction: the ownership probe
+            # and the receipt row are read from a single consistent
+            # snapshot, so a concurrent mint is observed either as the
+            # pre-commit state or as the committed first receipt --
+            # never a partial line.
+            conn.execute("BEGIN")
+            try:
+                owner = conn.execute(
+                    "SELECT 1 FROM requests "
+                    "WHERE tenant_id = ? AND request_id = ?",
+                    (tenant_id, request_id),
+                ).fetchone()
+                if owner is None:
+                    # Identical outcome for unknown, cross-tenant and
+                    # never-accepted ids: the response must not reveal
+                    # which records exist.
+                    raise RequestNotFound("request not found")
+                stored = RequestStore._load_receipt_row_locked(
+                    conn, tenant_id, request_id
+                )
+            except BaseException:
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+            conn.execute("COMMIT")
+        except (RequestNotFound, OSError):
+            raise
+        except sqlite3.Error:
+            raise _storage_failure() from None
+    finally:
+        conn.close()
+    # The request exists but no first receipt has committed. The read
+    # never mints one: accepted, processing, failed and
+    # completed-without-settled-execution requests share this one
+    # detail-free outcome.
+    if stored is None:
+        raise ReceiptUnavailable(_RECEIPT_UNAVAILABLE_MESSAGE)
+    return stored[1]
+
+
 # Allowed request lifecycle. completed and failed are terminal; moving a
 # request to the status it already holds is an idempotent no-op.
 _STATUS_ACCEPTED = "accepted"
