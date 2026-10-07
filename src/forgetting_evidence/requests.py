@@ -220,6 +220,16 @@ event is also stored on the request row, so deleting, modifying,
 inserting or reordering persisted events breaks verification. The hash
 preimage is never exposed in return values, exceptions or logs.
 
+:meth:`RequestStore.get_audit_timeline` backs the read-only
+``GET /requests/{request_id}/audit-timeline`` HTTP endpoint: the
+current status, the persisted head and the ordered events are read
+from one committed snapshot and replayed before rendering, so a
+deleted, altered, inserted or reordered event, a non-monotonic or
+malformed occurrence time, a replaced head or a current status
+split from the final event raises the fixed-text :class:`OSError`
+instead of returning a partial, fabricated or
+mixed-transaction timeline. The read never writes anything.
+
 A database-only chain cannot, however, tell a genuine timeline from
 one an attacker rewrote in full: with the file in hand every event,
 every request head and every commitment stored *in that file* can be
@@ -3059,6 +3069,21 @@ _ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     _STATUS_COMPLETED: frozenset(),
     _STATUS_FAILED: frozenset(),
 }
+
+# The only statuses a timeline event may carry, mirrored for the read-only
+# timeline so a corrupt or substituted row can never serialise another
+# value.
+_TIMELINE_STATUSES = frozenset(
+    {_STATUS_ACCEPTED, _STATUS_PROCESSING, _STATUS_COMPLETED, _STATUS_FAILED}
+)
+
+# The canonical UTC RFC3339 shape every persisted occurrence time is
+# written with by _format_rfc3339: a Z suffix and a six-digit
+# microsecond fraction, so two values sort lexicographically in time
+# order and a timeline never serialises a malformed timestamp.
+_TIMELINE_RFC3339_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$"
+)
 
 # Execution leasing. A claim is held for at most 3600 seconds; a lease that
 # has expired makes the request claimable again, starting a fresh attempt.
@@ -10845,6 +10870,168 @@ class RequestStore:
             "chain_hash": reported_head,
             "verified": verified,
         }
+
+    def get_audit_timeline(
+        self, tenant_id: str, request_id: str
+    ) -> dict[str, object]:
+        """Return one request's status-event timeline for the HTTP read.
+
+        Backs the read-only ``GET /requests/{request_id}/audit-timeline``
+        HTTP endpoint and remains a storage-layer method as well. Unlike the
+        acceptance receipt, the current status and the execution log, this
+        read answers the one question those cannot: the request's status
+        history in occurrence order. The request row (current status and
+        persisted chain head) and the full ordered state-event timeline are
+        read inside a single read-only transaction, so a status advance or
+        a concurrent writer can never let the response mix two committed
+        states: a half-settled timeline is never returned.
+
+        The result contains exactly ``request_id`` and ``events``; each
+        event contains exactly ``status`` and ``occurred_at``. Events are
+        the persisted state events in sequence order: the first is the
+        ``accepted`` acceptance event and only genuine status changes were
+        appended afterwards, so a repeated transition to the current
+        status never adds an event. Execution attempts, tombstones,
+        receipts and audit-anchor records are never part of the timeline.
+
+        The read is strictly consistent: a response is rendered only when
+        the snapshot is whole -- at least one event, sequences gap-free
+        from zero, the first status ``accepted``, every later status an edge
+        the fixed lifecycle allows from its predecessor, every status one
+        of the four lifecycle statuses, every ``occurred_at`` a
+        canonical UTC RFC3339 ``Z`` timestamp that never goes
+        backwards, every chain link replaying from the genesis
+        predecessor to the head persisted on the request row, and the
+        final event's status equal to the current persisted status. Any
+        deleted, altered, inserted or reordered event, a non-monotonic
+        or malformed timestamp, a replaced head, or a current status
+        split from the final event raises the fixed-text
+        :class:`OSError` instead of returning a partial, forged or
+        mixed-transaction timeline. The read never writes, repairs,
+        backfills, recomputes or overwrites any record, so repeated
+        reads -- including after a rebuild -- return the same order and
+        the same timestamps.
+
+        Invalid, unknown and cross-tenant ids raise
+        :class:`RequestNotFound` with one detail-free outcome; a
+        non-string or empty *tenant_id* raises :class:`ValueError`.
+        """
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        request_id = _require_identifier(request_id)
+        if self._mem_conn is not None:
+            with self._write_lock:
+                return self._get_audit_timeline(tenant_id, request_id)
+        return self._get_audit_timeline(tenant_id, request_id)
+
+    def _get_audit_timeline(
+        self, tenant_id: str, request_id: str
+    ) -> dict[str, object]:
+        conn = self._connect()
+        try:
+            try:
+                # One explicit read-only transaction covers every read: the
+                # current status and anchored head and the full ordered
+                # timeline are the same committed snapshot, so a
+                # concurrent transition can never contribute the new current
+                # status with the old events or vice versa.
+                conn.execute("BEGIN")
+                try:
+                    owner = conn.execute(
+                        "SELECT status, chain_hash FROM requests "
+                        "WHERE tenant_id = ? AND request_id = ?",
+                        (tenant_id, request_id),
+                    ).fetchone()
+                    if owner is None:
+                        # Identical outcome for unknown ids and
+                        # cross-tenant lookups; the enclosing handler
+                        # rolls the read transaction back before this
+                        # propagates.
+                        raise RequestNotFound("request not found")
+                    current_status, anchored_head = owner
+                    rows = conn.execute(
+                        "SELECT seq, status, occurred_at, chain_hash "
+                        "FROM status_events "
+                        "WHERE tenant_id = ? AND request_id = ? ORDER BY seq",
+                        (tenant_id, request_id),
+                    ).fetchall()
+                except BaseException:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
+                conn.execute("COMMIT")
+            except RequestNotFound:
+                raise
+            except sqlite3.Error:
+                # Never surface the database engine's own error text.
+                raise _storage_failure() from None
+        finally:
+            self._release(conn)
+
+        events: list[dict[str, str]] = []
+        previous_occurred_at: str | None = None
+        predecessor = _GENESIS_PREDECESSOR
+        for expected_seq, row in enumerate(rows):
+            seq, status, occurred_at, stored_hash = row
+            # A malformed row, a gap, an out-of-domain status, a
+            # backwards or malformed timestamp, or a link that does not
+            # replay to its persisted hash means the history is damaged:
+            # never render a partial or fabricated timeline.
+            if (
+                not isinstance(seq, int)
+                or isinstance(seq, bool)
+                or seq != expected_seq
+                or not isinstance(status, str)
+                or status not in _TIMELINE_STATUSES
+                or not isinstance(occurred_at, str)
+                or not _TIMELINE_RFC3339_RE.match(occurred_at)
+                or not _is_chain_hash(stored_hash)
+            ):
+                raise _storage_failure()
+            if expected_seq == 0:
+                # The first event is always the acceptance event.
+                if status != _STATUS_ACCEPTED:
+                    raise _storage_failure()
+            else:
+                # Later events record only genuine lifecycle edges; the
+                # writer never appends a repeated current status, so a
+                # same-status run means an out-of-band alteration.
+                if status not in _ALLOWED_TRANSITIONS[events[-1]["status"]]:
+                    raise _storage_failure()
+            if (
+                previous_occurred_at is not None
+                and occurred_at < previous_occurred_at
+            ):
+                # Occurrence times never go backwards.
+                raise _storage_failure()
+            recomputed = _chain_hash(
+                tenant_id,
+                request_id,
+                seq,
+                status,
+                occurred_at,
+                predecessor,
+            )
+            # Constant-time comparison; either mismatch breaks the chain.
+            if not hmac.compare_digest(recomputed, stored_hash):
+                raise _storage_failure()
+            predecessor = stored_hash
+            previous_occurred_at = occurred_at
+            events.append({"status": status, "occurred_at": occurred_at})
+
+        # At least the genesis event must exist, the final link must be
+        # the head anchored on the request row, and the final event's
+        # status must be the authoritative current persisted status.
+        if (
+            not events
+            or not isinstance(current_status, str)
+            or not _is_chain_hash(anchored_head)
+            or not hmac.compare_digest(predecessor, anchored_head)
+            or events[-1]["status"] != current_status
+        ):
+            raise _storage_failure()
+        return {"request_id": request_id, "events": events}
 
     # -- external trust anchors ---------------------------------------
 

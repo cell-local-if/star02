@@ -1,7 +1,7 @@
 """HTTP layer for deletion-request acceptance, lookup, observation and
 single-request and batched reconciliation.
 
-The service exposes sixteen business endpoints:
+The service exposes seventeen business endpoints:
 
 * ``POST /requests`` -- accept a deletion request for a tenant. The JSON
   body must carry non-empty ``tenant_id``, ``subject_id`` and
@@ -103,6 +103,35 @@ The service exposes sixteen business endpoints:
   still take precedence over the conditional evaluation: the tag is
   only compared once the evidence has been read, and the conditional
   read never writes to the database or changes the rendered bytes.
+* ``GET /requests/{request_id}/audit-timeline`` -- read-only
+  request-level status-history timeline. The tenant follows the existing
+  ``X-Tenant-Id``/query rule and the endpoint requires the
+  ``request:read`` role; the query string accepts no parameter other
+  than ``tenant_id`` -- a duplicated key, an unknown parameter or a
+  missing or empty tenant answers 400. The single-line JSON body
+  carries exactly ``request_id`` and ``events``; ``events`` are the
+  persisted state events in occurrence order, each carrying exactly
+  ``status`` and ``occurred_at`` (a canonical UTC RFC3339
+  timestamp). The first event is the ``accepted`` acceptance event;
+  only genuine status changes follow -- repeating the current status
+  never appends an event -- and the final event's status equals the
+  current persisted status. Execution attempts, tombstones, receipts
+  and audit-chain/anchor events never enter the timeline. The request
+  row and the ordered events are read from one committed snapshot
+  and every link, sequence, edge, timestamp and head is replayed
+  from that snapshot before anything renders, so an unreadable
+  database, a damaged event or a history that cannot be read
+  consistently answers 503 with the single ``error`` field only --
+  never a half-timeline, a fabricated event or records mixed across
+  transactions. Repeated reads and reads after a restart return the
+  same order and the same timestamps. The read never advances
+  state, never creates an attempt, a tombstone or a receipt, never
+  writes an audit-chain record, an anchor, a policy catalog or
+  inspection bookkeeping, and no subject, raw scope, idempotency
+  key, token, claim credential, worker, SQL text or filesystem path
+  is ever exposed. A malformed, unknown or cross-tenant request id
+  answers 404; other methods answer 405 with ``Allow: GET`` and
+  HEAD answers 405 with no body; a deeper path stays 404.
 * ``GET /requests/{request_id}/audit-diagnosis`` -- read-only diagnosis
   of the request's persisted audit chain, the reason-carrying companion
   of the evidence verdict. The tenant follows the existing
@@ -381,6 +410,7 @@ summaries (:meth:`RequestStore.audit_inspection_summary` and
 the storage layer and are deliberately not exposed over HTTP: over HTTP
 the service opens request acceptance, the acceptance-receipt lookup, the
 read-only tenant-scoped listing, the six read-only observation reads,
+the read-only request-level status timeline,
 the read-only audit-chain diagnosis, the read-only audit-bundle export,
 the read-only deletion-receipt recovery, the single-request execution
 reconciliation, the read-only
@@ -394,6 +424,8 @@ execution log (:meth:`RequestStore.get_execution_log`), the tombstone
 page read (:meth:`RequestStore.page_deletion_tombstones`), the
 single-snapshot request evidence read
 (:meth:`RequestStore.get_request_evidence`), the
+single-snapshot request status timeline read
+(:meth:`RequestStore.get_audit_timeline`), the
 read-only audit-chain diagnosis
 (:meth:`RequestStore.diagnose_chain`), the
 audit-bundle export
@@ -431,6 +463,9 @@ listing read renders exactly ``items`` and ``next_cursor``, each item
 rendering exactly ``request_id``, ``status`` and ``created_at``. The
 evidence read renders exactly ``request_id``, ``status``,
 ``event_count``, ``chain_hash`` and ``verified``. The
+audit-timeline read renders exactly ``request_id`` and
+``events``; each event renders exactly ``status`` and
+``occurred_at``. The
 audit-diagnosis read renders exactly ``request_id``, ``trusted`` and
 ``reasons``. The
 audit-bundle export renders the store's verbatim single-line compact
@@ -471,7 +506,7 @@ for a configured principal: a missing/malformed/unknown token answers
 endpoint, or acting on a tenant other than its own ``tenant_id``,
 answers ``403 forbidden``. ``POST /requests`` requires
 ``request:submit`` and the target tenant is the body's ``tenant_id``;
-each of the ten GET endpoints requires
+each of the eleven GET endpoints requires
 ``request:read`` and the target tenant follows the existing
 ``X-Tenant-Id``/query rule; the
 single-request reconciliation ``POST /requests/{request_id}/reconcile``
@@ -545,6 +580,7 @@ _STATUS_RESOURCE = "status"
 _EXECUTION_LOG_RESOURCE = "execution-log"
 _TOMBSTONES_RESOURCE = "tombstones"
 _EVIDENCE_RESOURCE = "evidence"
+_AUDIT_TIMELINE_RESOURCE = "audit-timeline"
 _AUDIT_DIAGNOSIS_RESOURCE = "audit-diagnosis"
 _AUDIT_BUNDLE_RESOURCE = "audit-bundle"
 _DELETION_RECEIPT_RESOURCE = "deletion-receipt"
@@ -580,6 +616,25 @@ _TERMINAL_RESULTS = frozenset({"completed", "failed"})
 # ``status`` filter and may serialise in an item.
 _REQUEST_STATUSES = frozenset({"accepted", "processing", "completed", "failed"})
 
+# The fixed lifecycle edges a timeline may show between consecutive
+# events, mirrored from the storage layer so a corrupt or
+# substituted store can never serialise a repeated current status or an
+# edge the state machine does not allow.
+_TIMELINE_TRANSITIONS = {
+    "accepted": frozenset({"processing", "failed"}),
+    "processing": frozenset({"completed", "failed"}),
+    "completed": frozenset(),
+    "failed": frozenset(),
+}
+
+# The canonical UTC RFC3339 shape every timeline occurrence time
+# carries: the store writes a Z suffix and a six-digit microsecond
+# fraction, so two values sort lexicographically in time order and a
+# malformed or substituted timestamp never serialises.
+_TIMESTAMP_RFC3339_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$"
+)
+
 # The query parameters the GET /requests listing understands; anything
 # else is an invalid request.
 _LIST_QUERY_PARAMS = frozenset(
@@ -604,6 +659,12 @@ _POLICY_CATALOG_QUERY_PARAMS = frozenset({"tenant_id"})
 # header-or-query resolution and is validated separately. Any other
 # parameter, or any duplicated key, is an invalid request.
 _AUDIT_BUNDLE_QUERY_PARAMS = frozenset({"tenant_id"})
+
+# The query parameters the GET /requests/{request_id}/audit-timeline
+# read understands: only ``tenant_id``, which keeps its historical
+# header-or-query resolution and is validated separately. Any other
+# parameter, or any duplicated key, is an invalid request.
+_AUDIT_TIMELINE_QUERY_PARAMS = frozenset({"tenant_id"})
 
 # The query parameters the GET /requests/{request_id}/audit-diagnosis
 # read understands: only ``tenant_id``, which keeps its historical
@@ -1006,6 +1067,14 @@ class DeferredRequestStore:
         # the read never writes anything.
         return self._ready().get_request_evidence(tenant_id, request_id)
 
+    def get_audit_timeline(self, tenant_id, request_id):
+        # Serves the read-only GET /requests/{request_id}/audit-timeline
+        # endpoint; the current status and the ordered state-event
+        # timeline come from one committed snapshot, the read only
+        # succeeds when that history is whole and it never writes
+        # anything.
+        return self._ready().get_audit_timeline(tenant_id, request_id)
+
     def export_audit_bundle(self, tenant_id, request_id):
         # Serves the read-only GET /requests/{request_id}/audit-bundle
         # endpoint; the settled chain is frozen from one committed
@@ -1092,11 +1161,12 @@ def make_handler(
                 # Empty or nested segments do not name a request.
                 if segment and "/" not in segment:
                     return "item", segment
-                # The seven read-only observability sub-resources live
+                # The eight read-only observability sub-resources live
                 # under a request id: /requests/{id}/status,
                 # /requests/{id}/execution-log,
                 # /requests/{id}/tombstones,
                 # /requests/{id}/evidence,
+                # /requests/{id}/audit-timeline,
                 # /requests/{id}/audit-diagnosis,
                 # /requests/{id}/audit-bundle and
                 # /requests/{id}/deletion-receipt, alongside the single
@@ -1113,6 +1183,8 @@ def make_handler(
                             return "tombstones", item_id
                         if suffix == _EVIDENCE_RESOURCE:
                             return "evidence", item_id
+                        if suffix == _AUDIT_TIMELINE_RESOURCE:
+                            return "audit_timeline", item_id
                         if suffix == _AUDIT_DIAGNOSIS_RESOURCE:
                             return "audit_diagnosis", item_id
                         if suffix == _AUDIT_BUNDLE_RESOURCE:
@@ -1335,10 +1407,10 @@ def make_handler(
                 self._serve_audit_inspection()
                 return
             # item (acceptance receipt), status, execution_log,
-            # tombstones, evidence, audit_diagnosis, audit_bundle and
-            # deletion_receipt are the eight GET-only reads;
-            # authorization, tenant/id resolution and the resulting
-            # error ordering are shared by all of them.
+            # tombstones, evidence, audit_timeline, audit_diagnosis,
+            # audit_bundle and deletion_receipt are the nine GET-only
+            # reads; authorization, tenant/id resolution and the
+            # resulting error ordering are shared by all of them.
             assert segment is not None
             resolved = self._resolve_read(segment)
             if resolved is None:
@@ -1352,6 +1424,8 @@ def make_handler(
                 self._serve_execution_log(tenant_id, request_id)
             elif kind == "evidence":
                 self._serve_evidence(tenant_id, request_id)
+            elif kind == "audit_timeline":
+                self._serve_audit_timeline(tenant_id, request_id)
             elif kind == "audit_diagnosis":
                 self._serve_audit_diagnosis(tenant_id, request_id)
             elif kind == "audit_bundle":
@@ -1510,6 +1584,68 @@ def make_handler(
                 self._reply_error(503, _STORAGE_UNAVAILABLE)
                 return
             self._reply_evidence(record, if_none_match)
+
+        def _serve_audit_timeline(self, tenant_id: str, request_id: str) -> None:
+            # The timeline read shares the other GET reads'
+            # authorization and tenant/id resolution (done by the
+            # caller); the tenant-only query gate runs here, before
+            # storage is touched. The store produces the current status
+            # and the whole ordered state-event timeline from one
+            # committed snapshot and only renders once that history is
+            # whole; a damaged event, a split current status or an
+            # unreadable snapshot is a storage fault, never a partial,
+            # forged or mixed-transaction response. The read never
+            # advances state and never creates an attempt, a tombstone,
+            # a receipt, an audit-chain record, an anchor, a policy
+            # catalog or inspection bookkeeping.
+            try:
+                self._audit_timeline_query_gate()
+            except _BadRequest:
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            try:
+                timeline = store.get_audit_timeline(tenant_id, request_id)
+            except RequestNotFound:
+                # Malformed, unknown and cross-tenant ids share one
+                # detail-free outcome.
+                self._reply_error(404, _NOT_FOUND)
+                return
+            except ValueError:
+                # Defence in depth: the HTTP resolution above is
+                # authoritative, but a rejected store call reads nothing
+                # and maps to the same client error.
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            except _StorageUnavailable:
+                _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
+                self._reply_error(503, _STORAGE_UNAVAILABLE)
+                return
+            except (sqlite3.Error, RuntimeError, OSError):
+                # An unreadable database, corrupt state events or a
+                # history that cannot be read consistently surfaces as
+                # the fixed-text storage error; sqlite text (locks,
+                # malformed images, paths) must never reach the
+                # client, and no half-timeline is ever rendered.
+                _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
+                self._reply_error(503, _STORAGE_UNAVAILABLE)
+                return
+            self._reply_audit_timeline(timeline)
+
+        def _audit_timeline_query_gate(self) -> None:
+            """Reject any query parameter other than a single ``tenant_id``.
+
+            The timeline read takes no business parameters;
+            ``tenant_id`` keeps its historical header-or-query
+            resolution in ``_tenant_id``. An unknown parameter or
+            any duplicated key (including ``tenant_id`` itself) is a
+            bad request.
+            """
+            params = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+            if not set(params) <= _AUDIT_TIMELINE_QUERY_PARAMS:
+                raise _BadRequest("unknown query parameter")
+            for values in params.values():
+                if len(values) != 1:
+                    raise _BadRequest("duplicate query parameter")
 
         def _serve_audit_diagnosis(self, tenant_id: str, request_id: str) -> None:
             # The audit-diagnosis read shares the other GET reads'
@@ -2983,6 +3119,85 @@ def make_handler(
                 self._reply_not_modified(etag)
                 return
             self._write_body(200, body, etag=etag)
+
+        def _reply_audit_timeline(self, timeline: object) -> None:
+            # Whitelist and re-render every field: even a store
+            # substitute that returned extra keys could not leak a
+            # subject, a raw scope, an idempotency key, an attempt,
+            # a tombstone, a receipt, an anchor, a credential or any
+            # other request field into the body. Shapes and value
+            # domains are re-checked so a corrupt timeline never
+            # serialises into a partially-formed or fabricated
+            # history. Field order is fixed: request_id, events;
+            # each event renders exactly status and occurred_at.
+            if not isinstance(timeline, dict) or set(timeline) != {
+                "request_id",
+                "events",
+            }:
+                raise RuntimeError("malformed audit timeline from store")
+            request_id = timeline["request_id"]
+            events = timeline["events"]
+            if (
+                not isinstance(request_id, str)
+                or not _UUID_RE.match(request_id)
+                or not isinstance(events, list)
+                or not events
+            ):
+                raise RuntimeError("malformed audit timeline from store")
+            rendered_events: list[dict[str, str]] = []
+            previous_occurred_at: str | None = None
+            for index, event in enumerate(events):
+                if not isinstance(event, dict) or set(event) != {
+                    "status",
+                    "occurred_at",
+                }:
+                    raise RuntimeError("malformed audit timeline from store")
+                status = event["status"]
+                occurred_at = event["occurred_at"]
+                if (
+                    not isinstance(status, str)
+                    or status not in _REQUEST_STATUSES
+                    or not isinstance(occurred_at, str)
+                    or not _TIMESTAMP_RFC3339_RE.match(occurred_at)
+                ):
+                    raise RuntimeError("malformed audit timeline from store")
+                if index == 0:
+                    # The first event is always the acceptance event.
+                    if status != "accepted":
+                        raise RuntimeError(
+                            "malformed audit timeline from store"
+                        )
+                else:
+                    # Later events record only genuine lifecycle edges;
+                    # a repeated current status is never appended.
+                    if (
+                        status
+                        not in _TIMELINE_TRANSITIONS[
+                            rendered_events[-1]["status"]
+                        ]
+                    ):
+                        raise RuntimeError(
+                            "malformed audit timeline from store"
+                        )
+                # Occurrence times never go backwards.
+                if (
+                    previous_occurred_at is not None
+                    and occurred_at < previous_occurred_at
+                ):
+                    raise RuntimeError("malformed audit timeline from store")
+                previous_occurred_at = occurred_at
+                rendered_events.append(
+                    {"status": status, "occurred_at": occurred_at}
+                )
+            body = (
+                json.dumps(
+                    {"request_id": request_id, "events": rendered_events},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+            self._write_body(200, body)
 
         def _reply_audit_diagnosis(self, request_id: str, reasons: object) -> None:
             # Whitelist and re-render every field: even a store
