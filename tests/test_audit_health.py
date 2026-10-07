@@ -11,7 +11,8 @@ secret), the single read-only consistent snapshot under concurrent
 writes, strict read-only behaviour (no batches, cursors, evidence or
 business writes), validation without writes, the fixed-text
 ``audit_health_failed`` OSError contract, repeatability across rebuilds
-and the absence of any HTTP route or health-command change.
+and the HTTP route now serving the same snapshot while the health
+command stays unchanged.
 """
 
 import http.client
@@ -577,10 +578,10 @@ class HealthHttpSurfaceTests(_StoreCase):
         thread.start()
         return server, thread
 
-    def test_no_http_route_or_delegate_is_added(self):
+    def test_http_route_and_delegate_serve_the_snapshot(self):
         store = self._store()
-        # The deferred HTTP store does not gain the storage-layer entry.
-        self.assertFalse(hasattr(httpapi.DeferredRequestStore, "audit_health"))
+        # The deferred HTTP store proxies the storage-layer entry.
+        self.assertTrue(hasattr(httpapi.DeferredRequestStore, "audit_health"))
         server, thread = self._serve(store)
         try:
             conn = http.client.HTTPConnection(
@@ -590,8 +591,12 @@ class HealthHttpSurfaceTests(_StoreCase):
                 for path in ("/audit-health", "/audit-health?tenant_id=tenant-a"):
                     conn.request("GET", path, headers={"X-Tenant-Id": "tenant-a"})
                     response = conn.getresponse()
-                    self.assertEqual(response.status, 404)
-                    response.read()
+                    self.assertEqual(response.status, 200)
+                    body = json.loads(response.read())
+                    self.assertEqual(body["total"], 0)
+                    self.assertEqual(body["verified"], 0)
+                    self.assertEqual(body["unverified"], 0)
+                    self.assertEqual(body["reasons"], [])
             finally:
                 conn.close()
         finally:

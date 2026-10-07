@@ -340,9 +340,10 @@ non-string reason -- or any storage fault is the fixed-text
 into success.
 
 :meth:`RequestStore.audit_health` complements the batched audit
-capability with an instantaneous tenant-wide health snapshot,
-storage-layer only like the rest of the audit capability and never
-routed over HTTP. It takes just a tenant identifier and reads every
+capability with an instantaneous tenant-wide health snapshot, backing
+the read-only HTTP ``GET /audit-health`` endpoint and remaining a
+storage-layer method as well. It takes just a tenant identifier and
+reads every
 request the tenant holds at the moment of the call from one consistent
 snapshot inside a single read-only transaction -- never creating a
 batch, advancing a cursor, repairing evidence or writing any business
@@ -9571,7 +9572,8 @@ class RequestStore:
     def audit_health(self, tenant_id: str) -> dict[str, object]:
         """Return an instantaneous read-only health snapshot of a tenant.
 
-        Storage-layer only; never routed over HTTP. The caller supplies
+        Backs the read-only HTTP ``GET /audit-health`` endpoint and
+        remains a storage-layer method as well. The caller supplies
         only the tenant identifier; the snapshot covers every request
         the tenant holds at the moment of the call, read from one
         consistent snapshot inside a single read-only transaction, so a
