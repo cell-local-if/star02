@@ -83,6 +83,26 @@ The service exposes fifteen business endpoints:
   completely answers 503. The read never creates or changes a request,
   a state event, an execution attempt, a tombstone, a receipt, a policy
   catalog or an audit anchor.
+  The read also honours HTTP conditional reads: every 200 response
+  carries a strong ``ETag`` of the form ``"sha256:<64 lowercase hex>"``
+  computed over the exact body bytes (including the trailing newline),
+  so the same evidence always yields the same tag -- across repeat
+  reads, concurrent readers and process restarts -- and any body change
+  (a status advance, a new event or a changed chain head) yields a
+  different tag. A request may send one ``If-None-Match`` header holding
+  a comma-separated list of entity tags; when any whitespace-stripped
+  double-quoted tag is exactly equal to the current tag, or a tag is
+  ``*``, the answer is ``304`` with no body, a zero ``Content-Length``
+  and the same ``ETag`` instead of the full 200 body. Non-matching
+  tags, lists where no tag matches and weak ``W/``-prefixed tags all
+  receive the full 200 body. More than one ``If-None-Match`` header, an
+  empty field value, a control character or a value that is neither a
+  legal double-quoted entity tag nor ``*`` answers 400 with exactly
+  ``invalid_request`` after authentication, tenant and request-id
+  resolution but before any storage access. The 404/503 outcomes above
+  still take precedence over the conditional evaluation: the tag is
+  only compared once the evidence has been read, and the conditional
+  read never writes to the database or changes the rendered bytes.
 * ``GET /requests/{request_id}/audit-diagnosis`` -- read-only diagnosis
   of the request's persisted audit chain, the reason-carrying companion
   of the evidence verdict. The tenant follows the existing
@@ -1357,10 +1377,17 @@ def make_handler(
         def _serve_evidence(self, tenant_id: str, request_id: str) -> None:
             # The evidence read shares the other GET reads'
             # authorization and tenant/id resolution (done by the
-            # caller). The store produces status, event count, the
-            # persisted chain head and the verification verdict from one
-            # committed snapshot; a tampered chain is still a successful
-            # read with verified false, never a storage fault.
+            # caller); the If-None-Match header validation runs here,
+            # before storage is touched. The store produces status,
+            # event count, the persisted chain head and the verification
+            # verdict from one committed snapshot; a tampered chain is
+            # still a successful read with verified false, never a
+            # storage fault.
+            try:
+                if_none_match = self._if_none_match_tags()
+            except _BadRequest:
+                self._reply_error(400, _INVALID_REQUEST)
+                return
             try:
                 record = store.get_request_evidence(tenant_id, request_id)
             except RequestNotFound:
@@ -1380,7 +1407,7 @@ def make_handler(
                 _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
                 self._reply_error(503, _STORAGE_UNAVAILABLE)
                 return
-            self._reply_evidence(record)
+            self._reply_evidence(record, if_none_match)
 
         def _serve_audit_diagnosis(self, tenant_id: str, request_id: str) -> None:
             # The audit-diagnosis read shares the other GET reads'
@@ -2464,7 +2491,9 @@ def make_handler(
                 "completed_at": completed_at,
             }
 
-        def _reply_evidence(self, record: object) -> None:
+        def _reply_evidence(
+            self, record: object, if_none_match: list[str] | None = None
+        ) -> None:
             # Whitelist and re-render every field: even a store substitute
             # that returned extra keys could not leak a subject, a scope,
             # an idempotency key, an occurred-at value, a credential or any
@@ -2517,7 +2546,17 @@ def make_handler(
                 )
                 + "\n"
             ).encode("utf-8")
-            self._write_body(200, body)
+            # The strong ETag is the SHA-256 of the exact body bytes, so
+            # the same bytes always yield the same tag -- across repeat
+            # reads, concurrent readers and process restarts -- and any
+            # byte change yields a different tag.
+            etag = '"sha256:' + hashlib.sha256(body).hexdigest() + '"'
+            if if_none_match is not None and _entity_tags_match(
+                if_none_match, etag
+            ):
+                self._reply_not_modified(etag)
+                return
+            self._write_body(200, body, etag=etag)
 
         def _reply_audit_diagnosis(self, request_id: str, reasons: object) -> None:
             # Whitelist and re-render every field: even a store
