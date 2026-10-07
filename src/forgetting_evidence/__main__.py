@@ -11,10 +11,12 @@ from .httpapi import (
 from .requests import (
     AuditBundleUnavailable,
     BackupConflict,
+    ReceiptUnavailable,
     RequestNotFound,
     RestoreConflict,
     read_audit_bundle,
     read_audit_health,
+    read_deletion_receipt,
     read_request_evidence,
     read_request_status,
     restore_backup,
@@ -40,6 +42,8 @@ _AUDIT_HEALTH_USAGE = "audit_health_usage"
 _BACKUP_USAGE = "backup_usage"
 # Audit-bundle shares the same rule: fixed, detail-free markers only.
 _AUDIT_BUNDLE_USAGE = "audit_bundle_usage"
+# Deletion-receipt shares the same rule: fixed, detail-free markers only.
+_DELETION_RECEIPT_USAGE = "deletion_receipt_usage"
 
 _FLAG_ALIASES = {
     "--db": "db",
@@ -58,6 +62,15 @@ _STATUS_FLAG_ALIASES = {
     "--request-id": "request_id",
 }
 _STATUS_POSITIONAL_FIELDS = ("db", "tenant_id", "request_id")
+
+# Deletion-receipt accepts both --db and --database for the path.
+_DELETION_RECEIPT_FLAG_ALIASES = {
+    "--db": "db",
+    "--database": "db",
+    "--tenant-id": "tenant_id",
+    "--request-id": "request_id",
+}
+_DELETION_RECEIPT_POSITIONAL_FIELDS = ("db", "tenant_id", "request_id")
 
 _AUDIT_HEALTH_FLAG_ALIASES = {
     "--db": "db",
@@ -258,6 +271,57 @@ def _run_audit_bundle(args: list[str]) -> int:
     return 0
 
 
+def _run_deletion_receipt(args: list[str]) -> int:
+    # Deletion-receipt accepts the exact same two invocation styles as
+    # status and evidence -- three positionals (database, tenant-id,
+    # request-id) or the named flags (--db or --database, plus
+    # --tenant-id and --request-id, including the equals form) -- so it
+    # shares the strict parser: mixing styles, duplicates, empty values,
+    # unknown flags or a wrong arity never reach storage.
+    parsed = _parse_named_args(
+        args,
+        _DELETION_RECEIPT_FLAG_ALIASES,
+        _DELETION_RECEIPT_POSITIONAL_FIELDS,
+    )
+    if parsed is None:
+        print(_DELETION_RECEIPT_USAGE, file=sys.stderr)
+        return 2
+    # Strictly read-only like status: the database is never created,
+    # migrated or repaired, the stored first receipt is recovered
+    # byte-for-byte without any signature key, and the call never mints
+    # a missing receipt, registers a key generation, advances status,
+    # writes an execution record or touches the audit chain or any
+    # bookkeeping. An invalid, unknown, cross-tenant or never-accepted
+    # id is the fixed not-found marker; a request that exists but has no
+    # settled first receipt -- accepted, processing, failed and
+    # completed without a settled completed execution record -- is the
+    # fixed unavailable marker; every other value error and every
+    # storage problem -- a missing, unreadable, locked or corrupt
+    # database, or a stored receipt that cannot be restored to legal
+    # text -- collapses to the single fixed failure marker. The path,
+    # the tenant, the request id, the receipt, keys, SQL and any
+    # underlying error are never printed, and the receipt text is only
+    # emitted once the read succeeds.
+    try:
+        text = read_deletion_receipt(
+            parsed["db"], parsed["tenant_id"], parsed["request_id"]
+        )
+    except RequestNotFound:
+        print("request_not_found", file=sys.stderr)
+        return 3
+    except ReceiptUnavailable:
+        print("receipt_unavailable", file=sys.stderr)
+        return 3
+    except (ValueError, OSError):
+        print("deletion_receipt_failed", file=sys.stderr)
+        return 2
+    # The stored text already ends with exactly one newline: stdout
+    # carries the receipt bytes and nothing else -- no JSON envelope,
+    # no annotation, no reordering.
+    sys.stdout.write(text)
+    return 0
+
+
 def _parse_serve_args(args: list[str]) -> dict[str, str] | None:
     values: dict[str, str] = {}
     positionals: list[str] = []
@@ -416,6 +480,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_audit_health(args[1:])
     if args and args[0] == "audit-bundle":
         return _run_audit_bundle(args[1:])
+    if args and args[0] == "deletion-receipt":
+        return _run_deletion_receipt(args[1:])
     print(_USAGE, file=sys.stderr)
     return 2
 
