@@ -196,6 +196,26 @@ The service exposes fifteen business endpoints:
   corrupt persisted receipt or an inconsistent snapshot answers 503.
   The read never mints a receipt, never registers a key generation,
   never advances any state and never rewrites any evidence.
+  The read also honours HTTP conditional reads: every 200 response
+  carries a strong ``ETag`` of the form ``"sha256:<64 lowercase hex>"``
+  computed over the exact body bytes, so the same receipt always yields
+  the same tag -- across repeat reads, concurrent readers and process
+  restarts -- and any body change yields a different tag. A request
+  may send one ``If-None-Match`` header holding a comma-separated list
+  of entity tags; when any whitespace-stripped double-quoted tag is
+  exactly equal to the current tag, or a tag is ``*`` and a receipt is
+  settled, the answer is ``304`` with no body, a zero
+  ``Content-Length`` and the same ``ETag`` instead of the full 200
+  body. Non-matching tags, lists where no tag matches and weak
+  ``W/``-prefixed tags all receive the full 200 body. More than one
+  ``If-None-Match`` header, an empty field value, a control character
+  or a value that is neither a legal double-quoted entity tag nor
+  ``*`` answers 400 with exactly ``invalid_request`` after
+  authentication, tenant and query validation but before any storage
+  access. The 404/409/503 outcomes above still take precedence over
+  the conditional evaluation: the tag is only compared once the
+  receipt has been read, and the conditional read never writes to the
+  database or changes the rendered bytes.
 * ``GET /policy-catalog/versions`` -- read-only publication of the
   tenant's policy-catalog version history, without any subject detail.
   The tenant follows the existing ``X-Tenant-Id``/query rule; the query
@@ -1590,13 +1610,15 @@ def make_handler(
         def _serve_deletion_receipt(self, tenant_id: str, request_id: str) -> None:
             # The deletion-receipt read shares the other GET reads'
             # authorization and tenant/id resolution (done by the
-            # caller); the tenant-only query gate runs here, before
-            # storage is touched. The store recovers the already-settled
-            # first receipt strictly read-only: the read never mints a
-            # receipt, never registers a key generation and never
-            # advances any state, and no signature key is presented.
+            # caller); the tenant-only query gate and the If-None-Match
+            # header validation run here, before storage is touched.
+            # The store recovers the already-settled first receipt
+            # strictly read-only: the read never mints a receipt, never
+            # registers a key generation and never advances any state,
+            # and no signature key is presented.
             try:
                 self._deletion_receipt_query_gate()
+                if_none_match = self._if_none_match_tags()
             except _BadRequest:
                 self._reply_error(400, _INVALID_REQUEST)
                 return
@@ -1631,7 +1653,7 @@ def make_handler(
                 _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
                 self._reply_error(503, _STORAGE_UNAVAILABLE)
                 return
-            self._reply_deletion_receipt(text)
+            self._reply_deletion_receipt(text, if_none_match)
 
         def _deletion_receipt_query_gate(self) -> None:
             """Reject any query parameter other than a single ``tenant_id``.
@@ -1648,7 +1670,9 @@ def make_handler(
                 if len(values) != 1:
                     raise _BadRequest("duplicate query parameter")
 
-        def _reply_deletion_receipt(self, text: object) -> None:
+        def _reply_deletion_receipt(
+            self, text: object, if_none_match: list[str] | None = None
+        ) -> None:
             # The body is the store's verbatim single-line compact JSON
             # text with its single trailing newline. It is still
             # re-validated field by field before it is emitted: a
@@ -1698,7 +1722,18 @@ def make_handler(
             )
             if text != canonical:
                 raise RuntimeError("malformed deletion receipt from store")
-            self._write_body(200, text.encode("utf-8"))
+            body = text.encode("utf-8")
+            # The strong ETag is the SHA-256 of the exact body bytes, so
+            # the same bytes always yield the same tag -- across repeat
+            # reads, concurrent readers and process restarts -- and any
+            # byte change yields a different tag.
+            etag = '"sha256:' + hashlib.sha256(body).hexdigest() + '"'
+            if if_none_match is not None and _entity_tags_match(
+                if_none_match, etag
+            ):
+                self._reply_not_modified(etag)
+                return
+            self._write_body(200, body, etag=etag)
 
         def _serve_tombstones(self, tenant_id: str, request_id: str) -> None:
             # The tombstone page read shares the other GET reads'
