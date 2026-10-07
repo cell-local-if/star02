@@ -340,9 +340,11 @@ non-string reason -- or any storage fault is the fixed-text
 into success.
 
 :meth:`RequestStore.audit_health` complements the batched audit
-capability with an instantaneous tenant-wide health snapshot,
-storage-layer only like the rest of the audit capability and never
-routed over HTTP. It takes just a tenant identifier and reads every
+capability with an instantaneous tenant-wide health snapshot. It
+remains a storage-layer method and is additionally published read-only
+by the HTTP ``GET /audit-health`` endpoint, which only adds
+authentication, tenant resolution and error mapping around the same
+snapshot semantics. It takes just a tenant identifier and reads every
 request the tenant holds at the moment of the call from one consistent
 snapshot inside a single read-only transaction -- never creating a
 batch, advancing a cursor, repairing evidence or writing any business
@@ -9571,15 +9573,18 @@ class RequestStore:
     def audit_health(self, tenant_id: str) -> dict[str, object]:
         """Return an instantaneous read-only health snapshot of a tenant.
 
-        Storage-layer only; never routed over HTTP. The caller supplies
-        only the tenant identifier; the snapshot covers every request
-        the tenant holds at the moment of the call, read from one
-        consistent snapshot inside a single read-only transaction, so a
-        concurrent submission, status advance or inspection page can
-        never contribute half-settled fields and no request is counted
-        twice. The entry never creates a batch, advances a cursor,
-        repairs, backfills, recomputes or overwrites any business,
-        audit, anchor or key record, and never writes at all.
+        The caller supplies only the tenant identifier; the snapshot is
+        also published read-only over HTTP by ``GET /audit-health``,
+        which performs authentication, tenant resolution and error
+        mapping but no storage semantics of its own. The snapshot
+        covers every request the tenant holds at the moment of the
+        call, read from one consistent snapshot inside a single
+        read-only transaction, so a concurrent submission, status
+        advance or inspection page can never contribute half-settled
+        fields and no request is counted twice. The entry never
+        creates a batch, advances a cursor, repairs, backfills,
+        recomputes or overwrites any business, audit, anchor or key
+        record, and never writes at all.
 
         The result is a plain dictionary with exactly these keys:
         ``total`` (the tenant's request count), ``statuses`` (a mapping

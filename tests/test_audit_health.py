@@ -11,7 +11,9 @@ secret), the single read-only consistent snapshot under concurrent
 writes, strict read-only behaviour (no batches, cursors, evidence or
 business writes), validation without writes, the fixed-text
 ``audit_health_failed`` OSError contract, repeatability across rebuilds
-and the absence of any HTTP route or health-command change.
+and the unchanged ``audit-health`` command. The HTTP surface built on
+top of this snapshot (``GET /audit-health``) is covered by
+``test_http_audit_health.py``.
 """
 
 import http.client
@@ -577,27 +579,56 @@ class HealthHttpSurfaceTests(_StoreCase):
         thread.start()
         return server, thread
 
-    def test_no_http_route_or_delegate_is_added(self):
+    def test_http_route_now_serves_the_snapshot(self):
         store = self._store()
-        # The deferred HTTP store does not gain the storage-layer entry.
-        self.assertFalse(hasattr(httpapi.DeferredRequestStore, "audit_health"))
+        self._submit_many(store, 2)
         server, thread = self._serve(store)
         try:
             conn = http.client.HTTPConnection(
                 "127.0.0.1", server.server_address[1], timeout=10
             )
             try:
-                for path in ("/audit-health", "/audit-health?tenant_id=tenant-a"):
-                    conn.request("GET", path, headers={"X-Tenant-Id": "tenant-a"})
-                    response = conn.getresponse()
-                    self.assertEqual(response.status, 404)
-                    response.read()
+                conn.request(
+                    "GET",
+                    "/audit-health",
+                    headers={"X-Tenant-Id": "tenant-a"},
+                )
+                response = conn.getresponse()
+                self.assertEqual(response.status, 200)
+                payload = json.loads(response.read())
+                self.assertEqual(payload["total"], 2)
+                self.assertEqual(payload["verified"], 2)
+                # Unknown neighbours of the new route still 404.
+                conn.request(
+                    "GET",
+                    "/audit-health/extra",
+                    headers={"X-Tenant-Id": "tenant-a"},
+                )
+                neighbour = conn.getresponse()
+                self.assertEqual(neighbour.status, 404)
+                neighbour.read()
             finally:
                 conn.close()
         finally:
             server.shutdown()
             server.server_close()
             thread.join(timeout=5)
+
+    def test_deferred_store_delegates_audit_health(self):
+        # The HTTP deferred wrapper now proxies the snapshot entry to
+        # the backing store, preserving the read-only contract.
+        from forgetting_evidence.httpapi import DeferredRequestStore
+
+        deferred = DeferredRequestStore(self.db_path)
+        # Seed through the wrapper itself, which is the serve-time
+        # configuration; the snapshot is the backing store's own.
+        deferred.submit("tenant-a", "subject-1", ["email"], "key-1")
+        snapshot = deferred.audit_health("tenant-a")
+        self._assert_well_formed(snapshot, 1)
+        self.assertEqual(
+            snapshot,
+            RequestStore(self.db_path).audit_health("tenant-a"),
+        )
 
     def test_health_command_is_unchanged(self):
         from forgetting_evidence.__main__ import main

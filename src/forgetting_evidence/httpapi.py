@@ -1,7 +1,7 @@
 """HTTP layer for deletion-request acceptance, lookup, observation and
 single-request and batched reconciliation.
 
-The service exposes fourteen business endpoints:
+The service exposes fifteen business endpoints:
 
 * ``POST /requests`` -- accept a deletion request for a tenant. The JSON
   body must carry non-empty ``tenant_id``, ``subject_id`` and
@@ -249,6 +249,34 @@ The service exposes fourteen business endpoints:
   cursor answers 400 and neither advances a batch nor changes a
   request; an unreadable database, corrupt persisted batch state or a
   failed commit answers 503 and never leaves a half-settled item.
+* ``GET /audit-health`` -- the instantaneous, tenant-scoped audit
+  health summary, the HTTP public read for the storage layer's
+  read-only :meth:`RequestStore.audit_health` snapshot. The request
+  carries no JSON business body and the tenant follows the existing
+  ``X-Tenant-Id``/``tenant_id`` query rule; the query string accepts
+  no parameter other than a single ``tenant_id`` -- a duplicated key,
+  an unknown parameter or a missing or empty tenant answers 400. The
+  single-line JSON body carries exactly ``total``, ``statuses``,
+  ``verified``, ``unverified`` and ``reasons`` in that order:
+  ``total`` is the tenant's request count, ``statuses`` carries the
+  four lifecycle counts (``accepted``, ``processing``, ``completed``
+  and ``failed``) with explicit zeros and always sums to ``total``,
+  ``verified`` and ``unverified`` are complementary and also sum to
+  ``total``, and ``reasons`` is a list of ``{"reason", "count"}``
+  entries -- one per distinct stable reason code, merged across the
+  tenant's unverified requests, ordered by Unicode code point, each
+  count a positive integer, empty when every request verifies. The
+  whole summary is read from one consistent read-only transaction, so
+  a concurrent submission, status advance or inspection sweep can
+  never mix half-settled fields from two transactions; the read never
+  creates an inspection batch, advances a cursor, writes business,
+  audit, anchor or key records or otherwise mutates anything. A
+  tenant that holds no requests still answers 200 with an all-zero
+  snapshot, never a missing-request error. An unreadable database,
+  corrupt bookkeeping or evidence or a snapshot that cannot be taken
+  consistently answers 503 with the single ``error`` field only,
+  never a partial snapshot, a pseudo count, a tenant, a request id, a
+  path or SQL text.
 
 The observation endpoints never advance state, create an attempt or
 write any bookkeeping; they only read persisted rows, so their answers
@@ -275,7 +303,8 @@ read-only tenant-scoped listing, the six read-only observation reads,
 the read-only audit-chain diagnosis, the read-only audit-bundle export,
 the read-only deletion-receipt recovery, the single-request execution
 reconciliation, the read-only
-policy-catalog version history and the policy-catalog publication
+policy-catalog version history, the policy-catalog publication and the
+read-only instantaneous audit-health summary
 described above. The
 current-status lookup (:meth:`RequestStore.get_status`), the
 tenant-scoped listing (:meth:`RequestStore.list_requests`), the
@@ -292,9 +321,10 @@ read-only deletion-receipt recovery
 single-request reconciliation
 (:meth:`RequestStore.reconcile_execution`), the batched reconciliation
 (:meth:`RequestStore.reconcile_batch`), the catalog version
-history (:meth:`RequestStore.audit_policy_catalog`) and the catalog
-publication (:meth:`RequestStore.publish_policy_catalog`) back their
-HTTP
+history (:meth:`RequestStore.audit_policy_catalog`), the catalog
+publication (:meth:`RequestStore.publish_policy_catalog`) and the
+instantaneous audit-health snapshot
+(:meth:`RequestStore.audit_health`) back their HTTP
 endpoints but remain storage-layer methods as well.
 
 Success responses are a single line of JSON followed by a trailing
@@ -324,7 +354,11 @@ tombstone rendering exactly ``adapter_id``, ``scope``, ``operation_id``,
 history read renders exactly ``versions``, each version rendering
 exactly ``version``, ``effective_at``, ``rule_count``,
 ``exception_count`` and ``status``. The policy-catalog publication
-renders exactly ``version`` and ``effective_at``.
+renders exactly ``version`` and ``effective_at``. The audit-health
+snapshot renders exactly ``total``, ``statuses``, ``verified``,
+``unverified`` and ``reasons``; ``statuses`` renders exactly the four
+lifecycle counts in fixed order and each reason renders exactly
+``reason`` and ``count``.
 Error responses are single-line JSON objects with exactly one key,
 ``error``, holding a stable error code:
 
@@ -345,7 +379,7 @@ for a configured principal: a missing/malformed/unknown token answers
 endpoint, or acting on a tenant other than its own ``tenant_id``,
 answers ``403 forbidden``. ``POST /requests`` requires
 ``request:submit`` and the target tenant is the body's ``tenant_id``;
-each of the nine GET endpoints requires
+each of the ten GET endpoints requires
 ``request:read`` and the target tenant follows the existing
 ``X-Tenant-Id``/query rule; the
 single-request reconciliation ``POST /requests/{request_id}/reconcile``
@@ -409,6 +443,7 @@ _COLLECTION_PATH = "/requests"
 _ITEM_PATH_PREFIX = "/requests/"
 _POLICY_CATALOG_VERSIONS_PATH = "/policy-catalog/versions"
 _RECONCILE_BATCH_PATH = "/reconcile"
+_AUDIT_HEALTH_PATH = "/audit-health"
 _STATUS_RESOURCE = "status"
 _EXECUTION_LOG_RESOURCE = "execution-log"
 _TOMBSTONES_RESOURCE = "tombstones"
@@ -489,6 +524,17 @@ _DELETION_RECEIPT_QUERY_PARAMS = frozenset({"tenant_id"})
 # understands; anything else is an invalid request. ``tenant_id`` keeps
 # its historical header-or-query resolution and is validated separately.
 _RECONCILE_BATCH_QUERY_PARAMS = frozenset({"tenant_id", "cursor", "limit"})
+
+# The query parameters the GET /audit-health instantaneous snapshot
+# read understands: only ``tenant_id``, which keeps its historical
+# header-or-query resolution and is validated separately. Any other
+# parameter, or any duplicated key, is an invalid request.
+_AUDIT_HEALTH_QUERY_PARAMS = frozenset({"tenant_id"})
+
+# The four request lifecycle statuses an audit-health snapshot reports,
+# in fixed serialisation order, mirrored from the storage layer so a
+# corrupt or substituted store can never serialise another value.
+_AUDIT_HEALTH_STATUSES = ("accepted", "processing", "completed", "failed")
 
 # The only statuses a reconciled batch item may serialise: accepted rows
 # are skipped without an item and terminal rows are never swept, so an
@@ -859,6 +905,13 @@ class DeferredRequestStore:
         # without any signature key and the read never writes anything.
         return self._ready().get_receipt(tenant_id, request_id)
 
+    def audit_health(self, tenant_id):
+        # Serves the read-only GET /audit-health endpoint; the
+        # instantaneous tenant snapshot is read from one committed
+        # read-only transaction by the store and the read never creates
+        # a batch, advances a cursor or writes anything.
+        return self._ready().audit_health(tenant_id)
+
 
 def _normalize_request_id(value: str) -> str:
     """Validate a request id as a UUID and return its canonical text."""
@@ -917,6 +970,8 @@ def make_handler(
                 return "policy_catalog_versions", None
             if path == _RECONCILE_BATCH_PATH:
                 return "reconcile_batch", None
+            if path == _AUDIT_HEALTH_PATH:
+                return "audit_health", None
             if path.startswith(_ITEM_PATH_PREFIX):
                 segment = path[len(_ITEM_PATH_PREFIX) :]
                 # Empty or nested segments do not name a request.
@@ -1151,6 +1206,11 @@ def make_handler(
                 self._reply_error(
                     405, _METHOD_NOT_ALLOWED, allowed="POST"
                 )
+                return
+            if kind == "audit_health":
+                # The instantaneous, tenant-scoped health snapshot;
+                # read-only like the other observation reads.
+                self._serve_audit_health()
                 return
             # item (acceptance receipt), status, execution_log,
             # tombstones, evidence, audit_diagnosis, audit_bundle and
@@ -1895,6 +1955,160 @@ def make_handler(
             if len(set(statuses)) != len(statuses):
                 raise _BadRequest("duplicate status")
             return statuses
+
+        def _audit_health_query_gate(self) -> None:
+            """Reject any query parameter other than a single ``tenant_id``.
+
+            The health snapshot takes no business parameters;
+            ``tenant_id`` keeps its historical header-or-query
+            resolution in ``_tenant_id``. An unknown parameter or any
+            duplicated key (including ``tenant_id`` itself) is a bad
+            request.
+            """
+            params = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+            if not set(params) <= _AUDIT_HEALTH_QUERY_PARAMS:
+                raise _BadRequest("unknown query parameter")
+            for values in params.values():
+                if len(values) != 1:
+                    raise _BadRequest("duplicate query parameter")
+
+        def _serve_audit_health(self) -> None:
+            # The instantaneous health snapshot shares the read
+            # endpoints' authorization and tenant resolution:
+            # authentication first, then the tenant (header or query)
+            # and its match against the principal, then the
+            # tenant-only query gate, then storage. The store reads the
+            # whole snapshot from one consistent read-only
+            # transaction; the read never creates a batch, advances a
+            # cursor or writes any business, audit, anchor or key
+            # record. A tenant that holds no requests is still a
+            # successful read of an all-zero snapshot, never a missing
+            # request.
+            principal = self._authorize(_ROLE_READ)
+            if principal is None:
+                return
+            try:
+                tenant_id = self._tenant_id()
+            except _BadRequest:
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            if not self._tenant_allowed(principal[0], tenant_id):
+                return
+            try:
+                self._audit_health_query_gate()
+            except _BadRequest:
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            try:
+                snapshot = store.audit_health(tenant_id)
+            except ValueError:
+                # Defence in depth: the HTTP resolution above is
+                # authoritative, but a rejected store call reads
+                # nothing and maps to the same client error.
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            except _StorageUnavailable:
+                _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
+                self._reply_error(503, _STORAGE_UNAVAILABLE)
+                return
+            except (sqlite3.Error, RuntimeError, OSError):
+                # An unreadable database, corrupt bookkeeping or
+                # evidence, or a snapshot that cannot be taken
+                # consistently surfaces as the fixed-text storage
+                # error; sqlite text (locks, malformed images, paths)
+                # must never reach the client, and no partial snapshot
+                # or pseudo count is ever rendered.
+                _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
+                self._reply_error(503, _STORAGE_UNAVAILABLE)
+                return
+            self._reply_audit_health(snapshot)
+
+        def _reply_audit_health(self, snapshot: object) -> None:
+            # Whitelist and re-render every field: even a store
+            # substitute that returned extra keys could not leak a
+            # subject, a raw scope, an idempotency key, a request id,
+            # a credential or any other request field into the body.
+            # Shapes and types are re-checked, the four status buckets
+            # are rendered in fixed order and the count invariants are
+            # re-proved here, so a corrupt snapshot never serialises
+            # into a partially-formed or self-contradictory summary.
+            # Field order is fixed: total, statuses, verified,
+            # unverified, reasons; each reason renders exactly
+            # reason and count.
+            if not isinstance(snapshot, dict) or set(snapshot) != {
+                "total",
+                "statuses",
+                "verified",
+                "unverified",
+                "reasons",
+            }:
+                raise RuntimeError("malformed audit health from store")
+            total = snapshot["total"]
+            statuses = snapshot["statuses"]
+            verified = snapshot["verified"]
+            unverified = snapshot["unverified"]
+            reasons = snapshot["reasons"]
+            if not _is_nonneg_int(total) or not isinstance(statuses, dict):
+                raise RuntimeError("malformed audit health from store")
+            if list(statuses) != list(_AUDIT_HEALTH_STATUSES):
+                raise RuntimeError("malformed audit health from store")
+            rendered_statuses: dict[str, int] = {}
+            for name in _AUDIT_HEALTH_STATUSES:
+                count = statuses[name]
+                if not _is_nonneg_int(count):
+                    raise RuntimeError("malformed audit health from store")
+                rendered_statuses[name] = count
+            if not _is_nonneg_int(verified) or not _is_nonneg_int(unverified):
+                raise RuntimeError("malformed audit health from store")
+            # The four lifecycle buckets partition the population and
+            # the trust tally covers every request exactly once.
+            if total != sum(rendered_statuses.values()):
+                raise RuntimeError("malformed audit health from store")
+            if total != verified + unverified:
+                raise RuntimeError("malformed audit health from store")
+            if not isinstance(reasons, list):
+                raise RuntimeError("malformed audit health from store")
+            rendered_reasons: list[dict[str, object]] = []
+            merged = 0
+            previous: str | None = None
+            for entry in reasons:
+                if not isinstance(entry, dict) or set(entry) != {
+                    "reason",
+                    "count",
+                }:
+                    raise RuntimeError("malformed audit health from store")
+                reason = entry["reason"]
+                count = entry["count"]
+                if (
+                    not isinstance(reason, str)
+                    or not reason
+                    or not _is_positive_int(count)
+                ):
+                    raise RuntimeError("malformed audit health from store")
+                # One entry per reason, ascending by Unicode code point.
+                if previous is not None and previous >= reason:
+                    raise RuntimeError("malformed audit health from store")
+                previous = reason
+                merged += count
+                rendered_reasons.append({"reason": reason, "count": count})
+            # The reason buckets partition the unverified population.
+            if merged != unverified:
+                raise RuntimeError("malformed audit health from store")
+            body = (
+                json.dumps(
+                    {
+                        "total": total,
+                        "statuses": rendered_statuses,
+                        "verified": verified,
+                        "unverified": unverified,
+                        "reasons": rendered_reasons,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+            self._write_body(200, body)
 
         def _serve_policy_catalog_versions(self) -> None:
             # The catalog history shares the read endpoints'
