@@ -1,7 +1,7 @@
 """HTTP layer for deletion-request acceptance, lookup, observation and
 single-request and batched reconciliation.
 
-The service exposes fifteen business endpoints:
+The service exposes sixteen business endpoints:
 
 * ``POST /requests`` -- accept a deletion request for a tenant. The JSON
   body must carry non-empty ``tenant_id``, ``subject_id`` and
@@ -290,6 +290,39 @@ The service exposes fifteen business endpoints:
   cursor answers 400 and neither advances a batch nor changes a
   request; an unreadable database, corrupt persisted batch state or a
   failed commit answers 503 and never leaves a half-settled item.
+* ``GET /audit-inspection`` -- the storage layer's batched audit
+  inspection (:meth:`RequestStore.audit_inspection`) and its read-only
+  per-batch metrics (:meth:`RequestStore.audit_inspection_metrics`)
+  behind one tenant-scoped entry point. The tenant follows the existing
+  ``X-Tenant-Id``/query rule; the only query parameters are
+  ``tenant_id``, ``cursor``, ``batch_id`` and ``limit`` (1..1000,
+  default 100), each at most once, and ``cursor`` and ``batch_id`` are
+  mutually exclusive. With neither ``cursor`` nor ``batch_id`` a new
+  persistent batch is created; with ``cursor`` the batch it names is
+  resumed from its durably committed position; with ``batch_id`` the
+  call is a strictly read-only metrics query that never creates,
+  advances or writes anything. A scan response carries exactly
+  ``batch_id``, ``next_cursor``, ``finished`` and ``items`` in that
+  order, each item carrying exactly ``request_id``, ``verified`` and
+  ``reason`` in inspection order (a verified item's reason is the empty
+  string, an unverified item's a stable reason code); ``next_cursor``
+  is the opaque continuation string while the sweep is incomplete and
+  ``null`` once it is finished. A metrics response carries exactly
+  ``batch_id``, ``scanned``, ``verified``, ``unverified``, ``reasons``,
+  ``next_cursor`` and ``finished`` in that order: ``scanned`` equals
+  ``verified`` plus ``unverified`` and ``reasons`` holds one
+  ``{"reason", "count"}`` entry per distinct reason code, merged and
+  ordered by Unicode code point, each count a positive integer. A
+  missing, duplicated or unknown parameter, a mutually exclusive pair,
+  an invalid ``limit`` or a malformed ``cursor`` or ``batch_id``
+  answers 400; an unknown or cross-tenant batch or cursor answers 404;
+  a storage or inspection-bookkeeping failure answers 503 and never a
+  half page or a partial aggregate. Concurrent continuations naming
+  the same cursor settle exactly one winning page; competing calls
+  observe the winner's committed progress with an empty item list, and
+  a retried cursor never re-reports a settled item. No subject, raw
+  scope, idempotency key, worker, credential, secret, SQL text or path
+  is ever exposed.
 * ``GET /audit-health`` -- the instantaneous, tenant-scoped audit
   health summary, the HTTP public read for the storage layer's
   read-only :meth:`RequestStore.audit_health` snapshot. The request
@@ -335,17 +368,17 @@ orchestration (:meth:`RequestStore.claim_next`,
 :meth:`RequestStore.verify_receipt`,
 :meth:`RequestStore.rotate_receipt_key`) and the anchor capability
 (:meth:`RequestStore.verify_chain`,
-:meth:`RequestStore.rotate_anchor_key`) and the read-only batched
-audit inspection (:meth:`RequestStore.audit_inspection` and
-:meth:`RequestStore.audit_inspection_summary`) exist only on
+:meth:`RequestStore.rotate_anchor_key`) and the read-only inspection
+summary (:meth:`RequestStore.audit_inspection_summary`) exist only on
 the storage layer and are deliberately not exposed over HTTP: over HTTP
 the service opens request acceptance, the acceptance-receipt lookup, the
 read-only tenant-scoped listing, the six read-only observation reads,
 the read-only audit-chain diagnosis, the read-only audit-bundle export,
 the read-only deletion-receipt recovery, the single-request execution
 reconciliation, the read-only
-policy-catalog version history, the policy-catalog publication and the
-read-only instantaneous audit-health summary
+policy-catalog version history, the policy-catalog publication, the
+read-only instantaneous audit-health summary and the batched audit
+inspection with its read-only metrics
 described above. The
 current-status lookup (:meth:`RequestStore.get_status`), the
 tenant-scoped listing (:meth:`RequestStore.list_requests`), the
@@ -366,7 +399,10 @@ history (:meth:`RequestStore.audit_policy_catalog`), the catalog
 publication (:meth:`RequestStore.publish_policy_catalog`) and the
 instantaneous audit-health snapshot
 (:meth:`RequestStore.audit_health`) back their HTTP
-endpoints but remain storage-layer methods as well.
+endpoints but remain storage-layer methods as well; the batched audit
+inspection (:meth:`RequestStore.audit_inspection`) and its read-only
+metrics (:meth:`RequestStore.audit_inspection_metrics`) likewise back
+``GET /audit-inspection`` while remaining storage-layer methods.
 
 Success responses are a single line of JSON followed by a trailing
 newline. Acceptance, receipt lookup, the status read and a successful
@@ -399,7 +435,12 @@ renders exactly ``version`` and ``effective_at``. The audit-health
 snapshot renders exactly ``total``, ``statuses``, ``verified``,
 ``unverified`` and ``reasons``; ``statuses`` renders exactly the four
 lifecycle counts in fixed order and each reason renders exactly
-``reason`` and ``count``.
+``reason`` and ``count``. The audit-inspection scan renders exactly
+``batch_id``, ``next_cursor``, ``finished`` and ``items``, each item
+rendering exactly ``request_id``, ``verified`` and ``reason``; the
+audit-inspection metrics render exactly ``batch_id``, ``scanned``,
+``verified``, ``unverified``, ``reasons``, ``next_cursor`` and
+``finished``, each reason rendering exactly ``reason`` and ``count``.
 Error responses are single-line JSON objects with exactly one key,
 ``error``, holding a stable error code:
 
@@ -428,7 +469,10 @@ requires ``request:reconcile`` and its target tenant follows the same
 existing ``X-Tenant-Id``/query rule; the
 batch reconciliation ``POST /reconcile`` requires
 ``request:reconcile`` and its target tenant follows the same existing
-``X-Tenant-Id``/query rule; the policy-catalog history
+``X-Tenant-Id``/query rule; the batched audit inspection
+``GET /audit-inspection`` requires ``request:reconcile`` and its
+target tenant follows the same existing ``X-Tenant-Id``/query rule;
+the policy-catalog history
 ``GET /policy-catalog/versions`` requires ``policy:read`` and its
 target tenant follows the same existing ``X-Tenant-Id``/query rule;
 the policy-catalog publication ``POST /policy-catalog/versions``
@@ -462,6 +506,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from .requests import (
     AuditBundleUnavailable,
+    AuditInspectionNotFound,
     IdempotencyConflict,
     PolicyCatalogConflict,
     ReceiptUnavailable,
@@ -485,6 +530,7 @@ _ITEM_PATH_PREFIX = "/requests/"
 _POLICY_CATALOG_VERSIONS_PATH = "/policy-catalog/versions"
 _RECONCILE_BATCH_PATH = "/reconcile"
 _AUDIT_HEALTH_PATH = "/audit-health"
+_AUDIT_INSPECTION_PATH = "/audit-inspection"
 _STATUS_RESOURCE = "status"
 _EXECUTION_LOG_RESOURCE = "execution-log"
 _TOMBSTONES_RESOURCE = "tombstones"
@@ -571,6 +617,16 @@ _RECONCILE_BATCH_QUERY_PARAMS = frozenset({"tenant_id", "cursor", "limit"})
 # header-or-query resolution and is validated separately. Any other
 # parameter, or any duplicated key, is an invalid request.
 _AUDIT_HEALTH_QUERY_PARAMS = frozenset({"tenant_id"})
+
+# The query parameters the GET /audit-inspection batched audit
+# inspection understands; anything else is an invalid request.
+# ``tenant_id`` keeps its historical header-or-query resolution and is
+# validated separately. ``cursor`` and ``batch_id`` are mutually
+# exclusive: neither creates a batch, ``cursor`` continues one and
+# ``batch_id`` names the read-only metrics query.
+_AUDIT_INSPECTION_QUERY_PARAMS = frozenset(
+    {"tenant_id", "cursor", "batch_id", "limit"}
+)
 
 # The four request lifecycle statuses an audit-health snapshot reports,
 # in fixed serialisation order, mirrored from the storage layer so a
@@ -906,14 +962,21 @@ class DeferredRequestStore:
         return self._ready().diagnose_chain(tenant_id, request_id)
 
     def audit_inspection(self, tenant_id, cursor=None, limit=None):
-        # Read-only batched audit inspection is storage-layer only;
-        # never routed over HTTP and never modifies audit evidence.
+        # Serves the GET /audit-inspection scan; the store's atomic
+        # per-page commit decides the unique continuation outcome and
+        # the sweep never modifies audit evidence.
         return self._ready().audit_inspection(tenant_id, cursor, limit)
 
     def audit_inspection_summary(self, tenant_id, batch_id):
         # The read-only inspection summary is storage-layer only; never
         # routed over HTTP and never writes anything.
         return self._ready().audit_inspection_summary(tenant_id, batch_id)
+
+    def audit_inspection_metrics(self, tenant_id, batch_id):
+        # Serves the read-only GET /audit-inspection metrics query; the
+        # read never creates a batch, advances a cursor or writes
+        # anything.
+        return self._ready().audit_inspection_metrics(tenant_id, batch_id)
 
     def audit_policy_catalog(self, tenant_id):
         # Serves the read-only GET /policy-catalog/versions endpoint;
@@ -1013,6 +1076,8 @@ def make_handler(
                 return "reconcile_batch", None
             if path == _AUDIT_HEALTH_PATH:
                 return "audit_health", None
+            if path == _AUDIT_INSPECTION_PATH:
+                return "audit_inspection", None
             if path.startswith(_ITEM_PATH_PREFIX):
                 segment = path[len(_ITEM_PATH_PREFIX) :]
                 # Empty or nested segments do not name a request.
@@ -1252,6 +1317,12 @@ def make_handler(
                 # The instantaneous, tenant-scoped health snapshot;
                 # read-only like the other observation reads.
                 self._serve_audit_health()
+                return
+            if kind == "audit_inspection":
+                # The batched audit inspection: a scan (batch creation
+                # or cursor continuation) or the read-only metrics
+                # query, decided by the query parameters.
+                self._serve_audit_inspection()
                 return
             # item (acceptance receipt), status, execution_log,
             # tombstones, evidence, audit_diagnosis, audit_bundle and
@@ -2172,6 +2243,319 @@ def make_handler(
                 + "\n"
             ).encode("utf-8")
             self._write_body(200, body)
+
+        def _serve_audit_inspection(self) -> None:
+            # The batched audit inspection shares the read endpoints'
+            # authorization and tenant resolution: authentication first
+            # (the endpoint requires the request:reconcile role), then
+            # the tenant (header or query) and its match against the
+            # principal, then the query-parameter gate, then storage.
+            # With a batch_id the call is the strictly read-only metrics
+            # query; otherwise it is a scan that creates a batch or
+            # continues the one the cursor names. A rejected call never
+            # creates or advances a batch and never writes anything.
+            principal = self._authorize(_ROLE_RECONCILE)
+            if principal is None:
+                return
+            try:
+                tenant_id = self._tenant_id()
+            except _BadRequest:
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            if not self._tenant_allowed(principal[0], tenant_id):
+                return
+            try:
+                inspection_args = self._audit_inspection_args()
+            except _BadRequest:
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            batch_id = inspection_args.pop("batch_id", None)
+            if batch_id is not None:
+                self._serve_audit_inspection_metrics(tenant_id, batch_id)
+                return
+            try:
+                result = store.audit_inspection(tenant_id, **inspection_args)
+            except ValueError:
+                # The store's fixed-text inspection ValueError covers
+                # every invalid limit or cursor shape, including a
+                # cursor bound to another tenant or a batch that never
+                # existed.
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            except _StorageUnavailable:
+                _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
+                self._reply_error(503, _STORAGE_UNAVAILABLE)
+                return
+            except (sqlite3.Error, RuntimeError, OSError):
+                # Corrupt persisted batch state and every storage fault
+                # surface as the fixed-text OSError; sqlite text (locks,
+                # malformed images, paths) must never reach the client,
+                # and the store guarantees no half-settled page.
+                _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
+                self._reply_error(503, _STORAGE_UNAVAILABLE)
+                return
+            self._reply_audit_inspection(result)
+
+        def _serve_audit_inspection_metrics(
+            self, tenant_id: str, batch_id: str
+        ) -> None:
+            # The metrics query is strictly read-only: it never creates
+            # a batch, never advances a cursor and never writes any
+            # business, audit, anchor, key or bookkeeping record.
+            try:
+                text = store.audit_inspection_metrics(tenant_id, batch_id)
+            except AuditInspectionNotFound:
+                # Missing batches and cross-tenant batches are
+                # indistinguishable.
+                self._reply_error(404, _NOT_FOUND)
+                return
+            except ValueError:
+                # Defence in depth: the HTTP validation above is
+                # authoritative, but a rejected store call reads nothing
+                # and maps to the same client error.
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            except _StorageUnavailable:
+                _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
+                self._reply_error(503, _STORAGE_UNAVAILABLE)
+                return
+            except (sqlite3.Error, RuntimeError, OSError):
+                # An unreadable database or corrupt inspection
+                # bookkeeping surfaces as the fixed-text storage error;
+                # never a partial aggregate or a fabricated metric.
+                _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
+                self._reply_error(503, _STORAGE_UNAVAILABLE)
+                return
+            self._reply_audit_inspection_metrics(text)
+
+        def _audit_inspection_args(self) -> dict[str, object]:
+            """Validate the inspection query string into store arguments.
+
+            Only ``tenant_id``, ``cursor``, ``batch_id`` and ``limit``
+            may appear, each at most once (``tenant_id`` keeps its
+            historical header-or-query resolution in ``_tenant_id``);
+            ``cursor`` and ``batch_id`` are mutually exclusive. Every
+            other shape is a bad request; the store re-validates the
+            values themselves as defence in depth.
+            """
+            params = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+            if not set(params) <= _AUDIT_INSPECTION_QUERY_PARAMS:
+                raise _BadRequest("unknown query parameter")
+            inspection_args: dict[str, object] = {}
+            for name in ("tenant_id", "cursor", "batch_id", "limit"):
+                values = params.get(name)
+                if values is None:
+                    continue
+                if len(values) != 1:
+                    raise _BadRequest(f"duplicate {name}")
+                value = values[0]
+                if name == "limit":
+                    # Far more digits than the 1..1000 domain can ever
+                    # hold is a bad request, not a storage fault (and an
+                    # unbounded digit string must never reach int()).
+                    if not _LIST_LIMIT_RE.match(value) or len(value) > 10:
+                        raise _BadRequest("invalid limit")
+                    inspection_args["limit"] = int(value)
+                elif name == "cursor":
+                    if not value:
+                        raise _BadRequest("invalid cursor")
+                    inspection_args["cursor"] = value
+                elif name == "batch_id":
+                    if not value:
+                        raise _BadRequest("invalid batch_id")
+                    inspection_args["batch_id"] = value
+            if "cursor" in inspection_args and "batch_id" in inspection_args:
+                raise _BadRequest("cursor and batch_id are mutually exclusive")
+            return inspection_args
+
+        def _reply_audit_inspection(self, result: object) -> None:
+            # Whitelist and re-render every field: even a store
+            # substitute that returned extra keys could not leak a
+            # subject, a raw scope, an idempotency key, a worker, a
+            # credential or any other request field into the body.
+            # Shapes and types are re-checked so a corrupt result never
+            # serialises into a partially-formed record. Field order is
+            # fixed: batch_id, next_cursor, finished, items; each item
+            # renders exactly request_id, verified and reason.
+            if not isinstance(result, dict) or set(result) != {
+                "batch_id",
+                "next_cursor",
+                "finished",
+                "items",
+            }:
+                raise RuntimeError("malformed audit inspection from store")
+            batch_id = result["batch_id"]
+            next_cursor = result["next_cursor"]
+            finished = result["finished"]
+            items = result["items"]
+            if (
+                not isinstance(batch_id, str)
+                or not batch_id
+                or not isinstance(finished, bool)
+                or not isinstance(items, list)
+            ):
+                raise RuntimeError("malformed audit inspection from store")
+            if next_cursor is not None and (
+                not isinstance(next_cursor, str) or not next_cursor
+            ):
+                raise RuntimeError("malformed audit inspection from store")
+            # A finished sweep carries no continuation cursor; an
+            # unfinished one always does.
+            if finished != (next_cursor is None):
+                raise RuntimeError("malformed audit inspection from store")
+            rendered_items: list[dict[str, object]] = []
+            for item in items:
+                if not isinstance(item, dict) or set(item) != {
+                    "request_id",
+                    "verified",
+                    "reason",
+                }:
+                    raise RuntimeError("malformed audit inspection from store")
+                request_id = item["request_id"]
+                verified = item["verified"]
+                reason = item["reason"]
+                if (
+                    not isinstance(request_id, str)
+                    or not request_id
+                    or not isinstance(verified, bool)
+                    or not isinstance(reason, str)
+                ):
+                    raise RuntimeError("malformed audit inspection from store")
+                # A verified item carries the empty reason; an
+                # unverified item always carries a stable reason code.
+                if verified != (not reason):
+                    raise RuntimeError("malformed audit inspection from store")
+                rendered_items.append(
+                    {
+                        "request_id": request_id,
+                        "verified": verified,
+                        "reason": reason,
+                    }
+                )
+            body = (
+                json.dumps(
+                    {
+                        "batch_id": batch_id,
+                        "next_cursor": next_cursor,
+                        "finished": finished,
+                        "items": rendered_items,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+            self._write_body(200, body)
+
+        def _reply_audit_inspection_metrics(self, text: object) -> None:
+            # The body is the store's single-line compact JSON text with
+            # its single trailing newline. It is still re-validated
+            # field by field before it is emitted: a corrupt or
+            # substituted store must never serialise a subject, a raw
+            # scope, an idempotency key, a worker, a credential, a
+            # secret, SQL text or a path into the body, and a malformed
+            # aggregate surfaces as the stable storage code, never as a
+            # partial metrics text.
+            if (
+                not isinstance(text, str)
+                or not text.endswith("\n")
+                or text.endswith("\n\n")
+                or "\n" in text[:-1]
+                or "\r" in text
+            ):
+                raise RuntimeError("malformed inspection metrics from store")
+            try:
+                payload = json.loads(text[:-1])
+            except ValueError:
+                raise RuntimeError(
+                    "malformed inspection metrics from store"
+                ) from None
+            if not isinstance(payload, dict) or set(payload) != {
+                "batch_id",
+                "scanned",
+                "verified",
+                "unverified",
+                "reasons",
+                "next_cursor",
+                "finished",
+            }:
+                raise RuntimeError("malformed inspection metrics from store")
+            batch_id = payload["batch_id"]
+            scanned = payload["scanned"]
+            verified = payload["verified"]
+            unverified = payload["unverified"]
+            reasons = payload["reasons"]
+            next_cursor = payload["next_cursor"]
+            finished = payload["finished"]
+            if (
+                not isinstance(batch_id, str)
+                or not batch_id
+                or not _is_nonneg_int(scanned)
+                or not _is_nonneg_int(verified)
+                or not _is_nonneg_int(unverified)
+                or not isinstance(reasons, list)
+                or not isinstance(finished, bool)
+            ):
+                raise RuntimeError("malformed inspection metrics from store")
+            if next_cursor is not None and (
+                not isinstance(next_cursor, str) or not next_cursor
+            ):
+                raise RuntimeError("malformed inspection metrics from store")
+            # The trust tally covers every scanned item exactly once,
+            # and a finished sweep carries no continuation cursor.
+            if scanned != verified + unverified:
+                raise RuntimeError("malformed inspection metrics from store")
+            if finished != (next_cursor is None):
+                raise RuntimeError("malformed inspection metrics from store")
+            rendered_reasons: list[dict[str, object]] = []
+            merged = 0
+            previous: str | None = None
+            for entry in reasons:
+                if not isinstance(entry, dict) or set(entry) != {
+                    "reason",
+                    "count",
+                }:
+                    raise RuntimeError("malformed inspection metrics from store")
+                reason = entry["reason"]
+                count = entry["count"]
+                if (
+                    not isinstance(reason, str)
+                    or not reason
+                    or not _is_positive_int(count)
+                ):
+                    raise RuntimeError("malformed inspection metrics from store")
+                # One entry per reason, ascending by Unicode code point.
+                if previous is not None and previous >= reason:
+                    raise RuntimeError("malformed inspection metrics from store")
+                previous = reason
+                merged += count
+                rendered_reasons.append({"reason": reason, "count": count})
+            # The reason buckets partition the unverified population.
+            if merged != unverified:
+                raise RuntimeError("malformed inspection metrics from store")
+            # The emitted bytes must be exactly the compact single-line
+            # rendering of the validated payload in the fixed field
+            # order; anything else (extra whitespace, a reserialised
+            # duplicate key, a reordered field) is not the store's text.
+            canonical = (
+                json.dumps(
+                    {
+                        "batch_id": batch_id,
+                        "scanned": scanned,
+                        "verified": verified,
+                        "unverified": unverified,
+                        "reasons": rendered_reasons,
+                        "next_cursor": next_cursor,
+                        "finished": finished,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+            if text != canonical:
+                raise RuntimeError("malformed inspection metrics from store")
+            self._write_body(200, text.encode("utf-8"))
 
         def _serve_policy_catalog_versions(self) -> None:
             # The catalog history shares the read endpoints'
