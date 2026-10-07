@@ -135,6 +135,19 @@ orchestration and never routed over HTTP:
   cursor resumes strictly after the page's last item regardless of the
   following page's limit, repeats to identical bytes and survives
   restarts; it is ``None`` once the snapshot has no following item.
+* :meth:`RequestStore.verify_deletion_tombstones` is the strictly
+  read-only consistency check over the normalized scopes, the tombstone
+  ledger and the finish record, taken from one consistent snapshot. It
+  returns one compact JSON line (``request_id``, ``verified``,
+  ``coverage``, ``tombstone_count``, ``evidence_digest``, ``reasons``):
+  ``coverage`` is ``complete`` only when a completed request's every
+  normalized scope is covered by exactly one tombstone,
+  ``evidence_digest`` is the recomputed scope-completion commitment
+  only for complete coverage, and ``verified`` is true only when every
+  tombstone record is well-formed, operation numbers repeat nowhere in
+  the whole ledger and the recomputed digest equals the settled
+  completion commitment. Verification never writes and never changes a
+  record.
 
 Deletion receipts close the lifecycle with an externally verifiable
 record, storage-layer only like the rest of the orchestration:
@@ -1375,6 +1388,34 @@ _DELETION_TOMBSTONE_PAGE_MESSAGE = "deletion_tombstone_page_failed"
 def _deletion_tombstone_page_value_failure() -> ValueError:
     """Build the single tombstone-page validation error callers see."""
     return ValueError(_DELETION_TOMBSTONE_PAGE_MESSAGE)
+
+
+# Fixed, detail-free text for every deletion-tombstone verification
+# failure: an unreadable store, a corrupt request, tombstone or finish
+# record, a digest that cannot be recomputed or a consistent snapshot
+# that cannot be taken. It never embeds a tenant, a subject, a scope,
+# an adapter, an operation number, a proof, an idempotency key, SQL
+# text or a filesystem path, and the strictly read-only verification
+# never writes.
+_DELETION_TOMBSTONE_VERIFICATION_MESSAGE = (
+    "deletion_tombstone_verification_failed"
+)
+
+
+def _deletion_tombstone_verification_failure() -> OSError:
+    """Build the single verification storage error callers ever see."""
+    return OSError(_DELETION_TOMBSTONE_VERIFICATION_MESSAGE)
+
+
+# The only reason codes a tombstone-verification report can carry. They
+# name only *why* the persisted evidence cannot be trusted -- never a
+# tenant, a subject, a scope, an adapter, an operation number or a
+# proof -- so the report can be shared without leaking the ledger.
+_VERIFICATION_REASON_REQUEST_NOT_COMPLETED = "request_not_completed"
+_VERIFICATION_REASON_SCOPE_COVERAGE_INVALID = "scope_coverage_invalid"
+_VERIFICATION_REASON_TOMBSTONE_RECORD_INVALID = "tombstone_record_invalid"
+_VERIFICATION_REASON_OPERATION_ID_INVALID = "operation_id_invalid"
+_VERIFICATION_REASON_EVIDENCE_DIGEST_MISMATCH = "evidence_digest_mismatch"
 
 
 # Fixed, detail-free text for every tenant-scoped request-listing failure:
@@ -3570,13 +3611,17 @@ def _normalize_tombstone_items(value: object) -> list[dict[str, str]]:
     return items
 
 
-def _request_scopes_or_tombstone_failure(scopes_json: object) -> list[str]:
+def _request_scopes_or_tombstone_failure(
+    scopes_json: object,
+    failure: Callable[[], OSError] = _deletion_tombstone_failure,
+) -> list[str]:
     """Decode a request's persisted normalized scopes for tombstone work.
 
     The persisted value was written by the store itself; anything that
     does not decode to a non-empty list of non-empty strings means the
     record was altered out of band and is reported as storage
-    corruption, never partially used.
+    corruption, never partially used. ``failure`` builds the fixed-text
+    error of the calling entry point.
     """
     try:
         scopes = json.loads(scopes_json) if isinstance(scopes_json, str) else None
@@ -3587,7 +3632,7 @@ def _request_scopes_or_tombstone_failure(scopes_json: object) -> list[str]:
         or not scopes
         or not all(isinstance(scope, str) and scope for scope in scopes)
     ):
-        raise _deletion_tombstone_failure()
+        raise failure()
     return scopes
 
 
@@ -7670,6 +7715,221 @@ class RequestStore:
             "evidence_digest": evidence_digest,
             "next_cursor": next_cursor,
         }
+
+    def verify_deletion_tombstones(
+        self,
+        tenant_id: str,
+        request_id: str,
+    ) -> str:
+        """Verify the tombstone ledger against the completion record.
+
+        Strictly read-only: the request, its tombstones and its finish
+        record are read from one consistent snapshot and no record is
+        created, updated or deleted. The result is a single compact
+        JSON line (exactly one trailing newline) with the fields
+        ``request_id``, ``verified``, ``coverage``, ``tombstone_count``,
+        ``evidence_digest`` and ``reasons`` in this order:
+
+        * ``coverage`` is ``complete`` when the request is completed
+          and every normalized scope is covered by exactly one
+          tombstone, ``incomplete`` when it is completed but a scope is
+          missing, duplicated or carries a superfluous tombstone, and
+          ``not_applicable`` for every other status;
+        * ``tombstone_count`` is the number of tombstones read;
+        * ``evidence_digest`` is the scope-completion commitment
+          recomputed with the existing algorithm (64 lowercase
+          hexadecimal characters) only when coverage is complete, and
+          ``None`` otherwise;
+        * ``verified`` is true only when coverage is complete, every
+          tombstone's adapter, normalized scope, ``deleted``/``absent``
+          outcome, operation number and proof digest are well-formed,
+          operation numbers repeat nowhere in the whole ledger and the
+          recomputed digest equals the finish ledger's first
+          ``completed`` commitment;
+        * ``reasons`` holds the stable, detail-free reason codes
+          (``request_not_completed``, ``scope_coverage_invalid``,
+          ``tombstone_record_invalid``, ``operation_id_invalid``,
+          ``evidence_digest_mismatch``) deduplicated and ordered by
+          Unicode code point; it is empty exactly when ``verified``
+          is true.
+
+        A non-string or empty *tenant_id* raises :class:`ValueError`;
+        an empty, non-string, malformed, unknown or cross-tenant
+        *request_id* raises :class:`RequestNotFound` identically. An
+        unreadable store, a corrupt request, tombstone or finish
+        record, a digest that cannot be recomputed or a consistent
+        snapshot that cannot be taken raises the fixed-text
+        :class:`OSError` ``deletion_tombstone_verification_failed``.
+        Neither the report nor an exception ever names a tenant, a
+        subject, a raw object, a proof body, an idempotency key, SQL
+        text or a filesystem path.
+        """
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        request_id = _require_identifier(request_id)
+        if self._mem_conn is not None:
+            with self._write_lock:
+                return self._verify_deletion_tombstones(tenant_id, request_id)
+        return self._verify_deletion_tombstones(tenant_id, request_id)
+
+    def _verify_deletion_tombstones(
+        self, tenant_id: str, request_id: str
+    ) -> str:
+        # The request row, the whole tombstone ledger, the finish
+        # record and the ledger-wide operation-number duplicates are
+        # read inside one explicit read transaction so every check is
+        # computed from a single consistent snapshot.
+        conn = self._connect()
+        try:
+            try:
+                conn.execute("BEGIN")
+            except sqlite3.Error:
+                raise _deletion_tombstone_verification_failure() from None
+            try:
+                try:
+                    owner = conn.execute(
+                        "SELECT status, scopes_json FROM requests "
+                        "WHERE tenant_id = ? AND request_id = ?",
+                        (tenant_id, request_id),
+                    ).fetchone()
+                    if owner is None:
+                        # Resolve ownership first: an empty ledger must
+                        # not distinguish "missing" from "foreign record".
+                        raise RequestNotFound("request not found")
+                    rows = conn.execute(
+                        "SELECT scope, adapter_id, operation_id, outcome, "
+                        "proof_digest FROM deletion_tombstones "
+                        "WHERE tenant_id = ? AND request_id = ?",
+                        (tenant_id, request_id),
+                    ).fetchall()
+                    settled = conn.execute(
+                        "SELECT result, evidence_digest "
+                        "FROM deletion_tombstone_finishes "
+                        "WHERE tenant_id = ? AND request_id = ?",
+                        (tenant_id, request_id),
+                    ).fetchone()
+                    duplicates = conn.execute(
+                        "SELECT operation_id FROM deletion_tombstones "
+                        "GROUP BY operation_id HAVING COUNT(*) > 1",
+                    ).fetchall()
+                except RequestNotFound:
+                    raise
+                except sqlite3.Error:
+                    raise _deletion_tombstone_verification_failure() from None
+            except BaseException:
+                # Leave no shared in-memory connection inside the
+                # transaction when the snapshot read aborts.
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+            try:
+                conn.execute("COMMIT")
+            except sqlite3.Error:
+                # A commit that cannot land must never leave the shared
+                # in-memory connection inside the open read transaction.
+                try:
+                    conn.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise _deletion_tombstone_verification_failure() from None
+        finally:
+            self._release(conn)
+
+        status, scopes_json = owner
+        if status not in _BUNDLE_STATUSES:
+            # A status the store never wrote is out-of-band corruption.
+            raise _deletion_tombstone_verification_failure()
+        scopes = _request_scopes_or_tombstone_failure(
+            scopes_json, _deletion_tombstone_verification_failure
+        )
+        scope_set = set(scopes)
+
+        entries: list[tuple[str, str, str, str, str]] = []
+        record_invalid = False
+        for scope, adapter_id, operation_id, outcome, proof_digest in rows:
+            if (
+                not isinstance(scope, str)
+                or not isinstance(adapter_id, str)
+                or not isinstance(operation_id, str)
+                or not isinstance(outcome, str)
+                or not isinstance(proof_digest, str)
+            ):
+                # A non-string field can never enter the digest
+                # preimage: the record was altered out of band and the
+                # commitment cannot be recomputed over it.
+                raise _deletion_tombstone_verification_failure()
+            entries.append(
+                (scope, operation_id, adapter_id, outcome, proof_digest)
+            )
+            if (
+                not scope
+                or scope not in scope_set
+                or not adapter_id
+                or not operation_id
+                or outcome not in _TOMBSTONE_OUTCOMES
+                or not _is_chain_hash(proof_digest)
+            ):
+                record_invalid = True
+
+        # The settled finish record is validated whenever it exists; a
+        # shape the store never wrote is out-of-band corruption.
+        ledger_digest: str | None = None
+        if settled is not None:
+            finished_result, finished_digest = settled
+            if finished_result not in _TERMINAL_RESULTS or (
+                finished_digest is not None
+                and not _is_chain_hash(finished_digest)
+            ):
+                raise _deletion_tombstone_verification_failure()
+            if finished_result == _STATUS_COMPLETED:
+                if finished_digest is None:
+                    # A completed finish always settles its commitment.
+                    raise _deletion_tombstone_verification_failure()
+                ledger_digest = finished_digest
+
+        reasons: set[str] = set()
+        evidence_digest: str | None = None
+        if status != _STATUS_COMPLETED:
+            coverage = "not_applicable"
+            reasons.add(_VERIFICATION_REASON_REQUEST_NOT_COMPLETED)
+        else:
+            per_scope: dict[str, int] = {}
+            for entry in entries:
+                per_scope[entry[0]] = per_scope.get(entry[0], 0) + 1
+            # Exactly one tombstone per normalized scope: a missing,
+            # duplicated or superfluous tombstone breaks coverage.
+            complete = set(per_scope) == scope_set and all(
+                count == 1 for count in per_scope.values()
+            )
+            coverage = "complete" if complete else "incomplete"
+            if not complete:
+                reasons.add(_VERIFICATION_REASON_SCOPE_COVERAGE_INVALID)
+            if record_invalid:
+                reasons.add(_VERIFICATION_REASON_TOMBSTONE_RECORD_INVALID)
+            own_operations = {entry[1] for entry in entries}
+            duplicated_operations = {row[0] for row in duplicates}
+            if own_operations & duplicated_operations:
+                # An operation number belongs to exactly one tombstone
+                # across every tenant and request.
+                reasons.add(_VERIFICATION_REASON_OPERATION_ID_INVALID)
+            if complete:
+                evidence_digest = _tombstone_evidence_digest(entries)
+                if ledger_digest != evidence_digest:
+                    # The recomputed commitment must equal the finish
+                    # ledger's first completed result.
+                    reasons.add(_VERIFICATION_REASON_EVIDENCE_DIGEST_MISMATCH)
+
+        report = {
+            "request_id": request_id,
+            "verified": coverage == "complete" and not reasons,
+            "coverage": coverage,
+            "tombstone_count": len(entries),
+            "evidence_digest": evidence_digest,
+            # Code point order, no duplicates.
+            "reasons": sorted(reasons),
+        }
+        return json.dumps(report, ensure_ascii=False, separators=(",", ":")) + "\n"
 
     def reconcile_execution(
         self,
