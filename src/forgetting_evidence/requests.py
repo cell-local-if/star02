@@ -3923,6 +3923,34 @@ _RFC3339_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$"
 )
 
+# The exact shape of the UTC timestamps the store writes on a status
+# event: :func:`_format_rfc3339` always emits six fractional digits and a
+# ``Z`` suffix, a fixed-width form whose lexicographic order is
+# chronological. The request-level timeline only accepts a persisted
+# event time with that canonical UTC shape and a real calendar date.
+_UTC_RFC3339_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$"
+)
+
+
+def _is_utc_rfc3339(value: object) -> bool:
+    """Return whether *value* is a canonical store-shaped UTC timestamp.
+
+    The text must match the fixed-width six-digit-fraction ``Z`` shape
+    :func:`_format_rfc3339` emits and name a real calendar date and time
+    of day; the strict width keeps lexicographic comparisons
+    chronological. Anything the store never wrote (a numeric offset, a
+    missing or variable-width fraction, an out-of-range month or hour,
+    non-text) is rejected.
+    """
+    if not isinstance(value, str) or not _UTC_RFC3339_RE.match(value):
+        return False
+    try:
+        datetime.strptime(value, "%Y-%m-%dT%H:%M:%S.%fZ")
+    except ValueError:
+        return False
+    return True
+
 
 def _scope_digest(tenant_id: str, request_id: str, scopes: list[str]) -> str:
     """Commit to the request's scope set without revealing it.
@@ -10696,6 +10724,139 @@ class RequestStore:
             # Identical outcome for unknown ids and cross-tenant lookups.
             raise RequestNotFound("request not found")
         return row[0], row[1], row[2]
+
+    def get_status_timeline(
+        self, tenant_id: str, request_id: str
+    ) -> dict[str, object]:
+        """Return one request's request-level status timeline, read-only.
+
+        Backs the read-only ``GET /requests/{request_id}/audit-timeline``
+        HTTP endpoint and remains a storage-layer method as well. Unlike
+        :meth:`audit`, which returns the persisted rows verbatim, this
+        read only succeeds when the persisted history is consistent: the
+        current status and the full ordered state-event timeline are read
+        inside one read-only transaction and the rows are then checked to
+        describe exactly the real status history -- a non-empty timeline
+        whose first entry is the acceptance event, every entry's status
+        drawn from the four lifecycle statuses, every later entry a
+        transition the lifecycle allows, non-decreasing UTC RFC3339
+        occurrence times, and the final entry's status equal to the
+        persisted current status. Execution attempts, tombstones,
+        receipts and the audit anchor records are never read and never
+        appear in the result.
+
+        The result contains exactly ``request_id`` and ``events``; each
+        event contains exactly ``status`` and ``occurred_at`` in
+        occurrence order. The read never writes, advances, creates or
+        changes anything. A non-string or empty *tenant_id* raises
+        :class:`ValueError` without touching storage; invalid, unknown
+        and cross-tenant *request_id* values raise
+        :class:`RequestNotFound` with one detail-free outcome; an
+        unreadable database, a corrupt event record or a history that
+        cannot be read as a consistent timeline raises the fixed-text
+        :class:`OSError` ``request store is unavailable`` rather than a
+        half timeline or a fabricated event.
+        """
+        tenant_id = _require_nonempty_str(tenant_id, "tenant_id")
+        request_id = _require_identifier(request_id)
+        if self._mem_conn is not None:
+            with self._write_lock:
+                return self._get_status_timeline(tenant_id, request_id)
+        return self._get_status_timeline(tenant_id, request_id)
+
+    def _get_status_timeline(
+        self, tenant_id: str, request_id: str
+    ) -> dict[str, object]:
+        conn = self._connect()
+        try:
+            try:
+                # One explicit read-only transaction covers both the
+                # current status and the full ordered timeline, so a
+                # concurrent transition can never contribute a new
+                # current status with the old final event or vice versa.
+                conn.execute("BEGIN")
+                try:
+                    owner = conn.execute(
+                        "SELECT status FROM requests "
+                        "WHERE tenant_id = ? AND request_id = ?",
+                        (tenant_id, request_id),
+                    ).fetchone()
+                    if owner is None:
+                        # Identical outcome for unknown ids and
+                        # cross-tenant lookups; the enclosing handler
+                        # rolls the read transaction back before this
+                        # propagates.
+                        raise RequestNotFound("request not found")
+                    (current_status,) = owner
+                    rows = conn.execute(
+                        "SELECT status, occurred_at FROM status_events "
+                        "WHERE tenant_id = ? AND request_id = ? ORDER BY seq",
+                        (tenant_id, request_id),
+                    ).fetchall()
+                except BaseException:
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                    raise
+                conn.execute("COMMIT")
+            except RequestNotFound:
+                raise
+            except sqlite3.Error:
+                # Never surface the database engine's own error text.
+                raise _storage_failure() from None
+        finally:
+            self._release(conn)
+
+        # The persisted rows must describe exactly the real status
+        # history. Anything short of that -- a missing or non-text
+        # current status, an empty timeline, a row whose status is
+        # outside the lifecycle, an illegal lifecycle edge, a malformed
+        # or non-UTC timestamp, a backwards occurrence time, or a final
+        # event that disagrees with the persisted current status -- is
+        # record corruption, never a partial timeline or a fabricated
+        # event. The events are projected (not returned verbatim) so no
+        # other persisted column can ever reach the renderer.
+        if not isinstance(current_status, str) or not rows:
+            raise _storage_failure()
+        events: list[dict[str, str]] = []
+        previous_status: str | None = None
+        previous_occurred_at: str | None = None
+        for row in rows:
+            if (
+                not isinstance(row, tuple)
+                or len(row) != 2
+                or not isinstance(row[0], str)
+                or not isinstance(row[1], str)
+            ):
+                raise _storage_failure()
+            status, occurred_at = row
+            if status not in _ALLOWED_TRANSITIONS:
+                raise _storage_failure()
+            if not _is_utc_rfc3339(occurred_at):
+                raise _storage_failure()
+            if previous_status is None:
+                # The first entry is always the acceptance event.
+                if status != _STATUS_ACCEPTED:
+                    raise _storage_failure()
+            else:
+                # Every later entry records one actual lifecycle change;
+                # an idempotent re-advance never persisted an event, so a
+                # repeated status here signals a corrupted history.
+                if status not in _ALLOWED_TRANSITIONS[previous_status]:
+                    raise _storage_failure()
+                # Occurrence times never go backwards. Both operands are
+                # fixed-width UTC ``Z`` text produced by the store, so a
+                # purely lexicographic comparison is chronological.
+                if occurred_at < previous_occurred_at:  # type: ignore[operator]
+                    raise _storage_failure()
+            events.append({"status": status, "occurred_at": occurred_at})
+            previous_status = status
+            previous_occurred_at = occurred_at
+        # The last recorded change is the persisted current status.
+        if previous_status != current_status:
+            raise _storage_failure()
+        return {"request_id": request_id, "events": events}
 
     def get_request_evidence(
         self, tenant_id: str, request_id: str
