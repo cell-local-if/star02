@@ -1,7 +1,7 @@
 """HTTP layer for deletion-request acceptance, lookup, observation and
 single-request and batched reconciliation.
 
-The service exposes seventeen business endpoints:
+The service exposes eighteen business endpoints:
 
 * ``POST /requests`` -- accept a deletion request for a tenant. The JSON
   body must carry non-empty ``tenant_id``, ``subject_id`` and
@@ -285,6 +285,32 @@ The service exposes seventeen business endpoints:
   default rule or a duplicated policy id answers 400 and writes nothing;
   a storage fault or a failed transaction answers 503 and never leaves
   a half-written version.
+* ``GET /policy-catalog/retention-trace`` -- read-only publication of the
+per-scope retention evidence for one subject under one published
+catalog version, backed by
+:meth:`RequestStore.resolve_retention_trace`. Published versions are
+the only catalog source: the query string carries one positive
+integer ``version``, one ``subject_id`` and at least one repeatable
+``scope`` selector; no request body or inline catalog is accepted.
+The tenant follows the existing ``X-Tenant-Id``/query rule; repeated
+``scope`` keys give the ordered selector sequence and the store's
+existing normalization, precedence, Unicode code point tie ordering,
+cross-scope maximum and first-winner tie rules decide the trace. The
+body is the verbatim single-line compact UTF-8 JSON text (with its
+single trailing newline) produced by the store for the same input:
+exactly ``catalog_source``, ``subject_id``, ``scopes``,
+``retention_days``, ``policy_id``, ``reason``, ``exception`` and
+``scope_evidence`` in that order. The only accepted parameters are a
+single ``tenant_id`` (header or query), a single ``subject_id``, a
+single ``version`` and one or more ``scope`` selectors; an unknown or
+duplicated parameter, an empty value, an illegal subject, selector or
+version, a non-empty body or a tenant-selection error answers 400; a
+version that does not exist, is unpublished or belongs to another
+tenant answers 404 with one detail-free outcome; a corrupt catalog,
+an unreadable database or a failed snapshot answers 503 and never a
+partial text. Only ``GET`` is allowed: other methods answer 405 with
+``Allow: GET``, a deeper path stays 404 and ``HEAD`` answers 405
+with no body.
 * ``POST /requests/{request_id}/reconcile`` -- reconcile exactly one
   request's execution record against its persisted state by calling the
   storage layer's :meth:`RequestStore.reconcile_execution`. The endpoint
@@ -415,7 +441,8 @@ the read-only audit-chain diagnosis, the read-only audit-bundle export,
 the read-only deletion-receipt recovery, the single-request execution
 reconciliation, the read-only
 policy-catalog version history, the policy-catalog publication, the
-read-only instantaneous audit-health summary and the batched audit
+read-only published-version retention trace, the read-only
+instantaneous audit-health summary and the batched audit
 inspection with its read-only per-batch metrics
 described above. The
 current-status lookup (:meth:`RequestStore.get_status`), the
@@ -437,6 +464,8 @@ single-request reconciliation
 (:meth:`RequestStore.reconcile_batch`), the catalog version
 history (:meth:`RequestStore.audit_policy_catalog`), the catalog
 publication (:meth:`RequestStore.publish_policy_catalog`), the
+published-version retention trace
+(:meth:`RequestStore.resolve_retention_trace`), the
 instantaneous audit-health snapshot
 (:meth:`RequestStore.audit_health`), the batched audit inspection
 (:meth:`RequestStore.audit_inspection`) and the read-only per-batch
@@ -481,7 +510,13 @@ tombstone rendering exactly ``adapter_id``, ``scope``, ``operation_id``,
 history read renders exactly ``versions``, each version rendering
 exactly ``version``, ``effective_at``, ``rule_count``,
 ``exception_count`` and ``status``. The policy-catalog publication
-renders exactly ``version`` and ``effective_at``. The audit-health
+renders exactly ``version`` and ``effective_at``. The published-version
+retention-trace read renders the store's verbatim single-line compact
+trace text with its single trailing newline: exactly
+``catalog_source``, ``subject_id``, ``scopes``, ``retention_days``,
+``policy_id``, ``reason``, ``exception`` and ``scope_evidence`` in
+that order, each scope-evidence item rendering exactly ``scope``,
+``level``, ``policy_id``, ``exception`` and ``retention_days``. The audit-health
 snapshot renders exactly ``total``, ``statuses``, ``verified``,
 ``unverified`` and ``reasons``; ``statuses`` renders exactly the four
 lifecycle counts in fixed order and each reason renders exactly
@@ -506,9 +541,9 @@ for a configured principal: a missing/malformed/unknown token answers
 endpoint, or acting on a tenant other than its own ``tenant_id``,
 answers ``403 forbidden``. ``POST /requests`` requires
 ``request:submit`` and the target tenant is the body's ``tenant_id``;
-each of the eleven GET endpoints requires
-``request:read`` and the target tenant follows the existing
-``X-Tenant-Id``/query rule; the
+each request-scoped observation GET endpoint and the audit-health
+read require ``request:read`` and the target tenant follows the
+existing ``X-Tenant-Id``/query rule; the
 single-request reconciliation ``POST /requests/{request_id}/reconcile``
 requires ``request:reconcile`` and its target tenant follows the same
 existing ``X-Tenant-Id``/query rule; the
@@ -520,6 +555,10 @@ batched audit inspection ``GET /audit-inspection`` requires
 ``X-Tenant-Id``/query rule; the policy-catalog history
 ``GET /policy-catalog/versions`` requires ``policy:read`` and its
 target tenant follows the same existing ``X-Tenant-Id``/query rule;
+the published-version retention trace
+``GET /policy-catalog/retention-trace`` requires ``policy:read`` and
+its target tenant follows the same existing
+``X-Tenant-Id``/query rule;
 the policy-catalog publication ``POST /policy-catalog/versions``
 requires ``policy:write`` and its target tenant is the body's
 ``tenant_id``.
@@ -554,6 +593,7 @@ from .requests import (
     AuditInspectionNotFound,
     IdempotencyConflict,
     PolicyCatalogConflict,
+    PolicyCatalogNotFound,
     ReceiptUnavailable,
     RequestNotFound,
     RequestStore,
@@ -573,6 +613,7 @@ _log = logging.getLogger(__name__)
 _COLLECTION_PATH = "/requests"
 _ITEM_PATH_PREFIX = "/requests/"
 _POLICY_CATALOG_VERSIONS_PATH = "/policy-catalog/versions"
+_POLICY_CATALOG_RETENTION_TRACE_PATH = "/policy-catalog/retention-trace"
 _RECONCILE_BATCH_PATH = "/reconcile"
 _AUDIT_HEALTH_PATH = "/audit-health"
 _AUDIT_INSPECTION_PATH = "/audit-inspection"
@@ -642,6 +683,17 @@ _LIST_QUERY_PARAMS = frozenset(
 )
 _LIST_LIMIT_RE = re.compile(r"^[0-9]+$")
 
+# The business scope selector grammar, mirrored from the storage layer
+# so a malformed retention-trace ``scope`` parameter is rejected before
+# storage is touched: ``*``, ``<collection>*`` or
+# ``<collection>:<entry>`` over the restricted lower-case alphabet.
+_SCOPE_NAME_PATTERN = r"[a-z0-9_.-]+"
+_SCOPE_SELECTOR_RE = re.compile(
+    r"\*"
+    rf"|{_SCOPE_NAME_PATTERN}\*"
+    rf"|{_SCOPE_NAME_PATTERN}:{_SCOPE_NAME_PATTERN}"
+)
+
 # The query parameters the GET /requests/{request_id}/tombstones page
 # read understands; anything else is an invalid request. ``tenant_id``
 # keeps its historical header-or-query resolution and is validated
@@ -653,6 +705,18 @@ _TOMBSTONES_QUERY_PARAMS = frozenset({"tenant_id", "cursor", "limit"})
 # header-or-query resolution and is validated separately. Any other
 # parameter, or any duplicated key, is an invalid request.
 _POLICY_CATALOG_QUERY_PARAMS = frozenset({"tenant_id"})
+
+# The query parameters the GET /policy-catalog/retention-trace read
+# understands: ``tenant_id`` (header-or-query, at most once),
+# ``subject_id`` (exactly once), ``version`` (exactly once) and
+# ``scope`` (one or more times, giving the ordered selector sequence).
+# Any other parameter, a duplicated single-value key, a missing or
+# blank value, or the complete absence of a scope is an invalid
+# request; the selector grammar itself is re-validated by the store
+# before storage is touched.
+_POLICY_CATALOG_RETENTION_TRACE_QUERY_PARAMS = frozenset(
+    {"tenant_id", "subject_id", "version", "scope"}
+)
 
 # The query parameters the GET /requests/{request_id}/audit-bundle
 # export understands: only ``tenant_id``, which keeps its historical
@@ -760,6 +824,30 @@ _DELETION_RECEIPT_FIELDS = (
     "attempt_digest",
     "tag",
 )
+
+# The exact field set and order of a published-version retention
+# trace, mirrored from the storage layer's renderer so a corrupt or
+# substituted store can never serialise an unvalidated key or value
+# into the body.
+_RETENTION_TRACE_FIELDS = (
+    "catalog_source",
+    "subject_id",
+    "scopes",
+    "retention_days",
+    "policy_id",
+    "reason",
+    "exception",
+    "scope_evidence",
+)
+_RETENTION_TRACE_EVIDENCE_FIELDS = (
+    "scope",
+    "level",
+    "policy_id",
+    "exception",
+    "retention_days",
+)
+_RETENTION_TRACE_LEVELS = frozenset({"entry", "group", "all"})
+_RETENTION_TRACE_SOURCE_PUBLISHED = "published_version"
 
 _UUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
@@ -1060,6 +1148,19 @@ class DeferredRequestStore:
             tenant_id, rules, exceptions
         )
 
+    def resolve_retention_trace(
+        self, tenant_id, subject_id, scopes, version
+    ):
+        # Serves the read-only
+        # GET /policy-catalog/retention-trace endpoint; the published
+        # version is the sole catalog source and the read never writes.
+        return self._ready().resolve_retention_trace(
+            tenant_id,
+            subject_id,
+            scopes,
+            version=version,
+        )
+
     def get_request_evidence(self, tenant_id, request_id):
         # Serves the read-only GET /requests/{request_id}/evidence
         # endpoint; the current status, event count, persisted chain head
@@ -1150,6 +1251,8 @@ def make_handler(
                 return "collection", None
             if path == _POLICY_CATALOG_VERSIONS_PATH:
                 return "policy_catalog_versions", None
+            if path == _POLICY_CATALOG_RETENTION_TRACE_PATH:
+                return "policy_catalog_retention_trace", None
             if path == _RECONCILE_BATCH_PATH:
                 return "reconcile_batch", None
             if path == _AUDIT_HEALTH_PATH:
@@ -1381,6 +1484,11 @@ def make_handler(
             if kind == "policy_catalog_versions":
                 # The read-only policy-catalog version history.
                 self._serve_policy_catalog_versions()
+                return
+            if kind == "policy_catalog_retention_trace":
+                # The read-only published-version per-scope retention
+                # trace; strictly read-only like the version history.
+                self._serve_policy_catalog_retention_trace()
                 return
             if kind == "reconcile":
                 # The reconciliation action is POST-only.
@@ -2579,6 +2687,124 @@ def make_handler(
                 if len(values) != 1:
                     raise _BadRequest("duplicate query parameter")
 
+        def _serve_policy_catalog_retention_trace(self) -> None:
+            # The published-version retention trace shares the catalog
+            # history's authorization and tenant resolution:
+            # authentication first (the minimal ``policy:read`` role,
+            # limited to the principal's own tenant), then the tenant
+            # (header or query) and its match against the principal,
+            # then the query-parameter gate and the empty-body gate,
+            # then storage. A published version is the sole catalog
+            # source: no body and no inline catalog is ever accepted,
+            # and the read never writes anything.
+            principal = self._authorize(_ROLE_POLICY_READ)
+            if principal is None:
+                return
+            try:
+                tenant_id = self._tenant_id()
+            except _BadRequest:
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            if not self._tenant_allowed(principal[0], tenant_id):
+                return
+            try:
+                trace_args = self._retention_trace_query_args()
+                self._read_empty_body()
+            except _BadRequest:
+                # A rejected body has been consumed (or the connection
+                # is marked for close when it cannot be) before the
+                # error.
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            try:
+                text = store.resolve_retention_trace(
+                    tenant_id,
+                    trace_args["subject_id"],
+                    trace_args["scopes"],
+                    version=trace_args["version"],
+                )
+            except PolicyCatalogNotFound:
+                # A missing, unpublished or cross-tenant version shares
+                # one indistinguishable, detail-free outcome.
+                self._reply_error(404, _NOT_FOUND)
+                return
+            except ValueError:
+                # Defence in depth: the HTTP validation above is
+                # authoritative, but an illegal subject, selector or
+                # version the store rejects reads nothing and maps to
+                # the same client error.
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            except _StorageUnavailable:
+                _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
+                self._reply_error(503, _STORAGE_UNAVAILABLE)
+                return
+            except (sqlite3.Error, RuntimeError, OSError):
+                # A corrupt catalog, an unreadable database or a
+                # snapshot that cannot complete surfaces as the
+                # fixed-text storage error; sqlite text (locks,
+                # malformed images, paths) must never reach the
+                # client, and no partial trace is ever rendered.
+                _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
+                self._reply_error(503, _STORAGE_UNAVAILABLE)
+                return
+            self._reply_retention_trace(text)
+
+        def _retention_trace_query_args(self) -> dict[str, object]:
+            """Validate the retention-trace query string into arguments.
+
+            Only ``tenant_id``, ``subject_id``, ``version`` and
+            ``scope`` may appear (``tenant_id`` keeps its historical
+            header-or-query resolution in ``_tenant_id``).
+            ``subject_id`` and ``version`` must each appear exactly
+            once with a non-blank/positive value and ``scope`` at
+            least once; the repeated ``scope`` keys give the ordered
+            selector sequence. Every other shape is a bad request; the
+            store re-validates the values themselves -- including the
+            selector grammar and exact-duplicate scopes -- as defence
+            in depth.
+            """
+            params = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+            if not set(params) <= _POLICY_CATALOG_RETENTION_TRACE_QUERY_PARAMS:
+                raise _BadRequest("unknown query parameter")
+            tenant_values = params.get("tenant_id")
+            if tenant_values is not None and len(tenant_values) != 1:
+                raise _BadRequest("duplicate tenant_id")
+            subject_values = params.get("subject_id")
+            if subject_values is None or len(subject_values) != 1:
+                raise _BadRequest("subject_id required once")
+            subject_id = subject_values[0]
+            if not subject_id.strip():
+                raise _BadRequest("invalid subject_id")
+            version_values = params.get("version")
+            if version_values is None or len(version_values) != 1:
+                raise _BadRequest("version required once")
+            version_text = version_values[0]
+            # A positive integer version; a digit string far longer than
+            # the consecutive per-tenant scheme can ever reach is a bad
+            # request, not a storage lookup. Capping at 18 digits also
+            # keeps the parsed value inside SQLite's signed 64-bit
+            # binding range, so an oversized value can never raise an
+            # OverflowError at the store boundary.
+            if not _LIST_LIMIT_RE.match(version_text) or len(version_text) > 18:
+                raise _BadRequest("invalid version")
+            version = int(version_text)
+            if version < 1:
+                raise _BadRequest("invalid version")
+            scope_values = params.get("scope")
+            if not scope_values:
+                raise _BadRequest("scope required")
+            scopes: list[str] = []
+            for scope in scope_values:
+                if not scope or _SCOPE_SELECTOR_RE.fullmatch(scope) is None:
+                    raise _BadRequest("invalid scope")
+                scopes.append(scope)
+            return {
+                "subject_id": subject_id,
+                "version": version,
+                "scopes": scopes,
+            }
+
         def _serve_policy_catalog_publish(self) -> None:
             # The publication endpoint shares the acceptance endpoint's
             # ordering: authentication first, then the JSON body, then
@@ -3591,6 +3817,105 @@ def make_handler(
             )
             if text != canonical:
                 raise RuntimeError("malformed catalog audit from store")
+            self._write_body(200, text.encode("utf-8"))
+
+        def _reply_retention_trace(self, text: object) -> None:
+            # The body is the store's verbatim single-line compact JSON
+            # trace text with its single trailing newline. It is still
+            # re-validated field by field before it is emitted: a
+            # corrupt or substituted store must never serialise an
+            # unvalidated key, an inline-catalog source label, a raw
+            # scope sequence or any foreign content into the body, and
+            # a malformed trace surfaces as the stable storage code,
+            # never as a partial text.
+            if (
+                not isinstance(text, str)
+                or not text.endswith("\n")
+                or text.endswith("\n\n")
+                or "\n" in text[:-1]
+                or "\r" in text
+            ):
+                raise RuntimeError("malformed retention trace from store")
+            try:
+                payload = json.loads(text[:-1])
+            except ValueError:
+                raise RuntimeError(
+                    "malformed retention trace from store"
+                ) from None
+            if not isinstance(payload, dict) or set(payload) != set(
+                _RETENTION_TRACE_FIELDS
+            ):
+                raise RuntimeError("malformed retention trace from store")
+            catalog_source = payload["catalog_source"]
+            subject_id = payload["subject_id"]
+            scopes = payload["scopes"]
+            retention_days = payload["retention_days"]
+            policy_id = payload["policy_id"]
+            reason = payload["reason"]
+            exception = payload["exception"]
+            scope_evidence = payload["scope_evidence"]
+            # This endpoint publishes published-version evidence only;
+            # the inline call-time catalog source is never served.
+            if catalog_source != _RETENTION_TRACE_SOURCE_PUBLISHED:
+                raise RuntimeError("malformed retention trace from store")
+            if not isinstance(subject_id, str) or not subject_id.strip():
+                raise RuntimeError("malformed retention trace from store")
+            if not isinstance(scopes, list) or not scopes:
+                raise RuntimeError("malformed retention trace from store")
+            for scope in scopes:
+                if (
+                    not isinstance(scope, str)
+                    or not scope
+                    or _SCOPE_SELECTOR_RE.fullmatch(scope) is None
+                ):
+                    raise RuntimeError("malformed retention trace from store")
+            if (
+                not _is_nonneg_int(retention_days)
+                or not isinstance(policy_id, str)
+                or not policy_id
+                or not isinstance(reason, str)
+                or not reason
+                or not isinstance(exception, bool)
+                or not isinstance(scope_evidence, list)
+                or len(scope_evidence) != len(scopes)
+            ):
+                raise RuntimeError("malformed retention trace from store")
+            for index, item in enumerate(scope_evidence):
+                if not isinstance(item, dict) or set(item) != set(
+                    _RETENTION_TRACE_EVIDENCE_FIELDS
+                ):
+                    raise RuntimeError("malformed retention trace from store")
+                item_scope = item["scope"]
+                level = item["level"]
+                item_policy_id = item["policy_id"]
+                item_exception = item["exception"]
+                item_days = item["retention_days"]
+                if (
+                    not isinstance(item_scope, str)
+                    # One evidence item per normalized scope, in order.
+                    or item_scope != scopes[index]
+                    or level not in _RETENTION_TRACE_LEVELS
+                    or not isinstance(item_policy_id, str)
+                    or not item_policy_id
+                    or not isinstance(item_exception, bool)
+                    or not _is_nonneg_int(item_days)
+                ):
+                    raise RuntimeError("malformed retention trace from store")
+            # The emitted bytes must be exactly the compact single-line
+            # rendering of the validated payload in the fixed field
+            # order; anything else (extra whitespace, a reserialised
+            # duplicate key, a reordered field) is not the store's
+            # verbatim text.
+            canonical = (
+                json.dumps(
+                    {name: payload[name] for name in _RETENTION_TRACE_FIELDS},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            )
+            if text != canonical:
+                raise RuntimeError("malformed retention trace from store")
             self._write_body(200, text.encode("utf-8"))
 
         def _reply_policy_catalog_publication(self, result: object) -> None:
