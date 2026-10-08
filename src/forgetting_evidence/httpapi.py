@@ -1,7 +1,7 @@
 """HTTP layer for deletion-request acceptance, lookup, observation and
 single-request and batched reconciliation.
 
-The service exposes eighteen business endpoints:
+The service exposes nineteen business endpoints:
 
 * ``POST /requests`` -- accept a deletion request for a tenant. The JSON
   body must carry non-empty ``tenant_id``, ``subject_id`` and
@@ -57,6 +57,42 @@ The service exposes eighteen business endpoints:
   fault or a corrupt ledger answers 503 and never a partial page or a
   pseudo digest. The read never advances state, never creates an
   attempt or a tombstone and never changes the audit chain.
+* ``GET /requests/{request_id}/tombstone-verification`` -- read-only,
+  reason-carrying verification of the request's deletion-tombstone
+  ledger against its completion record, the HTTP public read for the
+  storage layer's strictly read-only
+  :meth:`RequestStore.verify_deletion_tombstones`. The tenant follows
+  the existing ``X-Tenant-Id``/query rule and the endpoint requires the
+  ``request:read`` role; the query string accepts no parameter other
+  than ``tenant_id`` -- a duplicated key, an unknown parameter or a
+  missing or empty tenant answers 400. The single-line compact UTF-8
+  JSON body (with its single trailing newline) is re-validated field by
+  field and re-rendered in the fixed order; for an unchanged snapshot it
+  is byte-identical to the store's own report. Fields in fixed order are
+  ``request_id``, ``verified``, ``coverage``, ``tombstone_count``,
+  ``evidence_digest`` and ``reasons``. ``coverage`` is
+  ``not_applicable`` for every non-completed status (with
+  ``request_not_completed``), ``incomplete`` for a completed request
+  whose normalized scopes are not each covered by exactly one tombstone
+  (with ``scope_coverage_invalid``) and ``complete`` otherwise;
+  ``evidence_digest`` is the 64-character lowercase hexadecimal
+  commitment recomputed with the existing algorithm only when coverage
+  is complete and ``null`` otherwise; ``reasons`` holds the stable,
+  detail-free codes (``tombstone_record_invalid``,
+  ``operation_id_invalid`` and ``evidence_digest_mismatch`` alongside
+  the coverage codes), deduplicated and ordered by Unicode code point;
+  ``verified`` is true only when coverage is complete and ``reasons``
+  is empty. The coverage and record checks may coexist in one report;
+  neither the report nor an error ever names an object, a proof body, a
+  subject, a raw scope, an idempotency key, SQL text or a filesystem
+  path. A malformed, unknown or cross-tenant request id answers 404
+  with one detail-free outcome; other methods answer 405 with
+  ``Allow: GET`` and HEAD answers 405 with no body; a deeper path stays
+  404; an unreadable database, a corrupt request, tombstone or finish
+  record or a digest that cannot be recomputed answers 503 and never a
+  partial verdict. The read never advances state, never creates an
+  attempt, a tombstone, a receipt or a finish record and never changes
+  the audit chain.
 * ``GET /requests/{request_id}/evidence`` -- read-only request-level
   integrity verdict. The tenant follows the existing
   ``X-Tenant-Id``/query rule and the endpoint requires the
@@ -435,6 +471,7 @@ summaries (:meth:`RequestStore.audit_inspection_summary` and
 the storage layer and are deliberately not exposed over HTTP: over HTTP
 the service opens request acceptance, the acceptance-receipt lookup, the
 read-only tenant-scoped listing, the six read-only observation reads,
+the read-only tombstone-ledger verification,
 the read-only request-level status timeline,
 the read-only audit-chain diagnosis, the read-only audit-bundle export,
 the read-only deletion-receipt recovery, the single-request execution
@@ -448,6 +485,8 @@ current-status lookup (:meth:`RequestStore.get_status`), the
 tenant-scoped listing (:meth:`RequestStore.list_requests`), the
 execution log (:meth:`RequestStore.get_execution_log`), the tombstone
 page read (:meth:`RequestStore.page_deletion_tombstones`), the
+strictly read-only tombstone-ledger verification
+(:meth:`RequestStore.verify_deletion_tombstones`), the
 single-snapshot request evidence read
 (:meth:`RequestStore.get_request_evidence`), the
 single-snapshot request status timeline read
@@ -505,7 +544,11 @@ receipt text with its single trailing newline: exactly ``tenant_id``,
 tombstone page read renders exactly ``request_id``, ``tombstones``,
 ``recorded_at``, ``evidence_digest`` and ``next_cursor``, each
 tombstone rendering exactly ``adapter_id``, ``scope``, ``operation_id``,
-``outcome``, ``proof_digest`` and ``recorded_at``. The policy-catalog
+``outcome``, ``proof_digest`` and ``recorded_at``. The
+tombstone-verification read renders exactly
+``request_id``, ``verified``, ``coverage``, ``tombstone_count``,
+``evidence_digest`` and ``reasons`` in that order, with ``reasons``
+deduplicated and ordered by Unicode code point. The policy-catalog
 history read renders exactly ``versions``, each version rendering
 exactly ``version``, ``effective_at``, ``rule_count``,
 ``exception_count`` and ``status``. The retention decision trace read
@@ -540,7 +583,7 @@ for a configured principal: a missing/malformed/unknown token answers
 endpoint, or acting on a tenant other than its own ``tenant_id``,
 answers ``403 forbidden``. ``POST /requests`` requires
 ``request:submit`` and the target tenant is the body's ``tenant_id``;
-each of the eleven GET endpoints requires
+each of the twelve GET endpoints requires
 ``request:read`` and the target tenant follows the existing
 ``X-Tenant-Id``/query rule; the
 single-request reconciliation ``POST /requests/{request_id}/reconcile``
@@ -617,6 +660,7 @@ _AUDIT_INSPECTION_PATH = "/audit-inspection"
 _STATUS_RESOURCE = "status"
 _EXECUTION_LOG_RESOURCE = "execution-log"
 _TOMBSTONES_RESOURCE = "tombstones"
+_TOMBSTONE_VERIFICATION_RESOURCE = "tombstone-verification"
 _EVIDENCE_RESOURCE = "evidence"
 _AUDIT_TIMELINE_RESOURCE = "audit-timeline"
 _AUDIT_DIAGNOSIS_RESOURCE = "audit-diagnosis"
@@ -685,6 +729,13 @@ _LIST_LIMIT_RE = re.compile(r"^[0-9]+$")
 # keeps its historical header-or-query resolution and is validated
 # separately.
 _TOMBSTONES_QUERY_PARAMS = frozenset({"tenant_id", "cursor", "limit"})
+
+# The query parameters the GET
+# /requests/{request_id}/tombstone-verification read understands: only
+# ``tenant_id``, which keeps its historical header-or-query resolution
+# and is validated separately. Any other parameter, or any duplicated
+# key, is an invalid request.
+_TOMBSTONE_VERIFICATION_QUERY_PARAMS = frozenset({"tenant_id"})
 
 # The query parameters the GET /policy-catalog/versions history read
 # understands: only ``tenant_id``, which keeps its historical
@@ -767,6 +818,27 @@ _POLICY_CATALOG_PUBLISH_KEYS = frozenset(
 # the storage layer so a corrupt or substituted store can never
 # serialise another value.
 _TOMBSTONE_OUTCOMES = frozenset({"deleted", "absent"})
+
+# The only coverage verdicts a tombstone-verification report may
+# serialise, mirrored from the storage layer so a corrupt or
+# substituted store can never serialise another value.
+_TOMBSTONE_VERIFICATION_COVERAGES = frozenset(
+    {"complete", "incomplete", "not_applicable"}
+)
+
+# The only stable, detail-free reason codes a tombstone-verification
+# report may carry, mirrored from the storage layer so a corrupt or
+# substituted store can never serialise a tenant, a subject, a scope,
+# an adapter, an operation number or a proof into the body.
+_TOMBSTONE_VERIFICATION_REASONS = frozenset(
+    {
+        "request_not_completed",
+        "scope_coverage_invalid",
+        "tombstone_record_invalid",
+        "operation_id_invalid",
+        "evidence_digest_mismatch",
+    }
+)
 
 # A tombstone proof digest and the whole-ledger evidence digest are 64
 # lowercase hexadecimal characters.
@@ -1064,6 +1136,15 @@ class DeferredRequestStore:
             tenant_id, request_id, cursor, limit
         )
 
+    def verify_deletion_tombstones(self, tenant_id, request_id):
+        # Serves the read-only GET
+        # /requests/{request_id}/tombstone-verification endpoint; the
+        # report is computed from one committed snapshot and the read
+        # never creates or changes anything.
+        return self._ready().verify_deletion_tombstones(
+            tenant_id, request_id
+        )
+
     def reconcile_execution(self, tenant_id, request_id):
         # Backs the POST /requests/{request_id}/reconcile endpoint; the
         # store's atomic commit decides the unique reconciliation outcome.
@@ -1242,10 +1323,11 @@ def make_handler(
                 # Empty or nested segments do not name a request.
                 if segment and "/" not in segment:
                     return "item", segment
-                # The eight read-only observability sub-resources live
+                # The read-only observability sub-resources live
                 # under a request id: /requests/{id}/status,
                 # /requests/{id}/execution-log,
                 # /requests/{id}/tombstones,
+                # /requests/{id}/tombstone-verification,
                 # /requests/{id}/evidence,
                 # /requests/{id}/audit-timeline,
                 # /requests/{id}/audit-diagnosis,
@@ -1262,6 +1344,8 @@ def make_handler(
                             return "execution_log", item_id
                         if suffix == _TOMBSTONES_RESOURCE:
                             return "tombstones", item_id
+                        if suffix == _TOMBSTONE_VERIFICATION_RESOURCE:
+                            return "tombstone_verification", item_id
                         if suffix == _EVIDENCE_RESOURCE:
                             return "evidence", item_id
                         if suffix == _AUDIT_TIMELINE_RESOURCE:
@@ -1493,10 +1577,11 @@ def make_handler(
                 self._serve_audit_inspection()
                 return
             # item (acceptance receipt), status, execution_log,
-            # tombstones, evidence, audit_timeline, audit_diagnosis,
-            # audit_bundle and deletion_receipt are the nine GET-only
-            # reads; authorization, tenant/id resolution and the
-            # resulting error ordering are shared by all of them.
+            # tombstones, tombstone_verification, evidence,
+            # audit_timeline, audit_diagnosis, audit_bundle and
+            # deletion_receipt are the GET-only reads; authorization,
+            # tenant/id resolution and the resulting error ordering are
+            # shared by all of them.
             assert segment is not None
             resolved = self._resolve_read(segment)
             if resolved is None:
@@ -1508,6 +1593,8 @@ def make_handler(
                 self._serve_status(tenant_id, request_id)
             elif kind == "execution_log":
                 self._serve_execution_log(tenant_id, request_id)
+            elif kind == "tombstone_verification":
+                self._serve_tombstone_verification(tenant_id, request_id)
             elif kind == "evidence":
                 self._serve_evidence(tenant_id, request_id)
             elif kind == "audit_timeline":
@@ -2109,6 +2196,70 @@ def make_handler(
                 else:
                     page_args["cursor"] = value
             return page_args
+
+        def _serve_tombstone_verification(
+            self, tenant_id: str, request_id: str
+        ) -> None:
+            # The tombstone-verification read shares the other GET
+            # reads' authorization and tenant/id resolution (done by
+            # the caller); the tenant-only query gate runs here, before
+            # storage is touched. The store computes the coverage
+            # verdict, the recomputed complete-ledger commitment and the
+            # stable reasons from one committed snapshot strictly
+            # read-only; a non-completed request, broken coverage, an
+            # invalid record or operation number or a digest mismatch is
+            # still a successful read carrying reasons, never a storage
+            # fault. The read never advances state and never creates an
+            # attempt, a tombstone, a receipt or a finish record.
+            try:
+                self._tombstone_verification_query_gate()
+            except _BadRequest:
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            try:
+                text = store.verify_deletion_tombstones(tenant_id, request_id)
+            except RequestNotFound:
+                # Malformed, unknown and cross-tenant ids share one
+                # detail-free outcome.
+                self._reply_error(404, _NOT_FOUND)
+                return
+            except ValueError:
+                # Defence in depth: the HTTP resolution above is
+                # authoritative, but a rejected store call reads
+                # nothing and maps to the same client error.
+                self._reply_error(400, _INVALID_REQUEST)
+                return
+            except _StorageUnavailable:
+                _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
+                self._reply_error(503, _STORAGE_UNAVAILABLE)
+                return
+            except (sqlite3.Error, RuntimeError, OSError):
+                # An unreadable database, a corrupt request, tombstone
+                # or finish record or a snapshot that cannot be taken
+                # consistently surfaces as the fixed-text storage
+                # error; sqlite text (locks, malformed images, paths)
+                # must never reach the client, and no partial report is
+                # ever rendered.
+                _log.warning("request rejected: %s", _STORAGE_UNAVAILABLE)
+                self._reply_error(503, _STORAGE_UNAVAILABLE)
+                return
+            self._reply_tombstone_verification(text)
+
+        def _tombstone_verification_query_gate(self) -> None:
+            """Reject any query parameter other than a single ``tenant_id``.
+
+            The verification read takes no business parameters;
+            ``tenant_id`` keeps its historical header-or-query
+            resolution in ``_tenant_id``. An unknown parameter or any
+            duplicated key (including ``tenant_id`` itself) is a bad
+            request.
+            """
+            params = parse_qs(urlsplit(self.path).query, keep_blank_values=True)
+            if not set(params) <= _TOMBSTONE_VERIFICATION_QUERY_PARAMS:
+                raise _BadRequest("unknown query parameter")
+            for values in params.values():
+                if len(values) != 1:
+                    raise _BadRequest("duplicate query parameter")
 
         def _serve_reconcile(self, segment: str) -> None:
             # The single-request reconcile shares the read endpoints'
@@ -3717,6 +3868,110 @@ def make_handler(
                         "recorded_at": recorded_at,
                         "evidence_digest": evidence_digest,
                         "next_cursor": next_cursor,
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                + "\n"
+            ).encode("utf-8")
+            self._write_body(200, body)
+
+        def _reply_tombstone_verification(self, text: object) -> None:
+            # The store supplies a single-line compact JSON text with
+            # its single trailing newline. It is re-validated field by
+            # field and re-rendered before it is emitted: a corrupt or
+            # substituted store must never serialise a subject, a raw
+            # object, a proof body, a raw scope, an idempotency key, a
+            # worker, a credential, SQL text or a path into the body,
+            # and a malformed report surfaces as the stable storage
+            # code, never as a partial verdict. Field order is fixed:
+            # request_id, verified, coverage, tombstone_count,
+            # evidence_digest, reasons.
+            if (
+                not isinstance(text, str)
+                or not text.endswith("\n")
+                or text.endswith("\n\n")
+                or "\n" in text[:-1]
+                or "\r" in text
+            ):
+                raise RuntimeError(
+                    "malformed tombstone verification from store"
+                )
+            try:
+                payload = json.loads(text[:-1])
+            except ValueError:
+                raise RuntimeError(
+                    "malformed tombstone verification from store"
+                ) from None
+            if not isinstance(payload, dict) or set(payload) != {
+                "request_id",
+                "verified",
+                "coverage",
+                "tombstone_count",
+                "evidence_digest",
+                "reasons",
+            }:
+                raise RuntimeError(
+                    "malformed tombstone verification from store"
+                )
+            request_id = payload["request_id"]
+            verified = payload["verified"]
+            coverage = payload["coverage"]
+            tombstone_count = payload["tombstone_count"]
+            evidence_digest = payload["evidence_digest"]
+            reasons = payload["reasons"]
+            if (
+                not isinstance(request_id, str)
+                or not _UUID_RE.match(request_id)
+                or not isinstance(verified, bool)
+                or not isinstance(coverage, str)
+                or coverage not in _TOMBSTONE_VERIFICATION_COVERAGES
+                or not _is_nonneg_int(tombstone_count)
+            ):
+                raise RuntimeError(
+                    "malformed tombstone verification from store"
+                )
+            if coverage == "complete":
+                if not isinstance(evidence_digest, str) or not _HEX_DIGEST_RE.match(
+                    evidence_digest
+                ):
+                    raise RuntimeError(
+                        "malformed tombstone verification from store"
+                    )
+            elif evidence_digest is not None:
+                raise RuntimeError(
+                    "malformed tombstone verification from store"
+                )
+            if not isinstance(reasons, list) or not all(
+                isinstance(reason, str)
+                and reason in _TOMBSTONE_VERIFICATION_REASONS
+                for reason in reasons
+            ):
+                raise RuntimeError(
+                    "malformed tombstone verification from store"
+                )
+            stable_reasons = sorted(set(reasons))
+            # The verdict is true only for a complete, reason-free
+            # ledger; every other coverage answers verified false.
+            expected_verified = coverage == "complete" and not stable_reasons
+            if verified != expected_verified:
+                raise RuntimeError(
+                    "malformed tombstone verification from store"
+                )
+            # Re-render the validated fields into the canonical compact
+            # line so the emitted bytes always carry the fixed field
+            # order with reasons deduplicated and ordered by Unicode
+            # code point, even if a substitute store returned an
+            # equivalent but un-normalised rendering.
+            body = (
+                json.dumps(
+                    {
+                        "request_id": request_id,
+                        "verified": verified,
+                        "coverage": coverage,
+                        "tombstone_count": tombstone_count,
+                        "evidence_digest": evidence_digest,
+                        "reasons": stable_reasons,
                     },
                     ensure_ascii=False,
                     separators=(",", ":"),
