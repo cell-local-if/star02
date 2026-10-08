@@ -1,4 +1,5 @@
 import json
+import re
 import signal
 import sys
 
@@ -13,6 +14,7 @@ from .requests import (
     BackupConflict,
     ReceiptUnavailable,
     RequestNotFound,
+    RequestStore,
     RestoreConflict,
     read_audit_bundle,
     read_audit_health,
@@ -44,6 +46,9 @@ _BACKUP_USAGE = "backup_usage"
 _AUDIT_BUNDLE_USAGE = "audit_bundle_usage"
 # Deletion-receipt shares the same rule: fixed, detail-free markers only.
 _DELETION_RECEIPT_USAGE = "deletion_receipt_usage"
+# Audit-diagnose shares the same rule: fixed, detail-free markers only.
+_AUDIT_DIAGNOSE_USAGE = "audit_diagnose_usage"
+_AUDIT_DIAGNOSE_FAILED = "audit_diagnose_failed"
 
 _FLAG_ALIASES = {
     "--db": "db",
@@ -322,6 +327,143 @@ def _run_deletion_receipt(args: list[str]) -> int:
     return 0
 
 
+_AUDIT_DIAGNOSE_FLAG_ALIASES = {
+    "--bundle": "bundle",
+    "--anchor-secrets": "anchor_secrets",
+}
+
+# A secret-mapping generation key is the decimal string of a positive
+# integer with no leading zeros -- exactly the canonical form of the
+# positive generation integers the storage layer validates.
+_AUDIT_DIAGNOSE_SECRET_KEY_RE = re.compile(r"[1-9][0-9]*\Z")
+
+
+def _parse_audit_diagnose_args(args: list[str]) -> dict[str, str] | None:
+    # Audit-diagnose takes exactly the two named flags --bundle and
+    # --anchor-secrets (either the separated or the equals form); there
+    # is no positional style. Missing, duplicated, empty-valued or
+    # unknown arguments and any positional token never reach the files.
+    values: dict[str, str] = {}
+    index = 0
+    while index < len(args):
+        token = args[index]
+        if "=" in token and token.split("=", 1)[0] in _AUDIT_DIAGNOSE_FLAG_ALIASES:
+            name, value = token.split("=", 1)
+            field = _AUDIT_DIAGNOSE_FLAG_ALIASES[name]
+            if field in values or value == "":
+                return None
+            values[field] = value
+        elif token in _AUDIT_DIAGNOSE_FLAG_ALIASES:
+            field = _AUDIT_DIAGNOSE_FLAG_ALIASES[token]
+            if field in values or index + 1 >= len(args):
+                return None
+            values[field] = args[index + 1]
+            index += 1
+        else:
+            return None
+        index += 1
+    if set(values) != set(_AUDIT_DIAGNOSE_FLAG_ALIASES.values()):
+        return None
+    if not all(values.values()):
+        return None
+    return values
+
+
+def _read_utf8_text(path: str) -> str:
+    """Read a file's bytes and decode them as UTF-8, exactly as stored.
+
+    The bytes are read without any newline translation or BOM handling
+    so the diagnosed text is byte-for-byte what the file holds. An
+    unreadable path raises :class:`OSError`; bytes that are not valid
+    UTF-8 raise :class:`UnicodeDecodeError` (a :class:`ValueError`).
+    """
+    with open(path, "rb") as handle:
+        return handle.read().decode("utf-8")
+
+
+class _AuditDiagnosePairs(list):
+    """Marker for JSON objects while parsing the secret mapping.
+
+    Used as ``object_pairs_hook`` so a repeated member name is visible
+    (the decoder otherwise keeps only the last value) and so a top-level
+    JSON array can never pose as the mapping object.
+    """
+
+
+def _parse_anchor_secrets_text(text: str) -> dict[int, str]:
+    """Parse the anchor-secret mapping file into ``{generation: secret}``.
+
+    The file must hold one UTF-8 JSON object whose keys are decimal
+    strings of positive integers without leading zeros, never repeated,
+    and whose values are non-empty strings. Every deviation -- unparsable
+    JSON, a non-object document, a malformed or duplicated key, an empty
+    or non-string value -- raises the same detail-free
+    :class:`ValueError`; the secrets themselves never enter the message.
+    """
+    message = "anchor secrets mapping is not valid"
+    try:
+        parsed = json.loads(text, object_pairs_hook=_AuditDiagnosePairs)
+    except (ValueError, RecursionError):
+        raise ValueError(message) from None
+    if not isinstance(parsed, _AuditDiagnosePairs):
+        raise ValueError(message)
+    secrets: dict[int, str] = {}
+    for key, secret in parsed:
+        if (
+            not isinstance(key, str)
+            or _AUDIT_DIAGNOSE_SECRET_KEY_RE.match(key) is None
+            or not isinstance(secret, str)
+            or not secret
+        ):
+            raise ValueError(message)
+        generation = int(key)
+        if generation in secrets:
+            raise ValueError(message)
+        secrets[generation] = secret
+    return secrets
+
+
+def _run_audit_diagnose(args: list[str]) -> int:
+    # Strictly read-only and fully offline: the command only reads the
+    # two presented files and calls RequestStore.diagnose_audit_bundle
+    # on their content. It never connects to or creates a database,
+    # never builds a RequestStore, and never creates or modifies a
+    # database, batch, receipt, anchor, bundle or secret mapping -- the
+    # input files are opened read-only and left byte-for-byte intact.
+    parsed = _parse_audit_diagnose_args(args)
+    if parsed is None:
+        print(_AUDIT_DIAGNOSE_USAGE, file=sys.stderr)
+        return 2
+    # Every call-shape problem collapses to the single fixed usage
+    # marker: a missing, duplicated or unknown argument, an unreadable
+    # file, bytes that are not UTF-8, a secrets file that is not one
+    # JSON object, or a mapping key that is not the canonical decimal
+    # string of a positive integer (or is repeated, or maps to an empty
+    # or non-string value). The paths, the secrets and any underlying
+    # error are never printed, and stdout stays empty.
+    try:
+        bundle_text = _read_utf8_text(parsed["bundle"])
+        secrets = _parse_anchor_secrets_text(
+            _read_utf8_text(parsed["anchor_secrets"])
+        )
+    except (OSError, ValueError):
+        print(_AUDIT_DIAGNOSE_USAGE, file=sys.stderr)
+        return 2
+    # Both inputs are readable and the mapping satisfies the storage
+    # contract; a bundle text that still violates the existing call
+    # contract (a malformed presentation) is the fixed failure marker,
+    # again with an empty stdout and no details.
+    try:
+        result = RequestStore.diagnose_audit_bundle(bundle_text, secrets)
+    except ValueError:
+        print(_AUDIT_DIAGNOSE_FAILED, file=sys.stderr)
+        return 2
+    # The diagnosis already ends with exactly one newline: stdout
+    # carries the single compact JSON line and nothing else.
+    sys.stdout.write(result)
+    return 0
+
+
 def _parse_serve_args(args: list[str]) -> dict[str, str] | None:
     values: dict[str, str] = {}
     positionals: list[str] = []
@@ -482,6 +624,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_audit_bundle(args[1:])
     if args and args[0] == "deletion-receipt":
         return _run_deletion_receipt(args[1:])
+    if args and args[0] == "audit-diagnose":
+        return _run_audit_diagnose(args[1:])
     print(_USAGE, file=sys.stderr)
     return 2
 
